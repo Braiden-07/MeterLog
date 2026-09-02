@@ -1,0 +1,36 @@
+{
+  "name": "meterlog",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-tenant asset & utility-meter traceability SaaS",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=@meterlog/api & npm run dev --workspace=@meterlog/web",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "test:db": "npm run test:db --workspace=@meterlog/api",
+    "test:e2e": "npm run test:e2e --workspace=@meterlog/web",
+    "db:migrate": "npm run db:migrate --workspace=@meterlog/api",
+    "db:migrate:deploy": "npm run db:migrate:deploy --workspace=@meterlog/api",
+    "db:generate": "npm run db:generate --workspace=@meterlog/api",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.15.0",
+    "eslint": "^9.15.0",
+    "prettier": "^3.4.1",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.16.0"
+  }
+}

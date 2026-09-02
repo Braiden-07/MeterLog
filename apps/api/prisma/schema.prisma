@@ -1,0 +1,18 @@
+// Datasource points at the MIGRATION role: this schema file is consumed by the
+// Prisma CLI, which only ever runs migrations. The runtime client is constructed
+// explicitly against DATABASE_URL (the restricted app role) in src/prisma —
+// keeping the two roles impossible to confuse. See ADR-004.
+datasource db {
+  provider = "postgresql"
+  url      = env("MIGRATION_DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// No models yet. Tenants, users, assets, asset_events, readings,
+// maintenance_records and audit_log land in build-order step 4 onward
+// (PROJECT_BRIEF §5, §11). Every one of them arrives with RLS enabled and
+// forced in the same migration, plus an isolation fixture — the catalog suite
+// in test/db fails the build otherwise.

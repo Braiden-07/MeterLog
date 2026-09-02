@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  POSTGRES_DB: meterlog
+  MIGRATOR_PASSWORD: ci_migrator_password
+  APP_PASSWORD: ci_app_password
+
+jobs:
+  verify:
+    name: lint · typecheck · test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          # The cluster bootstrap user is the MIGRATION/owner role. The app and
+          # definer roles are created by migration SQL below — GitHub Actions
+          # service containers cannot mount the local init script, which is
+          # precisely why ADR-004 puts the role bootstrap in a migration.
+          POSTGRES_USER: meterlog_migrator
+          POSTGRES_PASSWORD: ci_migrator_password
+          POSTGRES_DB: meterlog
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U meterlog_migrator -d meterlog"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MIGRATION_DATABASE_URL: postgresql://meterlog_migrator:ci_migrator_password@localhost:5432/meterlog?schema=public
+      DATABASE_URL: postgresql://meterlog_app:ci_app_password@localhost:5432/meterlog?schema=public
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Run migrations
+        # Creates meterlog_definer and meterlog_app, applies role attributes,
+        # timeouts and schema grants.
+        run: npm run db:migrate:deploy
+
+      - name: Give the app role a password
+        # Deliberately not in the migration: passwords never enter version
+        # control. Locally the docker init script does this; on Render it is a
+        # one-time documented step.
+        run: |
+          PGPASSWORD="$MIGRATOR_PASSWORD" psql \
+            -h localhost -U meterlog_migrator -d "$POSTGRES_DB" \
+            -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE meterlog_app WITH LOGIN PASSWORD '$APP_PASSWORD';"
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        # Includes the catalog RLS suite and the definer probe. Both run as
+        # meterlog_app against the real database.
+        run: npm run test
+
+      - name: Build
+        run: npm run build

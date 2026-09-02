@@ -1,0 +1,210 @@
+# DECISIONS.md — MeterLog
+
+> ADR-style log of significant technical choices. One entry per decision, newest at the bottom.
+> Status: `Proposed` | `Accepted` | `Superseded by ADR-NNN`.
+
+## Template
+
+```
+## ADR-NNN — <Title>
+
+- **Date:**
+- **Status:**
+- **Context:** <the forces at play; what made this a decision>
+- **Decision:** <what we chose>
+- **Consequences:** <what this makes easy, what it makes hard, what we now must do>
+- **Alternatives considered:** <option — why not>
+```
+
+---
+
+## Index
+
+| ADR | Title                                                            | Status   |
+| --- | ---------------------------------------------------------------- | -------- |
+| 001 | Authentication: session cookie + Redis                           | Accepted |
+| 002 | ORM & migrations: Prisma                                         | Accepted |
+| 003 | Backend hosting: Render                                          | Accepted |
+| 004 | RLS enforcement: per-request tenant context + restricted DB role | Accepted |
+| 005 | Repository layout: npm-workspaces monorepo                       | Accepted |
+
+---
+
+## ADR-001 — Authentication: session cookie + Redis
+
+- **Date:** 2026-09-02
+- **Status:** Accepted
+- **Context:** `PROJECT_BRIEF.md` §3 and §7 leave auth as an explicit either/or: stateless JWT (access + refresh) or server-side sessions. Both are defensible. The deciding forces were revocability (§7 requires "support logout/revocation"), the fact that Redis is already in the stack, and a preference for a mechanism whose security properties are easy to reason about and to demonstrate.
+- **Decision:** Server-side sessions stored in Redis, transported via an `httpOnly` + `Secure` + `SameSite` cookie. Passwords hashed with argon2.
+- **Consequences:**
+  - Logout and admin-initiated revocation are real — deleting the Redis key ends the session immediately, with no denylist workaround.
+  - The session record is the natural home for the request's `tenant_id` and `role`, which feeds directly into the RLS context set in ADR-004 and into the RBAC guards.
+  - Redis becomes a hard runtime dependency of the API, not just a cache. It must be present locally (docker-compose) and in production (Render), and its loss logs everyone out.
+  - Cookie-based auth means **CSRF protection is mandatory** (§7) — implemented as part of the auth foundation, not deferred.
+  - CORS must allow-list the frontend origin with credentials enabled, and the cookie needs correct `SameSite`/domain settings given frontend (Vercel) and backend (Render) sit on different hosts.
+  - Slightly less "stateless-microservice-standard" than JWT, but MeterLog is a single deployable modular monolith, so statelessness buys nothing here.
+- **Alternatives considered:**
+  - **JWT access + refresh tokens** — more conventional in portfolio projects and avoids a session store, but honest revocation requires a Redis-backed denylist anyway, reintroducing the statefulness while keeping token-storage and expiry-handling complexity. Rejected as more moving parts for no gain at this scale.
+
+## ADR-002 — ORM & migrations: Prisma
+
+- **Date:** 2026-09-02
+- **Status:** Accepted
+- **Context:** `PROJECT_BRIEF.md` §3 requires picking Prisma or TypeORM and notes Prisma is recommended for DX, with the caveat that Row-Level Security needs raw SQL alongside it. The schema is well-defined up front (§5) and type safety across a TypeScript stack is a primary goal.
+- **Decision:** Prisma as ORM and migration tool. RLS policies, database roles, and grants are authored as hand-written SQL inside Prisma migration files.
+- **Consequences:**
+  - Strong end-to-end type safety from schema to service layer; generated types complement the Zod schemas shared with the frontend.
+  - Migrations are versioned, reviewable SQL — the RLS policies live in the same migration history as the tables they protect, so a fresh database and CI both get them automatically.
+  - **Tenant context must be set on the same connection as the query.** Prisma pools connections, so `SET LOCAL app.current_tenant` only holds inside an interactive `$transaction`. Every tenant-scoped request therefore runs its work through a transaction wrapper (see ADR-004). This is a real constraint on service design and must be enforced centrally, not remembered per-query.
+  - Prisma does not model RLS, roles, or grants in `schema.prisma`; those exist only in raw SQL migrations. `prisma migrate dev` after a schema edit can generate migrations that omit them, so RLS coverage needs an explicit test rather than trust.
+  - Parameterised raw SQL remains available via `$queryRaw` for the `EXPLAIN ANALYZE` index exercise in §13.
+- **Alternatives considered:**
+  - **TypeORM** — closer to the metal, and its query runner makes per-connection session variables slightly more natural for RLS. Rejected for markedly weaker type inference, a heavier decorator/entity layer, and a more manual migration story for a solo build.
+
+## ADR-003 — Backend hosting: Render
+
+- **Date:** 2026-09-02
+- **Status:** Accepted
+- **Context:** `PROJECT_BRIEF.md` §3 and §10 require choosing Railway or Render for the backend, managed Postgres, and Redis, explicitly on cost-conscious grounds. This is a portfolio deployment that must stay live and reachable indefinitely, not a short-lived demo.
+- **Decision:** Render for the NestJS API, managed PostgreSQL, and Redis. Frontend remains on Vercel.
+- **Consequences:**
+  - Predictable flat-rate pricing rather than metered usage credits that drain while the app idles — the right shape for something that must simply stay up.
+  - Managed Postgres backups (§10) and Redis come from the same provider, keeping the data tier in one place with one set of secrets.
+  - Deploys are wired from GitHub Actions on `main` (§9), with migrations as a gated deploy step and a `/health` smoke test after.
+  - Render's free Postgres tier expires and free web services cold-start; the plan tier must be chosen deliberately before the deploy step, and cold starts noted if they affect the p95 latency metric in §13.
+  - Cross-origin cookie configuration (ADR-001) must account for the Vercel/Render host split.
+- **Alternatives considered:**
+  - **Railway** — nicer developer experience and faster initial setup, but usage-credit billing makes an always-on demo's monthly cost less predictable. Rejected on the brief's own cost-conscious criterion.
+
+## ADR-004 — RLS enforcement: per-request tenant context + restricted DB role
+
+- **Date:** 2026-09-02
+- **Status:** Accepted
+- **Context:** `PROJECT_BRIEF.md` §4 lists "how RLS is enforced" as a decision to log, and §7 requires tenant isolation at the database layer rather than in application filtering. Postgres silently bypasses RLS for superusers, for roles with `BYPASSRLS`, and for a table's own owner unless `FORCE ROW LEVEL SECURITY` is set — so the enforcement mechanism is only as good as the role the application connects as.
+- **Decision:** Two database roles. A migration/owner role runs Prisma migrations and owns the schema; a restricted application role, with no `BYPASSRLS` and no table ownership, is what the API connects as at runtime. Every tenant-scoped table gets `ENABLE ROW LEVEL SECURITY` plus `FORCE ROW LEVEL SECURITY` and a policy keyed to `current_setting('app.current_tenant', true)`. A Nest interceptor opens an interactive Prisma transaction per authenticated request, issues `SET LOCAL app.current_tenant` from the session's tenant, and runs the request's work inside it.
+
+### Database roles
+
+Three roles, none of which holds `SUPERUSER` or `BYPASSRLS`.
+
+| Role               | Login  | Purpose                                                                                                                                    |
+| ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| migration/owner    | yes    | Runs Prisma migrations, owns the schema. Environment-provided: Render's generated default user in production, `meterlog_migrator` locally. |
+| `meterlog_definer` | **no** | Owns the pre-auth `SECURITY DEFINER` functions and nothing else. Cannot be connected as; it acts only through those functions.             |
+| `meterlog_app`     | yes    | The runtime connection. Explicitly `NOSUPERUSER NOBYPASSRLS`.                                                                              |
+
+- The migration role is **not named in migration SQL** — objects are owned by their creator, so the same migrations run under Render's generated user and under the local role without edits. Only `meterlog_definer` and `meterlog_app` are created by name, which is what lets policies reference them portably.
+- `meterlog_definer` is created by the migration role, which is therefore a member of it and can transfer function ownership to it.
+
+**`BYPASSRLS` is deliberately absent, because it is both unavailable and unnecessary.** Unavailable: [Render does not grant superuser](https://render.com/docs/databases), and per the [Postgres role-attribute docs](https://www.postgresql.org/docs/current/role-attributes.html) a role may only grant `BYPASSRLS` if it holds it — `CREATEROLE` does not confer it. Unnecessary: `FORCE ROW LEVEL SECURITY` (specified above) applies policies to the table _owner_ as well, so owner-based bypass would not work regardless. `meterlog_definer` instead reaches the auth tables through **named permissive policies scoped `TO meterlog_definer`** plus explicit table grants — ordinary DDL, no role attributes, no superuser, identical locally and on Render.
+
+An earlier draft of this ADR assumed the definer role would bypass RLS by ownership. Under `FORCE`, it does not; the functions would have been fail-closed and silently broken at first login. Recorded here because the correction is the reason the design has a third role at all.
+
+### Auth-table policy
+
+The pre-authentication paths are the one place where a tenant context cannot exist yet, so they are specified rather than left to judgement.
+
+- **`tenants`** is tenant-scoped but has no `tenant_id` column — its key _is_ the tenant. Its policy is keyed on `id = current_setting('app.current_tenant', true)::uuid`. This is called out because a coverage check keyed on the presence of a `tenant_id` column would skip this table entirely; see the catalog test below, whose primary assertion is column-agnostic for exactly this reason.
+- **`users`** carries the standard `tenant_id` policy for all authenticated access, so admin user management is tenant-scoped like any other module.
+- **Login and registration cannot use those policies.** They run before a session exists, so `app.current_tenant` is unset, `current_setting(..., true)` returns NULL, the policy evaluates false, and the app role sees zero rows. That is the correct fail-closed behaviour, and it means the credential lookup must not go through the ordinary query path.
+- **Pre-auth database access goes through a small, fixed set of `SECURITY DEFINER` functions**, owned by `meterlog_definer`, which reaches these two tables via permissive policies scoped `TO meterlog_definer` (see Database roles). Each function:
+  - takes a narrow argument list and returns only the columns that operation needs (the login lookup returns `id`, `tenant_id`, `role`, `password_hash`, `deleted_at` for at most one row);
+  - performs exact-match lookups only — no `LIKE`, no wildcards, no caller-supplied ordering or limits, so the function cannot be used to enumerate users or tenants;
+  - pins `SET search_path = pg_catalog, pg_temp` on the function definition, without which a `SECURITY DEFINER` function is itself a privilege-escalation vector;
+  - **schema-qualifies every object reference in its body** — `public.users`, `public.tenants`, never bare `users`. This is not stylistic: pinning `search_path` to `pg_catalog, pg_temp` deliberately removes `public` from resolution, so an unqualified reference does not resolve to the wrong table, it fails outright. Qualification is what makes the pinned path workable, and the two must be applied together.
+  - grants `EXECUTE` to `meterlog_app` and to no one else.
+- **The definer policies are `FOR ALL` with an explicit `WITH CHECK`.** Registration inserts a tenant and its first admin, and a policy carrying only `USING` does not apply to `INSERT` at all — with no applicable permissive policy, the insert is denied and registration fails closed exactly as login would have. So each is written `FOR ALL TO meterlog_definer USING (true) WITH CHECK (true)`.
+  - Postgres does default `WITH CHECK` to the `USING` expression when it is omitted on a `FOR ALL` policy, so the shorter form would happen to work today. It is written out anyway: the implicit coupling means any future narrowing of `USING` would silently narrow write permission too, which is precisely the kind of quiet, action-at-a-distance change this ADR exists to prevent.
+- **Least privilege comes from the grants, not the policy.** `meterlog_definer` is granted `SELECT, INSERT` on `public.users` and `public.tenants` and nothing else — no `UPDATE`, `DELETE`, `TRUNCATE`, or `REFERENCES`. Table privileges are checked before policies, so a broad `FOR ALL` policy cannot widen what the grants withhold; the policy governs which rows are visible, the grant governs which commands are possible. CI asserts the grant set (below), so the two halves cannot drift apart.
+- **The definer-scoped policies are themselves allowlisted.** A permissive policy `TO meterlog_definer` is a hole in the isolation boundary by construction, so CI asserts such policies exist only on `users` and `tenants` — one cannot appear on `assets` without a reviewed test edit.
+- **The set of `SECURITY DEFINER` functions is an allowlist asserted in CI** (below). Adding a bypass requires editing the expected list in a reviewed test, which is the point — the escape hatch cannot widen quietly.
+- **After login, no pre-auth path is needed per request.** The session in Redis holds `user_id`, `tenant_id`, and `role` (ADR-001), so `GET /auth/me` and every other authenticated request take the normal RLS-scoped path. The permanent pre-auth Postgres surface is therefore just: credential lookup, registration (create tenant + first admin atomically), and `/health`.
+- **Open question deferred to build-order step 4:** §5 specifies `users.email` as unique _per tenant_, so email alone does not identify a user at login. Either the login form carries a tenant discriminator (subdomain or slug) or email becomes globally unique. This determines the credential-lookup function's signature and must be settled before that function is written.
+
+### Interactive-transaction timeouts
+
+Because every authenticated request now runs inside an interactive transaction, Prisma's transaction defaults silently become the API's request deadline and its behaviour under load. They are therefore set explicitly rather than inherited:
+
+| Setting                                          | Value    | Why                                                                                                                               |
+| ------------------------------------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Prisma `maxWait`                                 | 2000 ms  | Time to wait for a pooled connection. Exceeded means the pool is exhausted — surfaced as a 503, not a hung request.               |
+| Prisma `timeout`                                 | 5000 ms  | Ceiling on one request's transaction. Generous against an expected p95 in the low tens of ms.                                     |
+| `statement_timeout` (app role)                   | 4000 ms  | Server-side backstop, set _below_ the Prisma ceiling so Postgres kills the runaway query first and the error names the statement. |
+| `idle_in_transaction_session_timeout` (app role) | 10000 ms | Stops a wedged request holding an open transaction, which would pin a connection and block vacuum.                                |
+
+- The two server-side timeouts are set on the app role in migration SQL, so they apply to production and CI alike and cannot be forgotten in platform config.
+- The layering matters: `statement_timeout` < Prisma `timeout` means a slow query produces a precise Postgres error rather than an opaque Prisma transaction abort.
+- **Connection-holding is the new failure mode.** Each in-flight request occupies a pooled connection for its whole duration, so pool exhaustion — not CPU — is what saturation will look like. Pool size must be set against Render's Postgres connection cap, and the k6 run (§13) is where these numbers get validated rather than guessed.
+- Any endpoint that legitimately needs longer overrides `timeout` at the call site with a comment justifying it. No global raise.
+
+### Catalog-level RLS coverage test (lands at scaffold)
+
+The two-tenant row test proves the mechanism works on tables it knows about. It cannot catch a _new_ table shipped without `ENABLE ROW LEVEL SECURITY`, and the failure modes are asymmetric: RLS enabled with no policy denies all rows (safe, loud), while RLS never enabled leaves an ordinary table fully readable by the app role (unsafe, silent). A test that reads the catalog closes that gap by inverting the default — a new table must be justified as exempt rather than remembered as protected.
+
+Landing at scaffold (build-order step 3), connecting **as the restricted app role**, and asserting:
+
+1. **Coverage** — every ordinary table in `public` has both `relrowsecurity` and `relforcerowsecurity` set in `pg_class`, except those in a short, reviewed exempt list (`_prisma_migrations`). Column-agnostic, so it covers `tenants` and any future table whose tenant key isn't named `tenant_id`.
+2. **The `tenant_id` rule specifically** — no table carrying a `tenant_id` column lacks enabled-and-forced RLS. Redundant with (1) by construction, kept because it names the actual convention and so fails with a far more legible message.
+3. **Policy presence** — every RLS-enabled table has at least one policy in `pg_policies`. Turns the fail-closed case into a build failure instead of a runtime mystery where every query correctly returns nothing.
+4. **`SECURITY DEFINER` allowlist** — the set of such functions in `public` equals the reviewed expected set, every one of them is owned by `meterlog_definer`, and every one has `search_path` pinned in `proconfig`. A definer function without a pinned path fails CI.
+5. **Definer-policy allowlist** — permissive policies scoped `TO meterlog_definer` exist only on `users` and `tenants`.
+6. **Definer grant set** — `meterlog_definer` holds `SELECT, INSERT` on `users` and `tenants` and holds no `UPDATE`, `DELETE`, `TRUNCATE`, or `REFERENCES` on any table. This is what makes the broad `FOR ALL` policy safe, so it is asserted rather than assumed.
+7. **Role sanity** — neither `current_user` nor `meterlog_definer` is `rolsuper` or `rolbypassrls`. This one is load-bearing: if `DATABASE_URL` is ever pointed at the migration role, assertions 1–6 all still pass while isolation is completely gone.
+
+At scaffold there are no domain tables yet, so the suite passes near-vacuously. That is deliberate — it is in CI _before_ the first tenant-scoped table exists, so step 4 cannot introduce one unprotected.
+
+### Functional proof of the definer path
+
+Every assertion above is structural, and structure is not behaviour. A definer function that is present, correctly owned, `search_path`-pinned, and covered by an allowlisted policy will satisfy all seven checks while returning zero rows — which is exactly the `FORCE ROW LEVEL SECURITY` bug recorded under Database roles, and exactly the bug a structural suite cannot see. The pre-auth path therefore needs a test that actually executes it.
+
+Two tests, landing at different points, because the honest constraint is that `users` and `tenants` do not exist until build-order step 4:
+
+- **At scaffold — a definer-pattern probe.** Inside one transaction, a migration-role connection creates a throwaway table, enables and forces RLS, creates a `FOR ALL ... USING (true) WITH CHECK (true)` policy scoped to `meterlog_definer`, and defines a schema-qualified, `search_path`-pinned definer function over it. An app-role connection then asserts both directions: the function can insert and read a row, and direct app-role access to the same table returns nothing. The transaction rolls back, so no fixture table persists and no catalog exemption is needed. This validates the _mechanism_ before any real code depends on it — it is the test that would have failed loudly last round instead of surfacing as a broken login in step 4.
+- **At step 4 — the real round trip.** `POST /auth/register` → `POST /auth/login` → `GET /auth/me` through the running Nest app, asserting a session cookie is issued, the returned identity carries the right `tenant_id` and `role`, and a second registration on the same email behaves per the login-identity decision still open below. This is the acceptance gate for step 4: the auth foundation is not done until it is green.
+
+The probe cannot substitute for the round trip, and the round trip cannot land at scaffold. Both are listed so neither is quietly dropped.
+
+### Catalog-driven isolation test
+
+Presence and correctness are different properties, and only one of them scaled. The checks above guarantee a new table has RLS enabled, forced, and carrying at least one policy — but not that the policy is _right_. A policy of `USING (true)`, or one keyed to the wrong column, satisfies every assertion above and isolates nothing. Meanwhile the two-tenant row test only covers tables someone remembered to hand-write a case for, which is the same discipline problem the catalog check was introduced to eliminate.
+
+So the two-tenant test is driven from the same catalog query:
+
+- **A fixture registry** maps each tenant-scoped table to a row factory. Factories are hand-written — foreign keys, enums, and `NOT NULL` columns make generic row construction impractical — and declare their FK dependencies so the harness can seed parents first (`tenants` → `assets` → `readings`).
+- **The registry's key set is asserted equal to the catalog's table set, in both directions.** A new table with no factory fails the suite; a factory for a dropped table fails it too. This is the move that makes correctness coverage scale like presence coverage — writing an isolation case stops being something to remember and becomes something CI demands.
+- **Each table then runs the same matrix**, seeded with a row for tenant A and a row for tenant B:
+  - under A's context, `SELECT` returns A's row and not B's;
+  - under A's context, `UPDATE` and `DELETE` targeting B's row report zero rows affected — a `USING`-only policy silently permits neither, but a wrong one does;
+  - under A's context, `INSERT` with B's `tenant_id` is rejected, which is what catches a policy written with `USING` but no `WITH CHECK` — a common and quiet mistake that leaves reads isolated while writes are not;
+  - with **no** tenant context set, every table returns zero rows, confirming the fail-closed baseline is real rather than assumed.
+
+The cost is honest: every new tenant-scoped table now requires a fixture before CI goes green. That is the intended trade — it is the same cost as writing the migration, and it buys a correctness guarantee that holds for tables nobody has thought about yet.
+
+- **Consequences:**
+  - Isolation holds even if a service forgets its `where tenant_id` clause; application-layer filtering becomes defence in depth rather than the boundary, exactly as §7 requires.
+  - Two connection strings and two sets of credentials to manage locally and on Render, and migrations run as a different role than the app — a deliberate cost for a meaningful guarantee.
+  - Every tenant-scoped query path must flow through the transaction wrapper; a query issued outside it sees no rows rather than the wrong rows, which fails loudly and safely.
+  - Directly testable, and the test is the centrepiece of the project (§8, §12): seed two tenants, authenticate as A, assert B's rows are invisible — backed by the catalog suite above, which is what keeps that guarantee true for tables written later.
+  - `prisma migrate dev` generates table DDL but never the RLS that protects it (ADR-002). The catalog test is the mechanism that makes that gap impossible to ship rather than merely documented.
+  - The pre-auth `SECURITY DEFINER` functions are a deliberate, enumerated hole in the isolation boundary. They are the highest-value review target in the codebase and should be treated as such.
+- **Alternatives considered:**
+  - **Single database role for migrations and runtime** — one fewer credential, but the app would own the tables, requiring `FORCE ROW LEVEL SECURITY` to be flawless with no second line of defence, and one accidental `BYPASSRLS` or superuser connection string silently disables the entire isolation story. Rejected: the guarantee is the product here.
+  - **Application-layer tenant filtering only** — rejected outright by §7.
+  - **Granting the app role `SELECT` on `users` outside RLS for login** — simpler than a `SECURITY DEFINER` function, but it opens the whole table to every code path rather than to one narrow, reviewed signature. Rejected.
+  - **Catalog test keyed only on the `tenant_id` column** — the obvious form, but it silently skips `tenants` (whose key is `id`) and any future table using a different column name. Kept as assertion (2) for its error message, with the column-agnostic assertion (1) as the actual guarantee.
+
+## ADR-005 — Repository layout: npm-workspaces monorepo
+
+- **Date:** 2026-09-02
+- **Status:** Accepted
+- **Context:** Two deployables (Next.js on Vercel, NestJS on Render) that share validation schemas and API contract types. §3 pins the stack but not the repository shape.
+- **Decision:** A single monorepo using npm workspaces: `apps/api`, `apps/web`, `packages/shared`. No Turborepo, Nx, or other build orchestrator.
+- **Consequences:**
+  - Zod schemas and contract types live in `packages/shared` and are imported by both sides, satisfying the brief's "shared schemas between client and server where practical" (§3).
+  - One install, one lockfile, one CI checkout; lint/typecheck/test/build fan out to both workspaces from root scripts.
+  - No additional tooling dependency, in line with the brief's cost-consciousness and CLAUDE.md's "ask before new dependencies".
+  - Both hosting platforms need a configured root directory and build command, since neither app sits at the repo root.
+  - Without a task orchestrator there is no build caching or dependency-aware task graph; at two apps this is not yet a cost, and Turborepo can be added later if CI duration (§13, target < 10 min) demands it.
+- **Alternatives considered:**
+  - **Two separate repositories** — simpler platform wiring, but shared schemas would need publishing or duplication, and a single feature's audit trail would span two PRs. Rejected.
+  - **Monorepo with Turborepo** — better caching, but an extra dependency and config surface for a two-app repo. Deferred, not rejected.

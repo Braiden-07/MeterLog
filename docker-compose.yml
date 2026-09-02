@@ -1,0 +1,46 @@
+# Local dependencies only. The API and web app run on the host during development
+# (`npm run dev`), which keeps the edit-reload loop fast. Containerising them is a
+# build-order step 10 concern, alongside the Render deploy.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: meterlog-postgres
+    restart: unless-stopped
+    environment:
+      # The cluster's bootstrap user is the MIGRATION/owner role (ADR-004).
+      # The app role is created alongside it by the init script below; it is
+      # deliberately never the owner of anything.
+      POSTGRES_USER: meterlog_migrator
+      POSTGRES_PASSWORD: ${POSTGRES_MIGRATOR_PASSWORD:-migrator_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-meterlog}
+      METERLOG_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-app_dev_password}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs once, on first initialisation of an empty data volume.
+      - ./docker/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U meterlog_migrator -d ${POSTGRES_DB:-meterlog}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: meterlog-redis
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:
+  redis-data:
