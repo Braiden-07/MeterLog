@@ -77,3 +77,44 @@ export const DEFINER_ACCESSIBLE_TABLES: readonly string[] = ['tenants', 'users']
  * it determines the lookup function's signature.
  */
 export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = [];
+
+/**
+ * Contract each tenant-scoped table must satisfy to be covered by the isolation
+ * matrix. Factories are hand-written because foreign keys, enums and NOT NULL
+ * columns make generic row construction impractical.
+ */
+export interface IsolationFixture {
+  /** Tables whose rows must exist first, seeded in this order. */
+  readonly dependsOn?: readonly string[];
+  /** Column carrying the tenant key. `tenants` keys on `id`; everything else on `tenant_id`. */
+  readonly tenantColumn?: string;
+  /** Insert exactly one row belonging to `tenantId`. Returns its primary key. */
+  seed(client: PrismaClient, tenantId: string): Promise<string>;
+}
+
+/**
+ * Fixture registry. Its key set is asserted equal to the catalog's tenant-scoped
+ * table set in BOTH directions, so a new table without a fixture fails the build
+ * and a fixture for a dropped table does too.
+ *
+ * Empty at scaffold because no domain tables exist yet. Step 4 populates it as
+ * tenants and users land — that is the gate, not a formality.
+ */
+export const ISOLATION_FIXTURES: Readonly<Record<string, IsolationFixture>> = {};
+
+/** Runs `body` with the request-scoped tenant context set, as the API does at runtime. */
+export async function withTenant<T>(
+  client: PrismaClient,
+  tenantId: string | null,
+  body: (tx: PrismaClient) => Promise<T>,
+): Promise<T> {
+  return client.$transaction(async (tx) => {
+    // set_config(..., is_local => true) is SET LOCAL: scoped to this transaction,
+    // and therefore to this connection, which is why the whole request must run
+    // inside it (ADR-002/ADR-004).
+    if (tenantId !== null) {
+      await tx.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, true)`, tenantId);
+    }
+    return body(tx as unknown as PrismaClient);
+  });
+}

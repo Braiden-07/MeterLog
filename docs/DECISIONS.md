@@ -100,13 +100,27 @@ Three roles, none of which holds `SUPERUSER` or `BYPASSRLS`.
 
 An earlier draft of this ADR assumed the definer role would bypass RLS by ownership. Under `FORCE`, it does not; the functions would have been fail-closed and silently broken at first login. Recorded here because the correction is the reason the design has a third role at all.
 
+### The canonical policy expression
+
+Every tenant-scoped policy uses this exact expression, for both `USING` and `WITH CHECK`:
+
+```sql
+<key column> = NULLIF(current_setting('app.current_tenant', true), '')::uuid
+```
+
+The `NULLIF` is not decoration, and the harness caught its absence on the first run against a real database.
+
+`current_setting(name, true)` returns NULL only while the setting has *never* been set on that session. Once `SET LOCAL` has set it even once, the parameter exists for the life of the session and reverts at transaction end to the **empty string**, not to NULL. So on a pooled connection — which is every connection after its first authenticated request — an unset context yields `''`, and `''::uuid` raises `22P02 invalid input syntax for type uuid` instead of evaluating false.
+
+That breaks the fail-closed baseline this ADR claims twice over: the "no context set ⇒ zero rows" property becomes "no context set ⇒ 500", and the failure appears only after a connection has been reused, which is exactly the kind of bug that survives a clean-database test run and shows up under load. `NULLIF(..., '')` maps both the never-set and the reverted-to-empty cases to NULL, the comparison evaluates NULL, and the row is filtered. Fail-closed, no error, on the first request and the thousandth.
+
 ### Auth-table policy
 
 The pre-authentication paths are the one place where a tenant context cannot exist yet, so they are specified rather than left to judgement.
 
-- **`tenants`** is tenant-scoped but has no `tenant_id` column — its key _is_ the tenant. Its policy is keyed on `id = current_setting('app.current_tenant', true)::uuid`. This is called out because a coverage check keyed on the presence of a `tenant_id` column would skip this table entirely; see the catalog test below, whose primary assertion is column-agnostic for exactly this reason.
+- **`tenants`** is tenant-scoped but has no `tenant_id` column — its key _is_ the tenant. Its policy is keyed on `id`, using the canonical expression below. This is called out because a coverage check keyed on the presence of a `tenant_id` column would skip this table entirely; see the catalog test below, whose primary assertion is column-agnostic for exactly this reason.
 - **`users`** carries the standard `tenant_id` policy for all authenticated access, so admin user management is tenant-scoped like any other module.
-- **Login and registration cannot use those policies.** They run before a session exists, so `app.current_tenant` is unset, `current_setting(..., true)` returns NULL, the policy evaluates false, and the app role sees zero rows. That is the correct fail-closed behaviour, and it means the credential lookup must not go through the ordinary query path.
+- **Login and registration cannot use those policies.** They run before a session exists, so `app.current_tenant` is unset, the canonical expression above evaluates NULL, the policy evaluates false, and the app role sees zero rows. That is the correct fail-closed behaviour, and it means the credential lookup must not go through the ordinary query path.
 - **Pre-auth database access goes through a small, fixed set of `SECURITY DEFINER` functions**, owned by `meterlog_definer`, which reaches these two tables via permissive policies scoped `TO meterlog_definer` (see Database roles). Each function:
   - takes a narrow argument list and returns only the columns that operation needs (the login lookup returns `id`, `tenant_id`, `role`, `password_hash`, `deleted_at` for at most one row);
   - performs exact-match lookups only — no `LIKE`, no wildcards, no caller-supplied ordering or limits, so the function cannot be used to enumerate users or tenants;
