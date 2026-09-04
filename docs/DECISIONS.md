@@ -110,9 +110,11 @@ Every tenant-scoped policy uses this exact expression, for both `USING` and `WIT
 
 The `NULLIF` is not decoration, and the harness caught its absence on the first run against a real database.
 
-`current_setting(name, true)` returns NULL only while the setting has *never* been set on that session. Once `SET LOCAL` has set it even once, the parameter exists for the life of the session and reverts at transaction end to the **empty string**, not to NULL. So on a pooled connection — which is every connection after its first authenticated request — an unset context yields `''`, and `''::uuid` raises `22P02 invalid input syntax for type uuid` instead of evaluating false.
+`current_setting(name, true)` returns NULL only while the setting has _never_ been set on that session. Once `SET LOCAL` has set it even once, the parameter exists for the life of the session and reverts at transaction end to the **empty string**, not to NULL. So on a pooled connection — which is every connection after its first authenticated request — an unset context yields `''`, and `''::uuid` raises `22P02 invalid input syntax for type uuid` instead of evaluating false.
 
 That breaks the fail-closed baseline this ADR claims twice over: the "no context set ⇒ zero rows" property becomes "no context set ⇒ 500", and the failure appears only after a connection has been reused, which is exactly the kind of bug that survives a clean-database test run and shows up under load. `NULLIF(..., '')` maps both the never-set and the reverted-to-empty cases to NULL, the comparison evaluates NULL, and the row is filtered. Fail-closed, no error, on the first request and the thousandth.
+
+**Enforced by catalog assertion 8**, not by discipline. A behavioural test cannot be trusted to catch this — whether it fails depends on whether the pooled connection it happens to land on has previously set the GUC, so a policy missing the `NULLIF` can pass a full green run and fail in production. Assertion 8 is therefore structural: any policy expression that references `current_setting('app.current_tenant'` must also wrap it in `NULLIF`. Phrased as "references it ⇒ must wrap it", so the definer policies (`USING (true)`) are unaffected and `tenants` (keyed on `id`) needs no special case. Verified to fail on the pre-fix form while assertions 1-7 all still pass — which is the whole reason it exists.
 
 ### Auth-table policy
 
@@ -164,6 +166,7 @@ Landing at scaffold (build-order step 3), connecting **as the restricted app rol
 5. **Definer-policy allowlist** — permissive policies scoped `TO meterlog_definer` exist only on `users` and `tenants`.
 6. **Definer grant set** — `meterlog_definer` holds `SELECT, INSERT` on `users` and `tenants` and holds no `UPDATE`, `DELETE`, `TRUNCATE`, or `REFERENCES` on any table. This is what makes the broad `FOR ALL` policy safe, so it is asserted rather than assumed.
 7. **Role sanity** — neither `current_user` nor `meterlog_definer` is `rolsuper` or `rolbypassrls`. This one is load-bearing: if `DATABASE_URL` is ever pointed at the migration role, assertions 1–6 all still pass while isolation is completely gone.
+8. **Canonical tenant-context expression** — any policy referencing `current_setting('app.current_tenant'` wraps it in `NULLIF` (see The canonical policy expression). Structural rather than behavioural because the bug it guards is connection-dependent and can pass a green run.
 
 At scaffold there are no domain tables yet, so the suite passes near-vacuously. That is deliberate — it is in CI _before_ the first tenant-scoped table exists, so step 4 cannot introduce one unprotected.
 

@@ -87,8 +87,13 @@ jobs:
         run: npm run typecheck
 
       - name: Test
-        # Includes the catalog RLS suite and the definer probe. Both run as
-        # meterlog_app against the real database.
+        # Includes all three database suites — catalog RLS coverage, the
+        # catalog-driven isolation harness, and the definer probe — each running
+        # as meterlog_app against the Postgres service above.
+        #
+        # The web workspace passes with no test files; the API workspace does
+        # not, so a mis-globbed or empty DB suite still fails here rather than
+        # going green on zero matches.
         run: npm run test
 
       - name: Build

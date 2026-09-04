@@ -23,9 +23,11 @@ import {
  * assertion 7: connecting as anything else would let every other check pass while
  * isolation was gone.
  *
- * At scaffold there are no domain tables, so 1-6 pass near-vacuously. That is the
- * point — this is in CI BEFORE the first tenant-scoped table exists, so step 4
- * cannot introduce one unprotected.
+ * At scaffold there are no domain tables, so assertions 1-6 and 8 iterate empty
+ * sets and only 7 has real content. That is the point — these are in CI BEFORE
+ * the first tenant-scoped table exists, so step 4 cannot introduce one that is
+ * unprotected (1-3), reachable by the definer path it should not be (4-6), or
+ * carrying the empty-string heisenbug (8).
  */
 describe('RLS catalog coverage', () => {
   let db: PrismaClient;
@@ -196,5 +198,48 @@ describe('RLS catalog coverage', () => {
       expect(role.rolsuper, `${role.rolname} must not be SUPERUSER`).toBe(false);
       expect(role.rolbypassrls, `${role.rolname} must not have BYPASSRLS`).toBe(false);
     }
+  });
+
+  it('8. every policy referencing the tenant context wraps it in NULLIF', async () => {
+    // Guards a heisenbug. `current_setting(name, true)` returns NULL only while
+    // the setting has never been set on that session; once SET LOCAL has set it
+    // even once, it reverts at transaction end to the EMPTY STRING. So on a
+    // pooled connection an unset context yields '', and ''::uuid raises 22P02
+    // instead of filtering — turning "no context ⇒ zero rows" into
+    // "no context ⇒ 500", but only after a connection has been reused.
+    //
+    // That is invisible to a behavioural test that happens to land on a fresh
+    // connection, which is exactly why it is asserted structurally here instead.
+    // Checked as "references the setting ⇒ must wrap it", so the `true` definer
+    // policies are unaffected and `tenants` (keyed on `id`, not `tenant_id`)
+    // needs no special case.
+    const rows = await db.$queryRawUnsafe<
+      { table_name: string; policy_name: string; clause: string; expression: string }[]
+    >(`
+      SELECT c.relname AS table_name,
+             p.polname AS policy_name,
+             clause.name AS clause,
+             clause.expr AS expression
+      FROM pg_policy p
+      JOIN pg_class c ON c.oid = p.polrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN LATERAL (
+        VALUES ('USING', pg_get_expr(p.polqual, p.polrelid)),
+               ('WITH CHECK', pg_get_expr(p.polwithcheck, p.polrelid))
+      ) AS clause(name, expr)
+      WHERE n.nspname = 'public'
+        AND clause.expr IS NOT NULL
+        AND clause.expr LIKE '%current_setting(''app.current_tenant''%'
+        AND clause.expr NOT LIKE '%NULLIF(current_setting(''app.current_tenant''%'
+      ORDER BY 1, 2, 3
+    `);
+
+    const offenders = rows.map(
+      (r) => `${r.table_name}.${r.policy_name} [${r.clause}]: ${r.expression}`,
+    );
+    expect(
+      offenders,
+      `policies using the raw tenant setting instead of NULLIF(current_setting('app.current_tenant', true), ''):\n  ${offenders.join('\n  ')}`,
+    ).toEqual([]);
   });
 });

@@ -30,7 +30,9 @@
 
 **Verified locally:** `npm run lint`, `npm run typecheck`, `npm run build` all clean; the health unit test passes. `nest build` initially emitted to `dist/src/` because the test tree was in compile scope — fixed with `tsconfig.build.json`, so `dist/main.js` now matches the `start` script.
 
-**Not verified locally:** the two DB suites. Docker is not installed on this machine, and the local PostgreSQL 18 service requires a password I do not have — I did not attempt to guess it or alter that instance. Both suites will execute for the first time in CI. Treat their first CI run as the real result.
+**Verified in CI** — [run 33877274316](https://github.com/Braiden-07/MeterLog/actions/runs/33877274316), commit `5539224`, success in 1m54s. Migrations connected to the CI Postgres service (`Datasource "db": PostgreSQL database "meterlog" ... at "localhost:5432"` → `All migrations have been successfully applied`), and the API workspace reported real counts: definer-probe 5, isolation 6, catalog-rls 7, health 1 — **19 passed**. `--passWithNoTests` applied only to the web workspace, so a mis-globbed or empty DB suite would still fail rather than pass on zero matches.
+
+**What is actually exercised, honestly.** With no domain tables, catalog assertions 1–6 and 8 iterate empty sets; only 7 (runtime role identity) has real content today. The isolation harness's `describe.each` matrix generates zero cases — its 6 passing tests are 1 vacuous fixture-coverage check plus 5 scratch-table self-tests. The definer probe is fully real (5 cases against its own fixtures). Negatives in the probe and the self-test were each confirmed to fail when their bug is mutated back in.
 
 **Next**
 
@@ -73,6 +75,12 @@
 - GitHub Actions CI running lint + typecheck + the test suite above.
 - Update the Commands block in `CLAUDE.md` to the real scripts once they exist.
 - Fill in `docs/ARCHITECTURE.md` §3 (repo layout) and §7 (RLS) as the scaffold lands.
+
+**Known-thin at scaffold (not defects, but do not mistake them for coverage)**
+
+- `packages/shared` is declared by both apps but imported by neither. The API build was verified to compile an import of it; the web side is untested.
+- `apps/web/e2e/` is empty. Playwright browsers are installed, so `npm run test:e2e` is untested rather than broken. CI does not run it.
+- The Nest skeleton's `ValidationPipe` and CORS config are configured but unexercised — no DTO endpoint and no cross-origin request exists yet. `/api/v1/health`, Helmet headers, Swagger and the route prefix were verified against a running instance.
 
 **Step 4 acceptance gates (named, not parenthetical)**
 
