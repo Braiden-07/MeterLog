@@ -11,8 +11,58 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// No models yet. Tenants, users, assets, asset_events, readings,
-// maintenance_records and audit_log land in build-order step 4 onward
-// (PROJECT_BRIEF §5, §11). Every one of them arrives with RLS enabled and
-// forced in the same migration, plus an isolation fixture — the catalog suite
-// in test/db fails the build otherwise.
+// NOTE: Prisma models the tables, never the RLS policies, grants, or roles that
+// protect them (ADR-002). Those live only in hand-written migration SQL, and
+// `prisma migrate dev` will happily generate a migration that omits them — which
+// is why test/db/catalog-rls.spec.ts asserts coverage rather than trusting it.
+
+enum MembershipRole {
+  admin
+  technician
+  auditor
+
+  @@map("membership_role")
+}
+
+model Tenant {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  memberships Membership[]
+
+  @@map("tenants")
+}
+
+/// Pure identity — no tenant_id, no role (ADR-006 §2). Both live on Membership.
+model User {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String    @db.Citext
+  passwordHash String    @map("password_hash")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+  deletedAt    DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  memberships Membership[]
+
+  @@map("users")
+}
+
+/// Grants one user one role in one tenant. A user may hold many.
+model Membership {
+  id        String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String         @map("user_id") @db.Uuid
+  tenantId  String         @map("tenant_id") @db.Uuid
+  role      MembershipRole
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime       @default(now()) @map("updated_at") @db.Timestamptz(6)
+  deletedAt DateTime?      @map("deleted_at") @db.Timestamptz(6)
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId], map: "memberships_tenant_id_idx")
+  @@map("memberships")
+}

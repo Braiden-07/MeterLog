@@ -92,8 +92,42 @@ export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = ['login_lookup', 'r
  * declared rather than left implicit: the fixture-coverage check below accounts
  * for these tables so their absence from the matrix cannot be mistaken for an
  * oversight, and their bespoke dual-axis test is mandatory.
+ *
+ * `users` and `tenants` are here for a different reason: the generic matrix seeds
+ * through the app role, and by design the app role cannot write either table.
+ * Tenants are created by `register_tenant` (definer) and users likewise; the app
+ * role holds `SELECT` only. The matrix's INSERT case would fail with "permission
+ * denied" rather than the row-level-security rejection it asserts — a failure
+ * about grants, not isolation. Their policies are covered by the bespoke suite.
+ *
+ * The generic matrix therefore still generates zero cases at step 4 Phase 1. It
+ * activates on its own at step 6, when `assets`/`readings` land — those the app
+ * role genuinely does write.
  */
-export const ISOLATION_BESPOKE_TABLES: readonly string[] = ['memberships'];
+export const ISOLATION_BESPOKE_TABLES: readonly string[] = ['memberships', 'users', 'tenants'];
+
+/**
+ * Request-scoped context, as the interceptor will set it in Phase 3.
+ *
+ * `withTenant` sets only the tenant GUC, which is all a plain tenant-scoped table
+ * needs. The identity tables need both axes, and the difference is exactly why
+ * the generic matrix cannot cover `memberships` (ADR-006 §8.2).
+ */
+export async function withContext<T>(
+  client: PrismaClient,
+  ctx: { userId?: string | null; tenantId?: string | null },
+  body: (tx: PrismaClient) => Promise<T>,
+): Promise<T> {
+  return client.$transaction(async (tx) => {
+    if (ctx.userId) {
+      await tx.$executeRawUnsafe(`SELECT set_config('app.current_user', $1, true)`, ctx.userId);
+    }
+    if (ctx.tenantId) {
+      await tx.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, true)`, ctx.tenantId);
+    }
+    return body(tx as unknown as PrismaClient);
+  });
+}
 
 /**
  * Contract each tenant-scoped table must satisfy to be covered by the isolation
