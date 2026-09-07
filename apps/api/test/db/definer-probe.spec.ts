@@ -146,9 +146,9 @@ describe('SECURITY DEFINER + FORCE RLS mechanism', () => {
     );
     expect(read[0]?.n).toBe(0);
 
-    await expect(
-      app.$queryRawUnsafe(`SELECT ${SCHEMA}.write_no_policy(2) AS id`),
-    ).rejects.toThrow(/row-level security/i);
+    await expect(app.$queryRawUnsafe(`SELECT ${SCHEMA}.write_no_policy(2) AS id`)).rejects.toThrow(
+      /row-level security/i,
+    );
   });
 
   // --- C: the bug itself ---------------------------------------------------

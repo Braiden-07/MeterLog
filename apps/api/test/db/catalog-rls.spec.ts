@@ -119,7 +119,19 @@ describe('RLS catalog coverage', () => {
       ORDER BY 1
     `);
 
-    expect(rows.map((r) => r.function_name).sort()).toEqual([...EXPECTED_DEFINER_FUNCTIONS].sort());
+    // Subset, not equality: the allowlist is the set of definer functions that
+    // are PERMITTED to exist, so it may name functions not yet written (ADR-006
+    // fixes it to {login_lookup, register_tenant} before step 4 creates them).
+    // The security property is one-directional — a function present in the
+    // catalog but absent from the list is an unreviewed hole in the isolation
+    // boundary; a listed function that does not exist yet is only a declaration.
+    const unlisted = rows
+      .map((r) => r.function_name)
+      .filter((name) => !EXPECTED_DEFINER_FUNCTIONS.includes(name));
+    expect(
+      unlisted,
+      `SECURITY DEFINER functions not on the reviewed allowlist: ${unlisted.join(', ')}`,
+    ).toEqual([]);
 
     for (const fn of rows) {
       expect(fn.owner, `${fn.function_name} must be owned by meterlog_definer`).toBe(
@@ -200,7 +212,7 @@ describe('RLS catalog coverage', () => {
     }
   });
 
-  it('8. every policy referencing the tenant context wraps it in NULLIF', async () => {
+  it('8. every policy reference to an app.* GUC is wrapped in NULLIF', async () => {
     // Guards a heisenbug. `current_setting(name, true)` returns NULL only while
     // the setting has never been set on that session; once SET LOCAL has set it
     // even once, it reverts at transaction end to the EMPTY STRING. So on a
@@ -210,9 +222,16 @@ describe('RLS catalog coverage', () => {
     //
     // That is invisible to a behavioural test that happens to land on a fresh
     // connection, which is exactly why it is asserted structurally here instead.
-    // Checked as "references the setting ⇒ must wrap it", so the `true` definer
-    // policies are unaffected and `tenants` (keyed on `id`, not `tenant_id`)
-    // needs no special case.
+    //
+    // Deliberately matches ANY `app.*` GUC, not just app.current_tenant. The
+    // first version of this assertion named that one setting, and would have
+    // waved through every raw `app.current_user` reference in ADR-006's draft —
+    // the guard had the same blind spot as the bug it exists to catch. Any new
+    // request-scoped GUC is covered from the moment it is written.
+    //
+    // Phrased as "references a GUC ⇒ must wrap it", so `USING (true)` definer
+    // policies are unaffected and tables keyed on a column other than
+    // `tenant_id` (e.g. `tenants.id`) need no special case.
     const rows = await db.$queryRawUnsafe<
       { table_name: string; policy_name: string; clause: string; expression: string }[]
     >(`
@@ -229,17 +248,33 @@ describe('RLS catalog coverage', () => {
       ) AS clause(name, expr)
       WHERE n.nspname = 'public'
         AND clause.expr IS NOT NULL
-        AND clause.expr LIKE '%current_setting(''app.current_tenant''%'
-        AND clause.expr NOT LIKE '%NULLIF(current_setting(''app.current_tenant''%'
+        AND clause.expr LIKE '%current_setting(''app.%'
       ORDER BY 1, 2, 3
     `);
 
-    const offenders = rows.map(
-      (r) => `${r.table_name}.${r.policy_name} [${r.clause}]: ${r.expression}`,
-    );
+    // The wrapper check runs here rather than in SQL: Postgres regex lookbehind
+    // is not dependable across versions, and every occurrence must be checked,
+    // not just the first.
+    const NEEDLE = "current_setting('app.";
+    const WRAPPER = 'NULLIF(';
+    const offenders: string[] = [];
+
+    for (const row of rows) {
+      for (
+        let i = row.expression.indexOf(NEEDLE);
+        i !== -1;
+        i = row.expression.indexOf(NEEDLE, i + 1)
+      ) {
+        if (row.expression.slice(i - WRAPPER.length, i) !== WRAPPER) {
+          offenders.push(`${row.table_name}.${row.policy_name} [${row.clause}]: ${row.expression}`);
+          break;
+        }
+      }
+    }
+
     expect(
       offenders,
-      `policies using the raw tenant setting instead of NULLIF(current_setting('app.current_tenant', true), ''):\n  ${offenders.join('\n  ')}`,
+      `policies referencing an app.* GUC without the NULLIF(current_setting('app.<guc>', true), '') wrapper:\n  ${offenders.join('\n  ')}`,
     ).toEqual([]);
   });
 });

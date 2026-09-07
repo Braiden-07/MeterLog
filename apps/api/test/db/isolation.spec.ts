@@ -4,6 +4,7 @@ import type { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  ISOLATION_BESPOKE_TABLES,
   ISOLATION_FIXTURES,
   RLS_EXEMPT_TABLES,
   appClient,
@@ -55,10 +56,11 @@ describe('catalog-driven tenant isolation', () => {
         ORDER BY 1
       `);
 
-      const catalogTables = rows
-        .map((r) => r.table_name)
-        .filter((t) => !RLS_EXEMPT_TABLES.includes(t))
-        .sort();
+      const allTables = rows.map((r) => r.table_name).filter((t) => !RLS_EXEMPT_TABLES.includes(t));
+
+      // Tables with a bespoke dual-axis test (ADR-006 §8.2) are accounted for
+      // here rather than silently missing from the matrix.
+      const catalogTables = allTables.filter((t) => !ISOLATION_BESPOKE_TABLES.includes(t)).sort();
       const registered = Object.keys(ISOLATION_FIXTURES).sort();
 
       const missing = catalogTables.filter((t) => !registered.includes(t));
@@ -67,10 +69,20 @@ describe('catalog-driven tenant isolation', () => {
       // Asserted in both directions on purpose: a new table without a fixture is
       // an isolation hole, and a fixture for a dropped table is dead weight that
       // would quietly stop covering anything.
-      expect(missing, `tenant-scoped tables with no isolation fixture: ${missing.join(', ')}`).toEqual(
-        [],
-      );
+      expect(
+        missing,
+        `tenant-scoped tables with no isolation fixture: ${missing.join(', ')}`,
+      ).toEqual([]);
       expect(stale, `fixtures for tables that no longer exist: ${stale.join(', ')}`).toEqual([]);
+
+      // A table cannot be both exempted for bespoke handling and registered in
+      // the generic matrix — that combination means one of the two is a leftover
+      // and nobody can tell which is authoritative.
+      const contradictory = ISOLATION_BESPOKE_TABLES.filter((t) => registered.includes(t));
+      expect(
+        contradictory,
+        `tables both exempted for bespoke handling and registered in the generic matrix: ${contradictory.join(', ')}`,
+      ).toEqual([]);
     });
   });
 
@@ -114,9 +126,9 @@ describe('catalog-driven tenant isolation', () => {
     it('INSERT for a foreign tenant is rejected by WITH CHECK', async () => {
       // Catches a policy written with USING but no WITH CHECK — reads isolated,
       // writes not.
-      await expect(
-        withTenant(app, tenantA, (tx) => fixture.seed(tx, tenantB)),
-      ).rejects.toThrow(/row-level security/i);
+      await expect(withTenant(app, tenantA, (tx) => fixture.seed(tx, tenantB))).rejects.toThrow(
+        /row-level security/i,
+      );
     });
 
     it('with no tenant context set, nothing is visible', async () => {
@@ -202,7 +214,10 @@ describe('catalog-driven tenant isolation', () => {
       expect(updated).toBe(0);
 
       const deleted = await withTenant(app, tenantA, (tx) =>
-        tx.$executeRawUnsafe(`DELETE FROM ${PROBE_SCHEMA}.widgets WHERE tenant_id = $1::uuid`, tenantB),
+        tx.$executeRawUnsafe(
+          `DELETE FROM ${PROBE_SCHEMA}.widgets WHERE tenant_id = $1::uuid`,
+          tenantB,
+        ),
       );
       expect(deleted).toBe(0);
 

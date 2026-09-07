@@ -1,11 +1,22 @@
 ## ADR-006 — Membership-based multi-tenancy (users decoupled from tenants; per-user tenant switching)
 
 - **Date:** 2026-09-04
-- **Status:** Accepted — with four sub-decisions marked **OPEN** below that must be answered before the code they govern is written. None blocks scaffold-level work.
+- **Status:** Accepted. All four sub-decisions resolved (§11). Corrected in stage-1 review before any code read from it — see **§0 Review corrections**, which is the reason several lines read the way they do.
+
 - **Supersedes / amends:**
   - The login-identity open question in **ADR-004** (whether email carries a tenant discriminator) — resolved here: email is **globally unique** and carries no tenant discriminator, because tenant is no longer a property of a user.
   - **PROJECT_BRIEF §5** `users` schema — `users.email` becomes globally unique (not per-tenant) and `users.tenant_id` / `users.role` move to a new `memberships` table. §5 explicitly invites schema refinement ("illustrative — refine during design phase, log schema decisions"); this is that refinement, logged.
   - **ADR-004** is extended, not replaced: its two-role-plus-definer structure, `FORCE ROW LEVEL SECURITY`, per-request `SET LOCAL` context, catalog tests, and definer pattern all stand. This ADR adds a **second RLS axis** and grows the definer surface by one function and one table.
+
+### 0. Review corrections (stage-1, verified against a live database)
+
+This ADR was pressure-tested before being frozen. Five defects were found and fixed in the text below; each was reproduced against Postgres 16 rather than reasoned about, and the fix re-verified the same way. They are recorded here because the corrected lines look unremarkable, and the next person to edit them needs to know what they are load-bearing against.
+
+1. **Privilege escalation via the self axis (critical).** §3 originally said `memberships` "carries two permissive policies", both given as `USING (...)`. Implemented as `FOR ALL`, Postgres defaults `WITH CHECK` to the `USING` expression, and permissive policies OR on writes as well as reads — so the self axis became a write path. A technician active in tenant A successfully ran `INSERT INTO memberships (user_id, tenant_id, role) VALUES (<self>, <tenant B>, 'admin')`, granting themselves **admin of a tenant they had no relationship with**, then legitimately switching into it. §4's re-verification is no defence: the membership genuinely exists. Fixed by making the self axis **`FOR SELECT`**, which carries no `WITH CHECK` at all. Re-verified: the same INSERT now raises `new row violates row-level security policy`, while the self-read still returns the user's own memberships.
+2. **The `NULLIF` lesson had not been applied.** Every `current_setting` in §3 and §4 used the raw form. Reproduced both failure modes on the new `app.current_user` GUC: `invalid input syntax for type uuid: ""` on a reused connection, and — because §4's query omitted the `missing_ok` argument entirely — `unrecognized configuration parameter "app.current_tenant"` on a fresh one. The re-verify did **not** fail closed; it 500'd, non-deterministically. All occurrences now use the canonical `NULLIF(current_setting('app.<guc>', true), '')::uuid`.
+3. **Verification happened after the tenant GUC was set.** §4 set `app.current_tenant` and then checked it. Reordered so the tenant GUC is never set to an unverified value at any instant (§4).
+4. **`/auth/me` could not return workspace names.** ADR-004's `tenants` policy is `id = current_tenant`, so every workspace but the active one was invisible. Added a second `FOR SELECT` policy (§3).
+5. **`deleted_at IS NULL` in a read policy makes soft delete impossible** — see the boxed finding in §3. This one contradicts an instruction given during review, and is recorded as an open decision (**OPEN-5**) rather than silently resolved.
 
 ### 1. Context and decision
 
@@ -41,7 +52,7 @@ This introduces a **two-axis RLS model** — one axis keyed on the acting user (
 **Constraints and indexes**
 
 - **Unique `(user_id, tenant_id)` where `deleted_at IS NULL`** — at most one _live_ membership per user per tenant. Partial (excludes soft-deleted) so a removed user can be re-invited to the same tenant later without a constraint collision. Apply the same partial-unique pattern to `users.email`.
-- Index `memberships(user_id)` — the self-read axis (login, switcher) hits this.
+- The partial unique on `(user_id, tenant_id)` above already serves the self-read axis and §4 re-verify lookups; **no separate `memberships(user_id)` index** — it would be write cost for nothing.
 - Index `memberships(tenant_id)` — the tenant-admin axis (user management) hits this.
 - FK `ON DELETE RESTRICT` both ways (consistent with §5; memberships are never cascade-deleted — revocation is a soft delete).
 
@@ -58,14 +69,54 @@ Two request-scoped GUCs, both set by the interceptor inside the per-request tran
 
 **`memberships` carries two permissive policies** (permissive policies OR together — this is deliberate and load-bearing):
 
-1. **Self axis** — `USING (user_id = current_setting('app.current_user', true)::uuid)`. Lets a user read _their own_ memberships across all tenants. This is what builds the workspace list at login and powers the switcher. At login `app.current_tenant` is still unset, so only this policy matches — the user sees exactly their own memberships and nothing else.
-2. **Tenant-admin axis** — `USING (tenant_id = current_setting('app.current_tenant', true)::uuid)`. Lets an admin acting in a tenant read _all_ memberships in that tenant, for user management.
+1. **Self axis — `FOR SELECT`, and this is not negotiable.**
 
-`memberships` gets `ENABLE` + `FORCE ROW LEVEL SECURITY` like every other table. Write policies (`WITH CHECK`) are scoped to `tenant_id = app.current_tenant` so a membership can only ever be created/modified inside the active tenant; the _admin-role_ requirement on those writes is enforced by the Nest RBAC guard, not the policy (keeping policy logic simple and role logic in one place).
+   ```sql
+   CREATE POLICY memberships_self_read ON public.memberships
+     FOR SELECT TO meterlog_app
+     USING (user_id = NULLIF(current_setting('app.current_user', true), '')::uuid);
+   ```
+
+   Lets a user read _their own_ memberships across all tenants. This builds the workspace list at login and powers the switcher. At login `app.current_tenant` is still unset, so only this policy matches — the user sees exactly their own memberships and nothing else.
+
+   **It must be `FOR SELECT`, never `FOR ALL`.** A `FOR ALL` policy with only a `USING` clause has its `WITH CHECK` defaulted to the same expression, and because permissive policies OR on writes, the self axis would then permit `INSERT`s where `user_id = self` — letting any user grant themselves **admin of any tenant**, and then switch into it legitimately. This was not hypothetical; it was demonstrated against a live database in stage-1 review (§0). `FOR SELECT` carries no `WITH CHECK` at all, which is precisely why it is the right shape for a read axis.
+
+2. **Tenant-admin axis** — the only write path.
+
+   ```sql
+   CREATE POLICY memberships_tenant ON public.memberships
+     FOR ALL TO meterlog_app
+     USING      (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+     WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+   ```
+
+   Lets an admin acting in a tenant read and manage _all_ memberships in that tenant. A membership can only ever be created or modified inside the active tenant; the _admin-role_ requirement on those writes is enforced by the Nest RBAC guard, not the policy (keeping policy logic simple and role logic in one place).
+
+**New: `tenants` gains a second, `FOR SELECT` policy** so `/auth/me` can name the user's workspaces. ADR-004's policy (`id = app.current_tenant`) exposes only the active tenant, which left the switcher able to render ids and roles but not names.
+
+```sql
+CREATE POLICY tenants_workspace_list ON public.tenants
+  FOR SELECT TO meterlog_app
+  USING (id IN (SELECT m.tenant_id FROM public.memberships m
+                WHERE m.user_id = NULLIF(current_setting('app.current_user', true), '')::uuid
+                  AND m.deleted_at IS NULL));
+```
+
+`FOR SELECT` for the same reason as the self axis — a read-shaped policy must not become a write vector. The subquery is itself filtered by `memberships`' own policies (the self axis scopes it to the acting user, which is exactly the intent) and does **not** recurse, because no `memberships` policy references `tenants`. Verified: a user with memberships in A and B, active in A, reads both names and no others.
+
+`memberships` gets `ENABLE` + `FORCE ROW LEVEL SECURITY` like every other table.
+
+> **Finding: `deleted_at IS NULL` in a read policy makes soft delete impossible — OPEN-5.**
+>
+> The intent was to enforce revocation at the database in all three membership-reading paths. It cannot be done in the row policies. When an `UPDATE` carries a `WHERE` clause, Postgres applies the **SELECT** policy to the _new_ row as well as the old, so a `deleted_at IS NULL` predicate in any SELECT-applicable policy causes `UPDATE memberships SET deleted_at = now() WHERE ...` to fail with `new row violates row-level security policy` — revocation, the very operation the predicate exists to make effective, becomes impossible. Verified minimally: identical statement, the only difference being that predicate; and the same `UPDATE` _without_ a `WHERE` clause succeeds. Splitting into `FOR SELECT` + `FOR UPDATE` policies does not help, because it is the SELECT policy that bites.
+>
+> **What is enforced in the database today (verified):** liveness lives in the two paths that only ever read — §4's re-verify query and the `tenants_workspace_list` subquery above. With those, revocation still takes full effect: the re-verify returns zero rows (→ 403) and the revoked workspace disappears from `/auth/me`. **Residual:** a raw self-axis read of `memberships` still returns the revoked row, with `deleted_at` set for the caller to filter on.
+>
+> **OPEN-5 — decide before step 4 writes the memberships migration.** Options: **(a)** accept the residual, keeping liveness in the two read paths plus caller predicates (revocation works, one app-level predicate to remember on membership listings); **(b)** keep `deleted_at IS NULL` in the row policies and route revocation through a third `SECURITY DEFINER` function — fully DB-enforced, but grows the highest-risk surface in the system for a routine admin operation; **(c)** hard-delete memberships and rely on `audit_log` for history, which also removes the need for the partial-unique-on-`deleted_at` index. Recommendation: **(a)** for v1.0 — it keeps the definer surface at two functions, and the security-critical paths (re-verify, workspace list) are DB-enforced either way.
 
 **The isolation property this yields, stated precisely:** a user can see (a) their own memberships everywhere, and (b) all memberships in a tenant they are _currently active in_ — and they can only become active in a tenant they hold a verified membership for (§4). They can therefore never enumerate the membership structure of a tenant they don't belong to. That is the guarantee the tests in §8 must prove.
 
-> **Sharp edge for the test harness — read §8.2 before writing the isolation suite.** The generic catalog-driven matrix assumes "under tenant A's context, a row belonging to tenant B is invisible." For `memberships` that is _false by design_ when the B-row is the acting user's own membership: the self axis (policy 1) correctly reveals it. `memberships` must therefore be **exempted from the generic tenant-only matrix and given a bespoke dual-axis test**, or the harness will produce a false failure and someone will "fix" it by weakening a policy. This is the single most likely place for this ADR to go wrong in implementation.
+> **Sharp edge for the test harness — read §8.2 before writing the isolation suite.** `memberships` must be **exempted from the generic tenant-only matrix and given a bespoke dual-axis test**. The danger is not that the generic matrix fails loudly — it is that it _passes_. See §8.2 for exactly why; do not rely on a green generic matrix as evidence that `memberships` is covered.
 
 ### 4. Request lifecycle and the membership-verification check
 
@@ -73,16 +124,26 @@ The load-bearing security check of the whole model: **the active tenant a reques
 
 **Belt — session is authoritative (ADR-001, session-in-Redis).** The session holds `user_id`, and once resolved, `active_tenant_id` and the `role` for that active membership. The session's active tenant can _only_ be written by login-auto-select or the switch endpoint, both of which verify the membership first. Because the session lives server-side in Redis, the client cannot forge an active tenant — this is a concrete payoff of choosing sessions over JWT in ADR-001.
 
-**Braces — per-request re-verification (handles mid-session revocation).** The interceptor, inside the transaction, after `SET LOCAL app.current_user` and `SET LOCAL app.current_tenant`, runs one cheap indexed read of the acting user's membership in the active tenant _under RLS_:
+**Braces — per-request re-verification (handles mid-session revocation).** The ordering is **verify, then set** — the tenant GUC must never hold an unverified value at any instant. Inside the per-request transaction:
 
-```
-SELECT role FROM memberships
-WHERE user_id = current_setting('app.current_user')::uuid
-  AND tenant_id = current_setting('app.current_tenant')::uuid
-  AND deleted_at IS NULL;
-```
+1. `SET LOCAL app.current_user` — always, for every authenticated request.
+2. Re-verify the claimed tenant, **passing it as a bound parameter, not reading it from a GUC**. The self axis alone can read this row, so no tenant context is needed yet:
 
-Zero rows → the membership was revoked since the session was minted → reject with 403 and clear the session's active tenant. This makes revocation effective on the _next request_, not at next login. Cost: one indexed single-row query per authenticated request — acceptable, and it uses the `memberships(user_id)` / `(tenant_id)` indexes. The freshly-read `role` also becomes the authoritative role for RBAC this request, so a role _change_ also takes effect next request without re-login.
+   ```sql
+   SELECT role FROM public.memberships
+   WHERE user_id = NULLIF(current_setting('app.current_user', true), '')::uuid
+     AND tenant_id = $1::uuid
+     AND deleted_at IS NULL;
+   ```
+
+3. Zero rows → the membership was revoked since the session was minted → 403, clear the session's active tenant, and `app.current_tenant` is never set.
+4. One row → `SET LOCAL app.current_tenant` to the verified value, and use the freshly-read `role` as the authoritative role for RBAC this request.
+
+This makes the guarantee structural rather than sequential: there is no window, however brief, in which the tenant axis is live for a tenant the user may not hold. It also makes revocation effective on the _next request_ rather than at next login, and a role _change_ likewise.
+
+Two details the earlier draft got wrong, both verified in stage-1 review (§0). The `, true` (`missing_ok`) argument is required — without it the query raises `unrecognized configuration parameter` on a connection where the GUC was never set. And the `NULLIF` is required — without it a reused pooled connection sees `''` and raises `invalid input syntax for type uuid`. With both, an unset context yields `NULL`, the comparison yields no rows, and the request fails closed with a clean 403. Verified to return zero rows rather than error on both a fresh and a reused connection.
+
+Cost: one indexed single-row read per authenticated request. It is served by the partial unique index on `(user_id, tenant_id) WHERE deleted_at IS NULL`, which covers this query exactly.
 
 ### 5. Auth flows
 
@@ -96,7 +157,7 @@ Zero rows → the membership was revoked since the session was minted → reject
 2. Verify argon2 hash in the app. Generic failure on no-user-or-bad-password (no user enumeration).
 3. `SET LOCAL app.current_user = id`; read live memberships under RLS policy 1.
 4. Branch on membership count:
-   - **0** → 403 "no active workspaces" (all memberships revoked; the account exists but grants nothing). **OPEN-2:** confirm this is the desired behavior vs. a dedicated empty-state screen.
+   - **0** → login **succeeds (200)**; issue the session with `user_id` and no active tenant. `/auth/me` returns the person with an empty workspace list — that empty list is the client signal. Tenant-scoped requests then 403 via the existing no-active-tenant fail-closed path, with no special casing. User-facing message is "no workspace access — ask an admin to invite you", not an auth failure. (OPEN-2, resolved: reject-at-login was considered and rejected for muddying the authn/authz boundary.)
    - **1** → auto-select as active; write `active_tenant_id` + `role` into the session; issue the session cookie. Login is complete in one step — identical UX to the brief's single-tenant flow for the common case.
    - **many** → issue the session cookie with `user_id` but **no** active tenant; return the workspace list; the client must call switch before any tenant-scoped request will succeed.
 
@@ -132,9 +193,16 @@ Both keep every ADR-004 hardening: owned by `meterlog_definer`, `SET search_path
 - Definer-function allowlist = `{login_lookup, register_tenant}`.
 - Definer-policy allowlist tables = `{users, tenants, memberships}` (was two).
 - Definer grant assertion includes `SELECT, INSERT` on `memberships`.
+- **Generalize catalog assertion 8 to any `app.*` GUC.** It currently matches only `current_setting('app.current_tenant'` and would not have caught this ADR's raw `app.current_user` usages — the guard had the same blind spot the bug exploited. Broaden it to require the `NULLIF(..., '')` wrapper on any `current_setting('app.*', ...)` reference in any policy qual or with-check.
 - `memberships` must appear with RLS enabled + forced like every other table (the column-agnostic assertion 1 already covers it; it has a `tenant_id` column so assertion 2 covers it too).
 
-**8.2 Catalog-driven isolation harness (ADR-004) — `memberships` is a special case.** Per the sharp edge in §3: exempt `memberships` from the generic tenant-only matrix and write a **bespoke dual-axis test**:
+**8.2 Catalog-driven isolation harness (ADR-004) — `memberships` is a special case.**
+
+**Why the generic matrix cannot be trusted here, stated correctly.** An earlier draft of this ADR said the generic matrix would produce a _false failure_ on `memberships`, because the self axis legitimately reveals the acting user's own B-membership under A's context. That reasoning is wrong, and wrong in the more dangerous direction. The harness sets **only** `app.current_tenant` and never `app.current_user`, so the self axis matches nothing and never fires at all. Verified against a live database: under tenant A's context with the user GUC unset, the matrix sees A's rows only, no B rows leak, and it **passes** — having exercised exactly half the policy surface. On a connection where `app.current_user` had previously been set, it instead raises `22P02` (see §0 item 2), so the other possible outcome is a flaky error. Neither is a true red.
+
+The practical consequence: **a green generic matrix on `memberships` is not evidence of anything**, and anyone who sees it green must not conclude the table is covered. That is why the bespoke test below is mandatory rather than a nicety, and why `memberships` is registered as an explicit exempt-with-bespoke-handler entry so its absence from the generic matrix is a declared decision rather than a silent gap.
+
+The bespoke dual-axis test:
 
 - **Tenant axis:** user M (member of A only) acting in A cannot see a membership belonging to user N in tenant B. (Standard isolation.)
 - **Self axis:** user M who is a member of both A and B, acting in A, _can_ see their own B-membership via policy 1 — assert this is present and correct, not treated as a leak.
@@ -152,6 +220,8 @@ Both keep every ADR-004 hardening: owned by `meterlog_definer`, `SET search_path
 
 ### 9. Frontend changes (step 8)
 
+**Scope decision (made deliberately, to stop step 8 ballooning):** a **minimal workspace switcher with a hard cache reset on switch** satisfies the cache-isolation security property below and is what v1.0 ships. A polished picker — search, avatars, recent-workspace ordering, transition states — is explicitly **out of scope for v1.0**. The backend contract is what earns the portfolio claim; the switcher has to be secure, not pretty. Step 8 is the likeliest place for this ADR's cost to run away, and this is the line against it.
+
 - **Post-login workspace picker** when the user has >1 membership; skipped (auto-selected) for exactly 1, so the single-tenant user's experience matches the brief.
 - **Persistent active-workspace indicator + switcher** in the app nav, driven by `/auth/me`'s workspace list.
 - **TanStack Query cache MUST be keyed by active `tenant_id`** (include it in every query key, or reset the cache on switch). RLS protects the _database_; the browser cache does not know tenants exist, so switching A→B without namespacing the cache will flash A's rows into B's views — a client-side isolation bug that lives entirely above the DB and would undercut the isolation story if a reviewer hit it. This is not optional polish; it is part of the isolation guarantee at the client boundary.
@@ -168,12 +238,16 @@ Both keep every ADR-004 hardening: owned by `meterlog_definer`, `SET search_path
 7. **`memberships` dual-axis isolation test (8.2)** is green and the table is correctly registered as a bespoke case in the harness.
 8. **`EXPECTED_DEFINER_FUNCTIONS`** updated to `{login_lookup, register_tenant}`; definer-policy allowlist updated to three tables.
 
-### 11. Open decisions (must be answered before the governed code is written)
+### 11. Sub-decisions (resolved)
 
-- **OPEN-1 (governs `register_tenant` + invite):** existing-email on register → reject 409 (recommended) or attach-to-existing-user; and correspondingly, invite-to-tenant attaches to an existing `users` row. Decide register + invite together for consistency.
-- **OPEN-2 (governs login):** zero-live-memberships on login → 403 "no workspaces" (recommended) or a dedicated empty state.
-- **OPEN-3 (cosmetic, governs the switch route):** endpoint name for tenant switching.
-- **OPEN-4 (governs audit, deferrable to step 7):** whether to record role-at-time-of-action in the audit payload, or leave attribution at person + row-tenant.
+- **OPEN-1 — RESOLVED. One `users` row per email, ever; multi-tenancy is expressed purely through memberships.**
+  - Register with an already-existing email → **reject 409**. Registration is new-org-with-new-account only.
+  - Invite with an already-existing email → **attach a new membership to the existing user**. This is the multi-org mechanism, and it is the same identity question as register seen from the other side, answered consistently.
+  - **Escape hatch — do not build now.** If self-serve second-org creation is ever wanted, it belongs behind an authenticated `POST /tenants`, never as a change to `register`. Recorded here as the designated future home so `register` does not accrete a second purpose later.
+- **OPEN-2 — RESOLVED. Zero live memberships → login succeeds (200).** Session issued with `user_id` and no active tenant; `/auth/me` returns the person with an empty workspace list, which is the client's signal. Tenant-scoped requests 403 through the existing no-active-tenant fail-closed path — no special casing. Message is "no workspace access — ask an admin to invite you", not an auth failure. Reject-at-login was explicitly rejected for muddying the authn/authz boundary. The frontend empty-state page is an optional step-8 upgrade, not a step-4 requirement; the backend contract is identical either way.
+- **OPEN-3 — RESOLVED.** The tenant-switch endpoint is **`POST /auth/switch`**.
+- **OPEN-4 — DEFERRED to step 7.** Whether to record role-at-time-of-action in the audit payload is decided when the audit module is built. Until then attribution stays at person (`users.id`) + the row's own `tenant_id`.
+- **OPEN-5 — OPEN, must be answered before the memberships migration is written.** Where `deleted_at IS NULL` is enforced, given that it cannot live in the row policies without breaking revocation. See the boxed finding in §3 for the three options and the recommendation.
 
 ### 12. Consequences
 

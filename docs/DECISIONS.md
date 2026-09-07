@@ -27,6 +27,7 @@
 | 003 | Backend hosting: Render                                          | Accepted |
 | 004 | RLS enforcement: per-request tenant context + restricted DB role | Accepted |
 | 005 | Repository layout: npm-workspaces monorepo                       | Accepted |
+| 006 | Membership-based multi-tenancy (two-axis RLS)                    | Accepted |
 
 ---
 
@@ -135,7 +136,7 @@ The pre-authentication paths are the one place where a tenant context cannot exi
 - **The definer-scoped policies are themselves allowlisted.** A permissive policy `TO meterlog_definer` is a hole in the isolation boundary by construction, so CI asserts such policies exist only on `users` and `tenants` — one cannot appear on `assets` without a reviewed test edit.
 - **The set of `SECURITY DEFINER` functions is an allowlist asserted in CI** (below). Adding a bypass requires editing the expected list in a reviewed test, which is the point — the escape hatch cannot widen quietly.
 - **After login, no pre-auth path is needed per request.** The session in Redis holds `user_id`, `tenant_id`, and `role` (ADR-001), so `GET /auth/me` and every other authenticated request take the normal RLS-scoped path. The permanent pre-auth Postgres surface is therefore just: credential lookup, registration (create tenant + first admin atomically), and `/health`.
-- **Open question deferred to build-order step 4:** §5 specifies `users.email` as unique _per tenant_, so email alone does not identify a user at login. Either the login form carries a tenant discriminator (subdomain or slug) or email becomes globally unique. This determines the credential-lookup function's signature and must be settled before that function is written.
+- **~~Open question~~ RESOLVED by ADR-006.** This ADR originally deferred the login-identity question — §5 made `users.email` unique _per tenant_, so email alone did not identify a user at login. ADR-006 dissolves it rather than answering it: tenant is no longer a property of a user, so `users.email` is **globally unique** and carries no tenant discriminator. `login_lookup(email)` therefore takes email alone.
 
 ### Interactive-transaction timeouts
 
@@ -177,7 +178,7 @@ Every assertion above is structural, and structure is not behaviour. A definer f
 Two tests, landing at different points, because the honest constraint is that `users` and `tenants` do not exist until build-order step 4:
 
 - **At scaffold — a definer-pattern probe.** Inside one transaction, a migration-role connection creates a throwaway table, enables and forces RLS, creates a `FOR ALL ... USING (true) WITH CHECK (true)` policy scoped to `meterlog_definer`, and defines a schema-qualified, `search_path`-pinned definer function over it. An app-role connection then asserts both directions: the function can insert and read a row, and direct app-role access to the same table returns nothing. The transaction rolls back, so no fixture table persists and no catalog exemption is needed. This validates the _mechanism_ before any real code depends on it — it is the test that would have failed loudly last round instead of surfacing as a broken login in step 4.
-- **At step 4 — the real round trip.** `POST /auth/register` → `POST /auth/login` → `GET /auth/me` through the running Nest app, asserting a session cookie is issued, the returned identity carries the right `tenant_id` and `role`, and a second registration on the same email behaves per the login-identity decision still open below. This is the acceptance gate for step 4: the auth foundation is not done until it is green.
+- **At step 4 — the real round trip.** `POST /auth/register` → `POST /auth/login` → `GET /auth/me` through the running Nest app, asserting a session cookie is issued, the returned identity carries the right `tenant_id` and `role`, and a second registration on the same email is rejected 409 (ADR-006 OPEN-1). This is the acceptance gate for step 4: the auth foundation is not done until it is green.
 
 The probe cannot substitute for the round trip, and the round trip cannot land at scaffold. Both are listed so neither is quietly dropped.
 
@@ -225,3 +226,24 @@ The cost is honest: every new tenant-scoped table now requires a fixture before 
 - **Alternatives considered:**
   - **Two separate repositories** — simpler platform wiring, but shared schemas would need publishing or duplication, and a single feature's audit trail would span two PRs. Rejected.
   - **Monorepo with Turborepo** — better caching, but an extra dependency and config surface for a two-app repo. Deferred, not rejected.
+
+## ADR-006 — Membership-based multi-tenancy (two-axis RLS)
+
+- **Date:** 2026-09-04
+- **Status:** Accepted. Full text in [`ADR-006-membership-model.md`](./ADR-006-membership-model.md); this entry is the index summary.
+- **Context:** The brief models one tenant per user, which makes the isolation claim — the centrepiece of the project — only ever testable across _different_ users. The metering domain routinely involves service providers whose staff operate across several client organizations.
+- **Decision:** Split person from role-in-tenant. `users` becomes pure identity with a **globally unique** email; a new `memberships` table grants one user one role in one tenant. Sessions carry an active tenant, switchable via `POST /auth/switch`. This introduces a **second RLS axis** (`app.current_user`) alongside ADR-004's `app.current_tenant`.
+- **Consequences:**
+  - The isolation claim strengthens from "A can't see B" to "a user who is a member of both A and B, acting in A, cannot see B — and cannot assert B as active unless verified."
+  - **Supersedes ADR-004's login-identity open question** and refines `PROJECT_BRIEF` §5: `users.email` global-unique, `users.tenant_id`/`users.role` move to `memberships`.
+  - The definer surface stays at two functions (`login_lookup`, `register_tenant`) and grows by one table's grants; the tenant/role read moves _under_ RLS rather than into a definer.
+  - `memberships`' dual policy is the highest-risk implementation detail in the system. Its self axis **must be `FOR SELECT`** — see below.
+  - Cost concentrates in steps 4, 5 and 8. Step 8 is capped by decision: a minimal switcher with a hard cache reset, not a polished picker.
+- **Corrected in stage-1 review, verified against a live database** (detail in §0 of the full ADR):
+  - **Critical — privilege escalation.** The self axis written `FOR ALL` lets a user INSERT themselves a membership granting **admin of any tenant**, because Postgres defaults `WITH CHECK` to `USING` and permissive policies OR on writes. Demonstrated, then fixed by `FOR SELECT`.
+  - Every `current_setting` now uses `NULLIF(current_setting('app.<guc>', true), '')` — the raw form in the draft did not fail closed, it errored.
+  - Re-verification reordered to **verify-then-set**, with the candidate tenant as a bound parameter, so `app.current_tenant` never holds an unverified value.
+  - Added a `FOR SELECT` policy on `tenants` so `/auth/me` can name workspaces the user is not currently active in.
+  - **OPEN-5 raised:** `deleted_at IS NULL` cannot live in the membership row policies — with a `WHERE`-filtered UPDATE, Postgres applies the SELECT policy to the _new_ row, so the predicate makes soft-delete revocation impossible. Liveness is enforced in the two read-only paths (re-verify, workspace-list subquery) pending that decision.
+- **Alternatives considered:**
+  - **Keep the brief's one-tenant-per-user model** — less work, and defensible against "do not over-build". Rejected because a membership model deepens the single thing the project exists to demonstrate rather than adding an orthogonal feature, and `PROJECT_BRIEF` §5 explicitly invites schema refinement.

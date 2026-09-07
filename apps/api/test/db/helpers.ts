@@ -65,18 +65,35 @@ export const RLS_EXEMPT_TABLES: readonly string[] = ['_prisma_migrations'];
  * Tables the pre-auth SECURITY DEFINER path is permitted to reach, and the only
  * ones allowed to carry a policy scoped `TO meterlog_definer` (ADR-004).
  */
-export const DEFINER_ACCESSIBLE_TABLES: readonly string[] = ['tenants', 'users'];
+export const DEFINER_ACCESSIBLE_TABLES: readonly string[] = ['tenants', 'users', 'memberships'];
 
 /**
  * The complete set of SECURITY DEFINER functions. Each is a deliberate,
  * enumerated hole in the isolation boundary; the list is asserted so one cannot
  * be added without a reviewed edit here.
  *
- * Empty at scaffold. The credential lookup and registration functions land in
- * build-order step 4, once the login-identity question (PROGRESS.md) is settled —
- * it determines the lookup function's signature.
+ * Fixed by ADR-006 §6. `login_lookup(email)` takes email alone — ADR-004's
+ * login-identity question is dissolved rather than answered, since email is now
+ * globally unique. `register_tenant` performs the three-row atomic insert
+ * (tenant + user + membership). Both land in build-order step 4; until then this
+ * list is asserted against an empty catalog.
  */
-export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = [];
+export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = ['login_lookup', 'register_tenant'];
+
+/**
+ * Tables deliberately excluded from the generic tenant-only isolation matrix
+ * because a bespoke test covers them instead (ADR-006 §8.2).
+ *
+ * `memberships` carries two permissive policies — a `FOR SELECT` self axis keyed
+ * on `app.current_user` and a tenant axis keyed on `app.current_tenant`. The
+ * generic matrix sets only the tenant GUC, so the self axis never fires and the
+ * table quietly **passes** while half its policy surface goes untested. A green
+ * generic matrix here would be evidence of nothing, which is why the exclusion is
+ * declared rather than left implicit: the fixture-coverage check below accounts
+ * for these tables so their absence from the matrix cannot be mistaken for an
+ * oversight, and their bespoke dual-axis test is mandatory.
+ */
+export const ISOLATION_BESPOKE_TABLES: readonly string[] = ['memberships'];
 
 /**
  * Contract each tenant-scoped table must satisfy to be covered by the isolation
