@@ -6,12 +6,51 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **Phases 1–2 complete** — schema, migrations, the full two-axis RLS policy set, and the two pre-auth `SECURITY DEFINER` functions with registration atomicity. Phases 3–4 (interceptor + per-request re-verify, endpoints) not started.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **Phases 1–3 complete** — schema, migrations, the full two-axis RLS policy set, the two pre-auth `SECURITY DEFINER` functions with registration atomicity, and the two-GUC interceptor with per-request membership re-verification. Phase 4 (auth endpoints) not started.
 - **Blockers:** —
+- **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-08 — Step 4 Phase 3: the two-GUC interceptor and per-request re-verification (§11 step 4)
+
+**Done**
+
+- **`TenantContextInterceptor`** (`src/common/tenant-context/`) — the request machinery from ADR-004 + ADR-006 §4. One interactive transaction per authenticated request, because `SET LOCAL` is scoped to a transaction and therefore to the single pooled connection it holds. Ordering is **verify, then set**: set `app.current_user`; re-verify the claimed tenant with it passed as a **bound parameter**, never read from a GUC; zero rows ⇒ 403 with `app.current_tenant` never assigned; one row ⇒ set the tenant GUC and use the freshly-read role.
+- **`RequestContext`** (`src/common/request-context/`) — `AsyncLocalStorage` carrying the transaction client, user, tenant and re-verified role. `requireRequestContext()` throws rather than returning an empty context: a handler reaching for tenant scope outside a request is a bug, and it must be loud rather than silently unscoped.
+- **`SessionService`** (`src/common/session/`) — Redis-backed sessions (ADR-001), signed-cookie ids (HMAC-SHA256 over a 128-bit id, `timingSafeEqual`). The client holds only an opaque id, so it cannot forge an active tenant — the "belt" half of ADR-006 §4. **New dependency: `ioredis`**, executing ADR-001's recorded choice; Redis was already in compose, CI and `.env`.
+- **`CommonModule`** provides all three. The interceptor is deliberately **not** bound via `APP_INTERCEPTOR` yet — there are no authenticated routes until Phase 4, and binding it globally now would wrap `/health` in an interactive transaction for nothing.
+- **CI gained `SESSION_SECRET`.** `SessionService` refuses to construct without one, on purpose, so an unsigned-cookie deployment cannot happen by accident.
+
+**Verified against live Postgres, with negatives**
+
+Every case runs the **real interceptor**, and the app client is pinned to `connection_limit=1` because the failure surface this phase exists to cover is **pooled-connection statefulness**, not policy correctness — Phase 1 already proved the policy.
+
+- **The hard one — revocation between two requests on a reused connection.** Request 1 succeeds with `app.current_tenant = A`; the membership is revoked between requests (`UPDATE 1`, asserted, so the fixture cannot silently no-op); request 2 on the **same backend** throws `ForbiddenException`, **the route handler never runs**, and the connection is left with `app.current_tenant = ''` and zero rows of A reachable. The vacuity guard is explicit: `pg_backend_pid()` is asserted equal across the two requests, because a request 2 landing on a fresh connection would prove nothing about pooled statefulness and would pass either way. (Confirmed separately that pids do differ across connections, so the assertion has real content.)
+- **The session's active tenant is cleared on the 403**, so a third request stops re-asserting a workspace the user no longer holds — it succeeds with no tenant context rather than 403-looping.
+- **Role changes follow the membership, not the session.** The session still cached `admin`; after an `UPDATE ... SET role = 'auditor'` the very next request reports `auditor`, with the stale session copy still sitting there unused.
+- **GUC hygiene across pooled requests.** M-in-A followed by N-in-B on the same backend: no bleed, correct counts, and an unauthenticated third request gets no context at all. Asserted on **both a fresh and a reused connection**, because the ADR-004 heisenbug is asymmetric — `current_setting` returns NULL on a connection that has never had the GUC set, and the **empty string** once `SET LOCAL` has touched it. Checking only one is how that bug survived review the first time.
+- **Verify-before-set ordering.** The behavioural cases cannot separate the two orderings — both end in a 403 with a rolled-back transaction and no residue — so ordering is asserted on the **emitted SQL** via Prisma query events: `set_config('app.current_user')` → the memberships re-verify → `set_config('app.current_tenant')`.
+- **Liveness through the interceptor.** OPEN-5's DB-side claim, now exercised end-to-end rather than against the policy in isolation: a revoked membership yields zero rows at the re-verify ⇒ 403, with the soft-deleted row asserted still present so the test cannot pass on a fixture that failed to revoke anything.
+- **Fail-closed on poisoned context:** a session naming a non-existent user, a tampered cookie signature, and a valid signature over a destroyed session all get no context.
+
+**Mutation sweep — 9 mutations, 9 caught** (after one fix, below).
+
+`verify-after-set`; re-verify skipped entirely; `SET` instead of `SET LOCAL` on the tenant GUC; the same on the user GUC; the `NULLIF` guard dropped; `deleted_at IS NULL` dropped from the re-verify; the re-verify moved above the user-GUC assignment; that same reordering plus the dropped `NULLIF`; and the tenant read from a GUC instead of a bound parameter.
+
+**The one that initially escaped, and what it taught.** Dropping the `NULLIF` from the re-verify reddened _nothing_ — because the interceptor sets `app.current_user` immediately beforehand, so `current_setting` always returns a valid uuid and the guard never fires. It was unreachable-by-construction, not unnecessary: mutations 7 and 8 differ by that guard alone, and the failure modes differ exactly as ADR-004 predicts — **with** the `NULLIF` the misordered code still throws `ForbiddenException` (fail closed), **without** it a `PrismaClientKnownRequestError`, i.e. a 500 instead of a 403. Rather than leave it flagged-but-untested, a reachable case was added: a session with a **blank** `userId` writes `''` into the GUC, which is exactly the state the guard exists for. That is a real poisoned-session state (corrupted Redis value, or a future path that forgets to populate it), not a contrivance, and the property — fail closed with 403, never 500 — is one worth holding. Dropping the `NULLIF` now reddens it.
+
+That test also demonstrated the heisenbug in miniature: run in isolation it **passes** under the mutation, because a fresh connection returns NULL rather than `''`. It only fails in a full run, once the connection has been reused. A per-test-isolation habit would have hidden it.
+
+**Not done, and not claimed.** No endpoints — no `/auth/register`, `/auth/login`, `/auth/me`, `/auth/switch`, `/auth/logout`. No RBAC guard. The interceptor is not globally bound. Step 4's definition of done needs the round-trip, the multi-membership switch, unauthorized-switch 403, revocation as an **observable endpoint behaviour**, and role-follows-active-membership — Phase 3 makes the machinery correct and proves revocation fails closed at the re-verify layer, but none of it is observable over HTTP until Phase 4 exists.
+
+**Next**
+
+- **Phase 4** — the auth endpoints on top of this machinery, binding the interceptor where it belongs, and the `23505` → 409 mapping recorded in `ARCHITECTURE.md` §16.2.
+
+---
 
 ### 2026-09-08 — Step 4 Phase 2: the pre-auth SECURITY DEFINER surface (§11 step 4)
 

@@ -50,6 +50,11 @@ jobs:
       MIGRATION_DATABASE_URL: postgresql://meterlog_migrator:ci_migrator_password@localhost:5432/meterlog?schema=public
       DATABASE_URL: postgresql://meterlog_app:ci_app_password@localhost:5432/meterlog?schema=public
       REDIS_URL: redis://localhost:6379
+      # Not a secret: it signs session cookies for the throwaway CI database only.
+      # A real value comes from the platform secret store at deploy (ARCHITECTURE §16).
+      # It must be SET, though — SessionService refuses to construct without one,
+      # deliberately, so an unsigned-cookie deployment is impossible by accident.
+      SESSION_SECRET: ci_session_secret_not_used_outside_ci
 
     steps:
       - uses: actions/checkout@v4
