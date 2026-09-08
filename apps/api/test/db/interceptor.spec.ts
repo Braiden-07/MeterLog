@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { ForbiddenException } from '@nestjs/common';
 import type { CallHandler, ExecutionContext } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import { PrismaClient as PrismaClientCtor } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
 import { Observable, firstValueFrom } from 'rxjs';
@@ -62,7 +63,7 @@ describe('tenant-context interceptor (Phase 3)', () => {
     prisma = new PrismaService();
     await prisma.$connect();
     sessions = new SessionService();
-    interceptor = new TenantContextInterceptor(prisma, sessions);
+    interceptor = new TenantContextInterceptor(prisma, sessions, new Reflector());
     migrator = migratorClient();
     process.env.DATABASE_URL = base;
   });
@@ -98,8 +99,15 @@ describe('tenant-context interceptor (Phase 3)', () => {
 
   function contextWithCookie(cookie: string | undefined): ExecutionContext {
     const headers = cookie ? { cookie: `${SESSION_COOKIE}=${encodeURIComponent(cookie)}` } : {};
+    // getHandler/getClass are required because the interceptor now consults the
+    // Reflector for @RequiresSession on the session-less path. These stand in for
+    // an unannotated route, which is the correct default for this suite: it tests
+    // the context machinery, not route-level auth policy (that is test/api).
+    const noop = (): void => undefined;
     return {
       switchToHttp: () => ({ getRequest: () => ({ headers }) }),
+      getHandler: () => noop,
+      getClass: () => class {},
     } as unknown as ExecutionContext;
   }
 
@@ -389,7 +397,11 @@ describe('tenant-context interceptor (Phase 3)', () => {
       );
 
       try {
-        const tracing = new TenantContextInterceptor(traced as unknown as PrismaService, sessions);
+        const tracing = new TenantContextInterceptor(
+          traced as unknown as PrismaService,
+          sessions,
+          new Reflector(),
+        );
         const cookie = await login(userM, tenantA, 'admin');
         await firstValueFrom(
           tracing.intercept(

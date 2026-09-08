@@ -6,13 +6,53 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **Phases 1–3 complete** — schema, migrations, the full two-axis RLS policy set, the two pre-auth `SECURITY DEFINER` functions with registration atomicity, and the two-GUC interceptor with per-request membership re-verification. Phase 4 (auth endpoints) not started.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete, pending gate review** — all four phases. Schema + two-axis RLS, the pre-auth definer surface, the two-GUC interceptor with per-request re-verification, and the five auth endpoints with the step-4 acceptance suite green over real HTTP. Step 5 (RBAC + the membership-write definer functions) next.
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-08 — Step 4 Phase 4: the auth endpoints and the step-4 acceptance suite (§11 step 4)
+
+**Done**
+
+- **Five endpoints** (`src/auth/`): `POST /auth/register`, `POST /auth/login`, `POST /auth/switch`, `GET /auth/me`, `POST /auth/logout`, wiring ADR-006's resolved OPEN-1/2/3 behaviours. Argon2id password hashing (ADR-001) via `@node-rs/argon2` — prebuilt bindings, so CI needs no compiler.
+- **The interceptor is now bound globally** (`APP_INTERCEPTOR`), the wiring deferred through Phase 3. Global rather than per-route is correct because it opens a transaction only when a session is actually present, so `/health`, register and login pass straight through untouched.
+- **`HttpExceptionFilter`** normalises every error to the project envelope `{ error: { code, message, details? } }`, including `ValidationPipe` rejections, which otherwise ship Nest's own shape.
+- **`@RequiresSession()`** marks the routes that need identity; the interceptor enforces it. See the two defects below for why it is not a guard.
+- New dev dependency `@types/express`; new runtime dependency `@node-rs/argon2`.
+
+**Two defects found while building, both fixed rather than papered over**
+
+1. **A protected route with no session returned 500, not 401.** The interceptor deliberately does not reject session-less requests — `/health`, register and login legitimately have none — so a handler calling `requireRequestContext()` threw a raw `Error` and the filter turned it into a 500. The refusal was right; the status and the reason were wrong. Worse, the first version of the acceptance test **asserted the 500**, which documents a defect instead of catching it. Now `@RequiresSession()` + a 401 with `UNAUTHENTICATED`, and the test asserts that.
+2. **The obvious fix — a `CanActivate` guard — rejects every request, authenticated or not.** Nest runs **guards before interceptors**, so the guard cannot see a request context the interceptor has not established yet. Observed, not reasoned about: every acceptance test went 401 at once. A guard could re-read and re-verify the session itself, but that means a second Redis round-trip per request and two places deciding what a valid session is. So the _declaration_ lives at the route as metadata and the single _enforcement_ point stays inside the interceptor that already resolved the session.
+
+**Verified over real HTTP, with negatives** — every case goes through supertest with real signed session cookies through the bound interceptor. Calling `AuthService` directly would bypass the interceptor and prove strictly less, the same shape as a rolled-back wrapper hiding non-atomicity.
+
+- **DoD 1 — register → login → `/auth/me` round-trips.** 201 → 200 with the single membership auto-selected → `/auth/me` naming the person, the active workspace and its role. Cookie asserted `HttpOnly` and `SameSite=Lax`. Logout destroys the session and the same cookie then 401s.
+- **Risk A — the interceptor is genuinely live.** _Positive:_ `/auth/me` returns real content, which is only possible if both GUCs were set — `users` and `tenants` are under FORCE RLS with policies keyed on them. _Negative:_ no cookie, a garbage cookie, and a well-formed-shape-but-bad-signature cookie all return **401**, not 200-with-nothing. Pre-auth routes still work, so the global binding costs them nothing.
+- **DoD 2 — the multi-membership switch.** Two memberships ⇒ login returns 200 with `activeWorkspace: null` and both workspaces; `POST /auth/switch` moves the active tenant and it persists to the next request.
+- **DoD 3 / Risk B — unauthorized switch.** Proven against a **real, existent second tenant with a real membership belonging to someone else** — 403 `NOT_A_MEMBER`, and nothing of that tenant becomes reachable afterwards. A malformed uuid would only have proven that `@IsUUID` runs; it says nothing about the boundary. The nonexistent-but-well-formed uuid case is covered separately, also 403.
+- **DoD 4 — revocation over HTTP.** Request 1 succeeds; the membership is revoked (`UPDATE 1`, asserted); request 2 returns **403 `MEMBERSHIP_REVOKED`** on the **same pooled backend** — pids read from `pg_stat_activity`, baseline-subtracted so a stray connection from another suite cannot make the assertion vacuous. The pooled-connection discipline does not lapse because there is an HTTP layer on top. Request 3 then succeeds with an empty workspace list rather than 403-looping, because the 403 cleared the session's active tenant.
+- **DoD 5 — role follows the active membership.** The same person is `admin` in one workspace and `technician` in the other, switching between them; and a role changed underneath a live session is picked up on the very next request.
+- **DoD 6 — isolation holds through the API.** A member of two tenants sees exactly those two and never the third.
+- **OPEN-1** duplicate register ⇒ **409** keyed on SQLSTATE `23505`, with no orphan tenant left behind, and case-insensitively (matching the index). **OPEN-2** zero memberships ⇒ **200** with no active tenant, landing in the no-active-tenant state without 403-looping. Login failures are byte-identical for unknown-email and wrong-password, and the no-such-user branch still performs an argon2 verify against a real dummy hash so the timing does not answer the question either.
+
+**Mutation sweep — 6 mutations, 6 caught** (after making one reachable).
+
+Interceptor unbound (**13 red** — the single most consequential wiring in the phase); switch authorization removed (2 red, both against the real-second-tenant case); the 409 keyed on the constraint name in the message rather than SQLSTATE (2 red — the Phase 2 carry-forward, now proven rather than asserted); `@RequiresSession` not enforced (2 red); login skipping password verification (1 red); and the app-side liveness predicate dropped from the workspace query.
+
+**The one that initially escaped, and why it mattered.** Dropping `AND m.deleted_at IS NULL` from `readWorkspaces` reddened nothing — the `JOIN` to `tenants` is filtered by `tenants_workspace_list`, which carries liveness of its own, so a workspace held **only** through a revoked membership is dropped by the join regardless. The obvious revoked-workspace test therefore proves nothing about that predicate. The reachable case is **re-invitation**, which ADR-006 §2 designs the _partial_ unique index for: `(user_id, tenant_id) WHERE deleted_at IS NULL` permits one live membership alongside any number of revoked ones for the same tenant. The tenant is then visible through the live row, the join keeps **both**, and the workspace appears twice — the duplicate carrying whatever role the person held before removal. In the added test that stale role is `admin` against a current `auditor`, so without the predicate the switcher would offer someone admin of a workspace they are an auditor in. Same treatment as Phase 3's `NULLIF`: diagnosed as unreachable-by-construction, then made reachable through a real scenario rather than left flagged.
+
+**Not done, and not claimed.** No RBAC guard and no role-gated endpoints — step 5. No membership-write definer functions (invite / revoke / change-role); when they land they are bound by the standing rule in ADR-006 §7, and their gate requires **live authorization negatives**, not just atomicity. No frontend: the empty-state page for the zero-membership login is step 8, and only the API behaviour exists today.
+
+**Next**
+
+- Step 5 — RBAC, and the admin-checking membership-write definer functions Decision B requires. `EXPECTED_DEFINER_FUNCTIONS` must be edited deliberately when they land.
+
+---
 
 ### 2026-09-08 — Step 4 Phase 3: the two-GUC interceptor and per-request re-verification (§11 step 4)
 

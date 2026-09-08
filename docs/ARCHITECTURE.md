@@ -21,8 +21,12 @@ meterlog/
 │   │   │   ├── common/session/          Redis sessions + signed cookie ids
 │   │   │   ├── common/request-context/  AsyncLocalStorage: tx, user, tenant, role
 │   │   │   ├── common/tenant-context/   the two-GUC interceptor (verify-before-set)
+│   │   │   ├── common/auth/             @RequiresSession route metadata
+│   │   │   ├── common/http/             error-envelope exception filter
+│   │   │   ├── auth/                    register · login · switch · me · logout
 │   │   │   └── health/                  GET /api/v1/health
-│   │   └── test/db/                     catalog RLS · isolation · definer · interceptor
+│   │   ├── test/db/                     catalog RLS · isolation · definer · interceptor
+│   │   └── test/api/                    step-4 acceptance, real HTTP + real cookies
 │   ├── web/                     Next.js App Router (Tailwind, TanStack Query, RHF, Zod)
 │   └── ...
 ├── packages/shared/             Zod contracts shared by both apps
@@ -35,6 +39,16 @@ meterlog/
 ## 4. Backend modules
 
 ### 4.1 Auth
+
+`POST /auth/register` · `POST /auth/login` · `POST /auth/switch` · `GET /auth/me` · `POST /auth/logout`, all under `/api/v1`.
+
+- **register** — `register_tenant` (definer) writes tenant + person + admin membership atomically. Duplicate email ⇒ **409**, keyed on SQLSTATE `23505` (§16.2). Does not log the user in; registration stays single-purpose.
+- **login** — `login_lookup` (definer) → argon2 verify → workspaces read under RLS via `app.current_user`. Zero memberships ⇒ **200** with no active tenant (OPEN-2); one ⇒ auto-selected; many ⇒ session with no active tenant plus the workspace list. Failures are generic and constant-time-ish, so the endpoint cannot enumerate accounts.
+- **switch** — the membership-model boundary. Verifies the membership under RLS before touching the session; a well-formed, existent tenant the caller is not a member of ⇒ **403**.
+- **me** — the person, the active workspace, and every live workspace. Carries the one documented app-side `deleted_at IS NULL` predicate (OPEN-5).
+- **logout** — destroys the Redis session and clears the cookie.
+
+Routes needing identity are marked `@RequiresSession()`; the tenant-context interceptor enforces it and returns **401**. It is deliberately _not_ a `CanActivate` guard — Nest runs guards **before** interceptors, so a guard cannot see a request context that has not been established yet.
 
 ### 4.2 Tenants
 
@@ -117,6 +131,7 @@ The stored `role` is **not authoritative** — it goes stale the moment an admin
 - [ ] **Confirm no `SECURITY DEFINER` function is executable by `PUBLIC`**, and that each pins a `search_path` that does **not** contain `public` (catalog assertions 4, 11, 12).
 - [ ] **Set the `meterlog_app` password** — deliberately absent from migration SQL. One-time, from the platform secret store: `ALTER ROLE meterlog_app WITH LOGIN PASSWORD '<secret>';`
 - [ ] **Set `SESSION_SECRET`** from the secret store. `SessionService` refuses to construct without one, so an unsigned-cookie deployment cannot happen by accident.
+- [ ] **Make that refusal surface as a FAILED DEPLOY, not a booted-but-broken service.** A fail-closed guard is only worth what the moment it first runs is worth. `SessionService` throws in its constructor, so Nest's DI resolves it at bootstrap and the process exits non-zero — but only if something actually instantiates it and the platform actually watches. Confirm both: the Render service has a **health check configured against `/api/v1/health`** and the deploy is gated on it, so a container that dies at boot (or one that boots without ever touching the session layer) is caught rather than left serving. If the health check ever becomes a static route that does not exercise DI, this guard silently stops being a deploy gate.
 - [ ] Confirm `DATABASE_URL` points at `meterlog_app` and `MIGRATION_DATABASE_URL` at the migration role. Pointing `DATABASE_URL` at the migration role disables tenant isolation while every structural test still passes.
 - [ ] Re-check the ADR-004 open question with a real answer, not an assumption: the migration role needs `CREATEROLE` and role-admin rights for `20260903000000`'s `CREATE ROLE` / `ALTER ROLE ... SET`.
 

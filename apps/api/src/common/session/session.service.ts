@@ -39,7 +39,19 @@ export class SessionService implements OnModuleDestroy {
   private readonly redis: Redis;
   private readonly secret: string;
 
-  constructor(redisUrl = process.env.REDIS_URL, secret = process.env.SESSION_SECRET) {
+  /**
+   * Takes no constructor arguments on purpose. Defaulted parameters still count
+   * as injectable dependencies to Nest's DI, so `constructor(url = process.env.X)`
+   * fails at bootstrap with "can't resolve dependencies ... at index [0]".
+   * Configuration is read here instead.
+   *
+   * Both reads throw rather than falling back. A missing SESSION_SECRET must be a
+   * failed boot, not a service that quietly signs cookies with `undefined` — see
+   * the deploy gate in ARCHITECTURE §16.1.
+   */
+  constructor() {
+    const redisUrl = process.env.REDIS_URL;
+    const secret = process.env.SESSION_SECRET;
     if (!redisUrl) throw new Error('REDIS_URL is not set.');
     if (!secret) throw new Error('SESSION_SECRET is not set.');
     this.redis = new Redis(redisUrl, { maxRetriesPerRequest: 2, lazyConnect: false });

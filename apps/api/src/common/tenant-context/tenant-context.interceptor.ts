@@ -4,8 +4,12 @@ import {
   ForbiddenException,
   Injectable,
   NestInterceptor,
+  UnauthorizedException,
 } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import { Observable, firstValueFrom, from } from 'rxjs';
+
+import { REQUIRES_SESSION } from '../auth/requires-session.decorator';
 
 import { PrismaService, TRANSACTION_OPTIONS } from '../prisma/prisma.service';
 import { runWithRequestContext } from '../request-context/request-context';
@@ -44,6 +48,7 @@ export class TenantContextInterceptor implements NestInterceptor {
   constructor(
     private readonly prisma: PrismaService,
     private readonly sessions: SessionService,
+    private readonly reflector: Reflector,
   ) {}
 
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
@@ -55,10 +60,26 @@ export class TenantContextInterceptor implements NestInterceptor {
     const cookie = SessionService.readCookie(request?.headers?.cookie, SESSION_COOKIE);
     const session = await this.sessions.read(cookie);
 
-    // Unauthenticated: no identity to scope by, so no transaction and no GUCs.
-    // Whether that is allowed is an auth guard's decision, not this one's —
-    // /health and the auth endpoints legitimately arrive here with no session.
     if (!session) {
+      // No identity to scope by, so no transaction and no GUCs.
+      //
+      // Whether that is ALLOWED is the route's declaration, not this
+      // interceptor's opinion: /health, /auth/register and /auth/login all
+      // legitimately arrive without a session, while /auth/me and /auth/switch
+      // cannot function without one. Routes say so with @RequiresSession().
+      //
+      // Enforced here rather than in a CanActivate guard because Nest runs guards
+      // BEFORE interceptors — a guard cannot see a context this interceptor has
+      // not established yet, and one written that way rejects every request.
+      const required = this.reflector.getAllAndOverride<boolean>(REQUIRES_SESSION, [
+        context.getHandler(),
+        context.getClass(),
+      ]);
+      if (required) {
+        throw new UnauthorizedException({
+          error: { code: 'UNAUTHENTICATED', message: 'Sign in to continue.' },
+        });
+      }
       return firstValueFrom(next.handle());
     }
 

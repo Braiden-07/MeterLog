@@ -42,6 +42,15 @@
 - Secrets only via env/secret stores; `.env` stays in `.gitignore`; never commit credentials.
 - Conventional commits; small PRs; trunk-based with short-lived feature branches.
 
+## Test-suite invariants (do not "optimize" these away)
+
+- **The database suites must run in a mode where connection reuse actually happens.** `apps/api/vitest.config.ts` sets `fileParallelism: false`, and `test/db/interceptor.spec.ts` pins its client to `connection_limit=1`. Both are load-bearing, not performance accidents.
+  - **Why:** the whole pooled-connection bug class is only observable across a _reused_ connection. `current_setting('app.x', true)` returns `NULL` on a connection that has never had the GUC set, but the **empty string** once `SET LOCAL` has touched it once — so a guard against the empty-string case passes on a fresh connection and fails only after reuse.
+  - **The proof this is real:** drop the `NULLIF(..., '')` from the re-verify in `tenant-context.interceptor.ts` and run `test/db/interceptor.spec.ts`. The test `a session with a BLANK user id fails closed with 403, not 500` **passes when run in isolation** (`-t` a single test → fresh connection → `NULL`) and **fails only in a full-file run**, once the connection has been reused (`''` → `''::uuid` → 22P02 → a 500 instead of a fail-closed 403).
+  - **Therefore:** do not add per-test connection isolation, do not give each test its own client, and do not enable `fileParallelism` for `test/db/**` in pursuit of CI speed. Any of those silently blinds the suite to the entire class while leaving it green.
+- **`test/db/interceptor.spec.ts` asserts `pg_backend_pid()` equality across requests.** That assertion is the guard that reuse actually occurred; without it the tests pass whether or not re-verification works.
+- Individual load-bearing tests are marked as such in their own comments (e.g. the citext case-insensitivity regression guard in `auth-definer.spec.ts`, which is the _only_ thing that can catch the silent-operator-resolution class — see ADR-004's operator amendment). Do not delete a test annotated that way as redundant.
+
 ## Guardrails (important)
 
 - **Do not over-build.** Complete the Essential scope in `docs/PROJECT_BRIEF.md` §2 before any Stretch item. Out of scope: microservices, Kubernetes, message queues, WebSockets, AI, billing.
