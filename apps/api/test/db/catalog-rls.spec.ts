@@ -139,10 +139,29 @@ describe('RLS catalog coverage', () => {
       );
       // Without a pinned search_path a SECURITY DEFINER function is itself a
       // privilege-escalation vector.
+      const pin = (fn.proconfig ?? []).find((c) => c.startsWith('search_path='));
+      expect(pin, `${fn.function_name} must pin search_path`).toBeDefined();
+
+      // Presence is not the property — CONTENT is. This assertion originally
+      // checked only that some `search_path=` entry existed, which a mutation
+      // sweep showed accepts `search_path = public, pg_catalog, pg_temp`: the pin
+      // is technically present and the hardening is gone. `public` is exactly the
+      // schema that must stay out, because it is the one an attacker who can
+      // create objects could use to shadow a function or operator the body
+      // resolves unqualified.
+      //
+      // It is not hypothetical here even without an attacker: `citext` lives in
+      // `public`, and whether `public` is on the path silently changes which `=`
+      // operator `login_lookup` binds — case-insensitive or case-sensitive. That
+      // cost a real bug in Phase 2.
+      const schemas = (pin ?? '')
+        .slice('search_path='.length)
+        .split(',')
+        .map((entry) => entry.trim().replace(/^"|"$/g, ''));
       expect(
-        (fn.proconfig ?? []).some((c) => c.startsWith('search_path=')),
-        `${fn.function_name} must pin search_path`,
-      ).toBe(true);
+        schemas,
+        `${fn.function_name} must not resolve names in 'public' — pin is: ${pin}`,
+      ).not.toContain('public');
     }
   });
 
@@ -337,5 +356,58 @@ describe('RLS catalog coverage', () => {
     for (const row of rows) {
       expect(row.readable, `${row.table_name} must be readable by the app role`).toBe(true);
     }
+  });
+  it('11. no SECURITY DEFINER function is executable by PUBLIC', async () => {
+    // Postgres grants EXECUTE on a NEW function to PUBLIC by default, and a
+    // function's ACL is invisible in the places people look when reviewing a
+    // definer function (the body, the owner, the search_path all look right).
+    // Left at the default, every role in the cluster could call a function that
+    // reads password hashes with the definer's privileges.
+    //
+    // `proacl IS NULL` means "never touched", which IS the permissive default —
+    // so it has to count as a violation, not be skipped as "no grants".
+    const rows = await db.$queryRawUnsafe<{ function_name: string; reason: string }[]>(`
+      SELECT p.proname AS function_name,
+             CASE WHEN p.proacl IS NULL
+                  THEN 'default ACL — EXECUTE is implicitly granted to PUBLIC'
+                  ELSE 'EXECUTE explicitly granted to PUBLIC' END AS reason
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.prosecdef
+        AND (
+          p.proacl IS NULL
+          OR EXISTS (
+            SELECT 1 FROM aclexplode(p.proacl) a
+            WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+          )
+        )
+      ORDER BY 1
+    `);
+
+    expect(
+      rows.map((r) => `${r.function_name}: ${r.reason}`),
+      'a SECURITY DEFINER function is callable by PUBLIC',
+    ).toEqual([]);
+  });
+
+  it('12. every SECURITY DEFINER function IS executable by the app role', async () => {
+    // Pairs with 11 the way 10 pairs with 9. On its own, 11 is satisfied by a
+    // function nobody can call — fail-closed, but broken: the login and register
+    // paths would 500 rather than being denied, and no other assertion notices.
+    const rows = await db.$queryRawUnsafe<{ function_name: string; callable: boolean }[]>(`
+      SELECT p.proname AS function_name,
+             has_function_privilege('meterlog_app', p.oid, 'EXECUTE') AS callable
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.prosecdef
+      ORDER BY 1
+    `);
+
+    const uncallable = rows.filter((r) => !r.callable).map((r) => r.function_name);
+    expect(
+      uncallable,
+      `SECURITY DEFINER functions the app role cannot call: ${uncallable.join(', ')}`,
+    ).toEqual([]);
   });
 });

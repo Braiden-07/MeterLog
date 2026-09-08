@@ -6,12 +6,57 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **Phase 1 complete** — schema, migrations, the full two-axis RLS policy set, and the suites that prove it. Phases 2–4 (definer functions, interceptor + per-request re-verify, endpoints) not started.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **Phases 1–2 complete** — schema, migrations, the full two-axis RLS policy set, and the two pre-auth `SECURITY DEFINER` functions with registration atomicity. Phases 3–4 (interceptor + per-request re-verify, endpoints) not started.
 - **Blockers:** —
 
 ---
 
 ## Session log
+
+### 2026-09-08 — Step 4 Phase 2: the pre-auth SECURITY DEFINER surface (§11 step 4)
+
+**Done**
+
+- **Migration `20260908000000_auth_definer_functions`** — `login_lookup(citext)` and `register_tenant(text, citext, text)`, the complete definer surface ADR-006 §6 allows. Both owned by `meterlog_definer`, `SET search_path = pg_catalog, pg_temp`, bodies fully schema-qualified, `EXECUTE` revoked from `PUBLIC` and granted only to `meterlog_app`. `EXPECTED_DEFINER_FUNCTIONS` already named both, so the allowlist needed no edit — which is the point of having declared it early.
+- **`register_tenant` writes three rows atomically** — tenant, person, admin membership. Atomicity is structural rather than coded: the body opens no subtransaction because it carries no `EXCEPTION` handler, so any failure unwinds all three. The migration says so at length, because adding a handler around a _subset_ of the inserts is the one edit that breaks it silently.
+- **Ownership on a non-superuser migration role.** `ALTER FUNCTION ... OWNER TO meterlog_definer` requires membership in the target role. Locally and in CI the migration role is the bootstrap superuser and this is invisible; **on Render it is not**, and this is the first migration that would have failed there. The migration now grants itself membership only if it lacks it (it holds `ADMIN OPTION` from having created the role in `20260903000000`), does the two `ALTER`s, and **revokes the membership again** — not tidiness: RLS matches policy roles by _membership_, so a migration role left inside `meterlog_definer` would silently pick up every `TO meterlog_definer USING (true)` policy on every identity table. This closes part of the open "migration privileges on Render" question ahead of step 10.
+- **Catalog assertions 11 and 12** — no `SECURITY DEFINER` function is executable by `PUBLIC` (counting `proacl IS NULL`, which _is_ the permissive default, as a violation), and every one of them is executable by `meterlog_app` so 11 cannot be satisfied by a function nobody can call.
+- **Catalog assertion 4 tightened from presence to content.** It checked only that some `search_path=` entry existed. A mutation showed that accepts `search_path = public, pg_catalog, pg_temp` — pin present, hardening gone. It now asserts `public` is absent from the resolution path.
+
+**The bug this phase found — a silent, unrecoverable account lockout**
+
+`login_lookup` was written with a bare `u.email = p_email`. Both sides are `citext`, so that looks correct and reviews as correct. It is not, under a pinned `search_path`: **citext's `=` operator lives in `public`**, which the pin deliberately excludes. The reference does not fail to resolve — it falls back through citext's implicit cast to `text` and binds case-**sensitive** `text = text`. Verified directly:
+
+```
+search_path = pg_catalog, pg_temp   ->  'a'::citext = 'A'::citext  =  false
+search_path = public, pg_catalog    ->  'a'::citext = 'A'::citext  =  true
+```
+
+The blast radius is worse than a wrong answer. `users_email_live_key` resolved its citext operator class at `CREATE INDEX` time, with `public` in scope, so **uniqueness stayed case-insensitive while the lookup became case-sensitive**. Register as `Founder@acme.test`, then log in as `founder@acme.test`: no row, generic auth failure — and re-registering is refused by the index. The account is unreachable and unrecoverable, with no error anywhere.
+
+Fixed by schema-qualifying the operator, `u.email OPERATOR(public.=) p_email` — **not** by adding `public` to the `search_path`, which is the whole thing the pin exists to prevent. Note the shape: ADR-004 justified the pin on the grounds that an unqualified reference "fails outright rather than resolving wrongly". That is true of functions and tables. It is **not** true of operators, which fall back through implicit casts and resolve to something plausible and wrong. Definer-probe case E covers the failing kind; this was the silent kind.
+
+**Verified against live Postgres, with negatives** (as `meterlog_app`, no request context set)
+
+- **`register_tenant` positive:** three linked rows, membership role `admin`, reachable with no context at all. **Negative:** the same `INSERT`s attempted directly by the app role — `permission denied` on both `tenants` and `users`.
+- **Atomicity, failure on insert #2** (duplicate email, the natural OPEN-1 path): raises, and **no orphan tenant survives**. Run in autocommit, because a rolled-back wrapper would make the assertion pass against a non-atomic function. The survival check runs as the **migration** role, because `tenants` is under FORCE RLS and asking the app role would return zero rows regardless — a guaranteed green proving nothing.
+- **Atomicity, failure on insert #3** (forced with a `CHECK (false) NOT VALID` constraint on `memberships`, since nothing natural trips that insert): no tenant and no user survive. This is the failure that strands the most state.
+- **`login_lookup` positive:** returns `id`, `password_hash`, `deleted_at` with no context. **Negative:** the same role reading `password_hash` directly — `permission denied`, the column-level grant doing what RLS cannot.
+- Case-insensitive across mixed/lower/upper; exact-match only (prefix, suffix, trailing space and `%` all miss); at most one row when a soft-deleted account shares the address, preferring the live one.
+- **Mutation sweep, 8 mutations, 8 caught** after the assertion-4 tightening: bare `=` restored, `ORDER BY/LIMIT` dropped, an `EXCEPTION` handler added that strands an orphan tenant, `EXECUTE` granted to `PUBLIC`, `EXECUTE` revoked from the app role, owner reverted to the migration role, `search_path` unpinned, and `search_path` widened to include `public`.
+
+**A Prisma detail that changes Phase 4.** Postgres raises `duplicate key value violates unique constraint "users_email_live_key"`, but Prisma's raw-query wrapper reduces it to `Raw query failed. Code: 23505. Message: Unique constraint failed: ` — **the constraint name is dropped**. Registration's duplicate-email → 409 mapping must therefore key on SQLSTATE `23505`, not on the constraint name. On this function only the email index can realistically raise it; the other two keys are `gen_random_uuid()` primary keys.
+
+**Recorded, not built: the standing rule Decision B created.** B closed the app-role write path, and in doing so **relocated the write-correctness burden into the definer function bodies**. Pre-B, `memberships_tenant` was `FOR ALL USING/WITH CHECK (tenant_id = current_tenant)` — the policy enforced tenant-scoping on every write, so even a buggy function body could not cross a tenant boundary. Post-B the only write path is the definer, whose policy is `USING (true) WITH CHECK (true)` and constrains nothing. Tenant-scoping and the admin check are now both the function body's sole responsibility. ADR-006 §7 and DECISIONS.md now carry the rule: **every definer write function acting for an authenticated caller must enforce, in its own body, that the caller is an admin of the active tenant and that the target row belongs to it.** `register_tenant` is exempt because it runs pre-auth and creates the tenant it writes into; `login_lookup` is read-only. Everything added after them is subject to it — and the **step-5 gate now requires live authorization negatives, not just atomicity**: a non-admin call rejected, and an admin of A unable to touch B through the function.
+
+**Not done, and not claimed.** No interceptor, no session, no per-request re-verify, no endpoints — Phases 3–4. No step-5 membership-write functions. Step 4's definition of done still needs `register → login → /auth/me`, the multi-membership switch, unauthorized-switch 403, revocation-on-next-request and role-follows-active-membership; none of that exists yet.
+
+**Next**
+
+- **Phase 3** — the interceptor: two GUCs, verify-then-set ordering, per-request membership re-verification with the claimed tenant passed as a bound parameter.
+- Phase 4 — the auth endpoints, including the `23505` → 409 mapping above.
+
+---
 
 ### 2026-09-08 — Step 4 Phase 1: identity/tenancy schema + two-axis RLS (§11 step 4)
 
