@@ -5,13 +5,53 @@
 
 ## Status
 
-- **Current milestone:** v0.1 — planning & scaffold
-- **Build-order step (PROJECT_BRIEF §11):** 3 (scaffold) complete; 4 (auth + tenancy foundation) next
+- **Current milestone:** v0.1 — auth & tenancy foundation
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **Phase 1 complete** — schema, migrations, the full two-axis RLS policy set, and the suites that prove it. Phases 2–4 (definer functions, interceptor + per-request re-verify, endpoints) not started.
 - **Blockers:** —
 
 ---
 
 ## Session log
+
+### 2026-09-08 — Step 4 Phase 1: identity/tenancy schema + two-axis RLS (§11 step 4)
+
+**Done**
+
+- **Migration `20260907000000_identity_tenancy_schema`** — `tenants`, `users` (pure identity, globally-unique live email via partial index, `citext`), `memberships` (the join carrying `role`), the `membership_role` enum, partial unique on `(user_id, tenant_id) WHERE deleted_at IS NULL`, `ENABLE` + `FORCE ROW LEVEL SECURITY` on all three, eight policies, and column-limited grants. Implements ADR-006, with two amendments recorded there.
+- **`users` policy set — an ADR gap, surfaced rather than assumed.** ADR-006 never specified one, and `users` had lost the `tenant_id` its ADR-004 policy keyed on; it would have shipped with a broken policy or none at all. Added `users_self_read`, `users_tenant_members_read`, `users_definer`, **no app-role write policy**, and `password_hash` withheld by **column-level grant** (RLS is row-level and cannot hide a column).
+- **DECISION B — the database backstops intra-tenant role authorization.** The gate review found that `memberships_tenant`, specified `FOR ALL TO meterlog_app` with the admin check left to a step-5 RBAC guard, permitted **intra-tenant privilege escalation**: a technician in tenant A ran `UPDATE public.memberships SET role='admin' WHERE user_id=<self>` and got `UPDATE 1`. Neither policy clause carries a role term, and `tenant_id` never changes during a role edit. The axis is now `FOR SELECT`, the app role's `INSERT`/`UPDATE` grants on `memberships` are withdrawn, and invite/revoke/change-role move to admin-checking `SECURITY DEFINER` functions in step 5. Recorded in ADR-006 §3 and §7 and in DECISIONS.md, with the A/B/C rationale.
+- **Co-member visibility recorded as intentional.** Every member of a tenant reads every co-member's identity and role. That was an unremarked side effect of the tenant axis keying on `tenant_id` alone; it is now a decision (team-SaaS default), and reads stay un-gated because a role term in a _read_ policy is the shape that produced OPEN-5.
+- **Catalog assertions 9 and 10** — the app role holds no `INSERT`/`UPDATE`/`DELETE` on any identity table, and can still read all three. 9 is what keeps Decision B durable: one stray `GRANT` would otherwise reopen the escalation with nothing complaining. It also closes the previously-untested `tenants` write-privilege gap.
+- **Revoked-membership fixtures.** The OPEN-5 residual argument — "liveness is enforced in-policy on the read paths, so a revoked workspace disappears from `/auth/me`" — is recorded in three places and was tested by nothing: no fixture had a soft-deleted membership, so deleting either liveness predicate was a green mutation. Two revoked memberships now exist in the suite, with assertions on both read paths, plus an assertion pinning the residual itself so nobody "fixes" what cannot be fixed.
+
+**Verified against live Postgres, with negatives** (`meterlog_app`, `rolbypassrls = f`, on a database built only by `prisma migrate deploy`)
+
+- **The escalation, before and after.** Pre-B: `INSERT 0 1` for the active tenant, and `UPDATE 1` → `role_now = admin`. Post-B: both `permission denied for table memberships`.
+- **Both denial layers, separately.** The grant layer is shown by the plain rejections above. The **policy** layer is isolated by restoring the write grants inside a rolled-back transaction — then `INSERT` raises `new row violates row-level security policy`, while `UPDATE`/`DELETE` **do not raise**: no applicable policy means no visible row, so Postgres returns `UPDATE 0` / `DELETE 0` cleanly with the row unchanged. A test asserting a thrown error on the UPDATE path would have failed against a correct database; the suite asserts zero-rows-and-unchanged there deliberately.
+- **Cross-tenant boundary unregressed**, and reads unregressed — a technician in A still reads all of A's co-members (the accepted behaviour).
+- **`register_tenant` unaffected — proven, not asserted.** Built as ADR-006 §6 specifies inside a rolled-back transaction: the three-row insert succeeds as `meterlog_definer`; the identical insert as `meterlog_app` is denied. Same treatment for `login_lookup`, which still reads `password_hash` through the definer while the app role gets `permission denied`.
+- **Mutation sweep, 21 mutations, 20 caught.** Every `USING`/`WITH CHECK` predicate, every `NULLIF` guard, both liveness predicates, the `FOR SELECT`→`FOR ALL` reversals, and stray write grants, dropped one at a time. Reverting `memberships_tenant` to `FOR ALL` is caught **only** by the policy-layer block, which is why that block exists. The one uncaught mutation (`tenants_active` `WITH CHECK` → `true`) is unreachable rather than unguarded — the app role cannot write `tenants` — and assertion 9 now guards the privilege that makes it unreachable, which mutation 21B confirms. All 21 reverted; post-sweep schema dump identical to a freshly-migrated one.
+- **Drift** — schema, policies (full `USING`/`WITH CHECK` text), RLS flags, table and column grants and indexes diffed against a scratch database built only from the migrations: identical.
+
+**Verified in CI** — see the run linked on PR #1. 45 tests (catalog-rls 10, membership-isolation 23, isolation 6, definer-probe 5, health 1), up from 34.
+
+**Process smell worth naming.** The local database was found carrying the Phase 1 tables with **no `_prisma_migrations` table at all** — the schema had been applied out-of-band at least once, so `prisma migrate status` reported both migrations unapplied while the objects existed. It was byte-identical to what the migrations produce, so nothing was wrong with the schema; what was wrong is that this could not have been known without diffing. Migrations must be the only path that ever touches a database, most of all Render — an out-of-band change there is invisible, unreviewable, and unreproducible. The local ledger was baselined with `prisma migrate resolve --applied`; CI-on-a-fresh-database remains the real reproducibility proof.
+
+**Repo / process**
+
+- Branch protection on `main`: PR required, CI status check required, no direct pushes, no force-push, no deletion, **0 required approvals** (solo repo). Verified by a refused push, not by reading the settings.
+- Secrets scan over full history (gitleaks + a provider-token grep across every blob): clean. The single gitleaks hit is the literal placeholder `replace-me-with-32-bytes-of-hex` in `.env.example`.
+
+**Not done, and not claimed.** Step 4's definition of done needs `register → login → /auth/me` round-tripping, the multi-membership switch, unauthorized-switch 403, revocation-on-next-request and role-follows-active-membership. None of that exists — it is Phases 2–4. What Phase 1 proves is the harder novel part: the shared-user, dual-axis membership isolation, and now a real intra-tenant write boundary at the database layer.
+
+**Next**
+
+- **Phase 2** — the two `SECURITY DEFINER` functions (`login_lookup`, `register_tenant`), including the forced-failure test that asserts no tenant survives a partial registration.
+- Phase 3 — the interceptor: two GUCs, verify-then-set, per-request membership re-verification.
+- Phase 4 — the auth endpoints.
+- Step 5 will add the admin-checking membership-write definer functions Decision B requires, and must edit `EXPECTED_DEFINER_FUNCTIONS` deliberately when it does.
+
+---
 
 ### 2026-09-03 — Scaffold (§11 step 3)
 

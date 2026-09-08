@@ -277,4 +277,65 @@ describe('RLS catalog coverage', () => {
       `policies referencing an app.* GUC without the NULLIF(current_setting('app.<guc>', true), '') wrapper:\n  ${offenders.join('\n  ')}`,
     ).toEqual([]);
   });
+  it('9. the app role holds no INSERT, UPDATE or DELETE on any identity table', async () => {
+    // The structural guarantee behind DECISION B (ADR-006 §3 amendment). Membership
+    // writes are denied twice over: no app-role write policy, and no write grant.
+    // This asserts the second half, because it is the half a future edit can undo
+    // in one line — `GRANT INSERT ON public.memberships TO meterlog_app` reopens the
+    // intra-tenant self-promotion escalation with nothing else complaining.
+    //
+    // It also subsumes the `tenants` gap found by mutation sweep 02: that policy's
+    // WITH CHECK is unreachable only because the app role cannot write `tenants`,
+    // and until now nothing asserted that.
+    //
+    // Deliberately catalog-driven rather than a hardcoded list of three, so a new
+    // identity table cannot arrive with write privileges unnoticed.
+    const rows = await db.$queryRawUnsafe<{ table_name: string; privilege: string }[]>(
+      `
+      SELECT c.relname AS table_name, priv AS privilege
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN unnest(ARRAY['INSERT','UPDATE','DELETE']) AS priv
+      WHERE n.nspname = 'public'
+        AND c.relkind = 'r'
+        AND c.relname = ANY ($1::text[])
+        AND has_table_privilege('meterlog_app', c.oid, priv)
+      ORDER BY 1, 2
+    `,
+      DEFINER_ACCESSIBLE_TABLES as string[],
+    );
+
+    expect(
+      rows.map((r) => `${r.table_name}:${r.privilege}`),
+      'the app role must be read-only on the identity tables — all writes go through SECURITY DEFINER functions',
+    ).toEqual([]);
+  });
+
+  it('10. the app role can still READ every identity table', async () => {
+    // Pairs with 9. On its own, assertion 9 is satisfied by a table the app role
+    // cannot touch at all, which would be fail-closed but broken. `users` is
+    // column-granted (password_hash withheld), so table-level has_table_privilege
+    // reports false for it — the read check must be column-aware or it would force
+    // the column grant to be widened to satisfy the test.
+    const rows = await db.$queryRawUnsafe<{ table_name: string; readable: boolean }[]>(
+      `
+      SELECT c.relname AS table_name,
+             EXISTS (
+               SELECT 1 FROM pg_attribute a
+               WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                 AND has_column_privilege('meterlog_app', c.oid, a.attnum, 'SELECT')
+             ) AS readable
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = ANY ($1::text[])
+      ORDER BY 1
+    `,
+      DEFINER_ACCESSIBLE_TABLES as string[],
+    );
+
+    expect(rows.map((r) => r.table_name)).toEqual([...DEFINER_ACCESSIBLE_TABLES].sort());
+    for (const row of rows) {
+      expect(row.readable, `${row.table_name} must be readable by the app role`).toBe(true);
+    }
+  });
 });

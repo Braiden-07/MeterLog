@@ -123,11 +123,35 @@ CREATE POLICY memberships_self_read ON public.memberships
   FOR SELECT TO meterlog_app
   USING (user_id = NULLIF(current_setting('app.current_user', true), '')::uuid);
 
--- Tenant-admin axis — the only app-role write path.
+-- Tenant read axis — the app role's view of the active tenant's membership
+-- structure. This is a READ policy only: membership writes are definer-only.
+--
+-- DECISION B (ADR-006 §3 amendment). This policy was FOR ALL, making it the app
+-- role's write path, with the admin-only check left to the Nest RBAC guard. That
+-- was demonstrated against a live database to permit a one-statement intra-tenant
+-- self-promotion: a technician in tenant A running
+--   UPDATE public.memberships SET role = 'admin' WHERE user_id = <self>
+-- succeeded, because the WITH CHECK (defaulted from USING under FOR ALL) carries
+-- no role term and tenant_id never changed. The guard that was supposed to stop
+-- it does not exist yet, and "latent until step 5" is still exploitable.
+--
+-- FOR SELECT carries no WITH CHECK, so with no other app-role policy on this
+-- table there is no permissive policy applicable to INSERT/UPDATE/DELETE and
+-- every such statement is denied at the policy layer. The GRANT below withdraws
+-- the privilege as well, so the write is refused twice over, independently.
+--
+-- NOTE the asymmetry, verified live: a denied INSERT raises 42501/"new row
+-- violates row-level security policy", but a denied UPDATE is NOT an error —
+-- with no applicable policy no row is visible to update, so it silently reports
+-- zero rows affected. A test asserting "rejected" must assert zero-rows-and-row-
+-- unchanged for UPDATE, not a thrown error.
+--
+-- Reads are deliberately NOT role-gated: every member of a tenant sees every
+-- co-member's identity and role. That is an intentional team-SaaS default
+-- (ADR-006 §3 amendment), not an oversight.
 CREATE POLICY memberships_tenant ON public.memberships
-  FOR ALL TO meterlog_app
-  USING      (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
-  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+  FOR SELECT TO meterlog_app
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
 
 CREATE POLICY memberships_definer ON public.memberships
   FOR ALL TO meterlog_definer USING (true) WITH CHECK (true);
@@ -145,9 +169,15 @@ GRANT SELECT ON public.tenants TO meterlog_app;
 -- reading member identities cannot read their hashes.
 GRANT SELECT (id, email, created_at, updated_at, deleted_at) ON public.users TO meterlog_app;
 
--- App role: memberships is the one table it writes. No DELETE — revocation is a
--- soft delete (UPDATE), so hard deletion is impossible for the runtime role.
-GRANT SELECT, INSERT, UPDATE ON public.memberships TO meterlog_app;
+-- App role: read-only on memberships (DECISION B). It previously held
+-- SELECT, INSERT, UPDATE here; the write privileges are withdrawn so the
+-- escalation above is closed at the privilege layer too, not only by the absence
+-- of a write policy. Invite / revoke / change-role all route through
+-- admin-checking SECURITY DEFINER functions in step 5, extending the
+-- register_tenant pattern. The app role is now SELECT-only on all three identity
+-- tables, which catalog assertion 9 asserts so a stray future grant cannot
+-- silently reopen the escalation.
+GRANT SELECT ON public.memberships TO meterlog_app;
 
 -- Definer role: exactly what login_lookup and register_tenant need, and nothing
 -- else. No UPDATE/DELETE/TRUNCATE/REFERENCES anywhere (asserted in CI).

@@ -93,12 +93,15 @@ export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = ['login_lookup', 'r
  * for these tables so their absence from the matrix cannot be mistaken for an
  * oversight, and their bespoke dual-axis test is mandatory.
  *
- * `users` and `tenants` are here for a different reason: the generic matrix seeds
- * through the app role, and by design the app role cannot write either table.
- * Tenants are created by `register_tenant` (definer) and users likewise; the app
- * role holds `SELECT` only. The matrix's INSERT case would fail with "permission
- * denied" rather than the row-level-security rejection it asserts — a failure
- * about grants, not isolation. Their policies are covered by the bespoke suite.
+ * `users` and `tenants` are here for a second reason, which DECISION B extended
+ * to `memberships` as well: the generic matrix seeds through the app role, and
+ * the app role cannot write any of these three. Tenants and users are created by
+ * `register_tenant` (definer); membership writes join them behind admin-checking
+ * definer functions in step 5. The app role is SELECT-only on all three, asserted
+ * by catalog assertion 9. The matrix's INSERT case would therefore fail with
+ * "permission denied" rather than the row-level-security rejection it asserts — a
+ * failure about grants, not isolation. Their policies are covered by the bespoke
+ * suite, which asserts both denial layers separately.
  *
  * The generic matrix therefore still generates zero cases at step 4 Phase 1. It
  * activates on its own at step 6, when `assets`/`readings` land — those the app
