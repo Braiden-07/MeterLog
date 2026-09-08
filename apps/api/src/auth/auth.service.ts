@@ -1,4 +1,4 @@
-import { hash as argonHash, verify as argonVerify } from '@node-rs/argon2';
+import { Algorithm, hash as argonHash, verify as argonVerify } from '@node-rs/argon2';
 import {
   ConflictException,
   ForbiddenException,
@@ -35,6 +35,27 @@ export interface Identity {
  */
 const UNIQUE_VIOLATION = '23505';
 
+/**
+ * The single source of truth for password-hashing cost (ADR-001, argon2id).
+ *
+ * Values are the OWASP-recommended baseline. Exported because the timing-
+ * equalisation hash on the no-such-user login branch MUST be produced with the
+ * identical parameters — see `dummyVerifyTarget` — and a test asserts the two
+ * agree by parsing `m=`, `t=`, `p=` out of both encoded hashes.
+ *
+ * These were previously left implicit: both call sites simply omitted options
+ * and inherited the library defaults, which agreed *by coincidence of default*
+ * rather than by construction. Adding explicit options to one call site while
+ * tuning cost would then have silently reopened the enumeration oracle, with
+ * nothing failing. Naming them once removes that possibility.
+ */
+export const ARGON2_OPTIONS = {
+  algorithm: Algorithm.Argon2id,
+  memoryCost: 19456,
+  timeCost: 2,
+  parallelism: 1,
+} as const;
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -54,7 +75,7 @@ export class AuthService {
     email: string;
     password: string;
   }): Promise<{ tenantId: string; userId: string }> {
-    const passwordHash = await argonHash(input.password);
+    const passwordHash = await argonHash(input.password, ARGON2_OPTIONS);
 
     try {
       const [row] = await this.prisma.$queryRawUnsafe<{ tenant_id: string; user_id: string }[]>(
@@ -260,7 +281,12 @@ async function verifyQuietly(hash: string, password: string): Promise<boolean> {
  * the timing gap it is supposed to close.
  */
 let dummyHash: Promise<string> | null = null;
-function dummyVerifyTarget(): Promise<string> {
-  dummyHash ??= argonHash('a value that is never a real password');
+export function dummyVerifyTarget(): Promise<string> {
+  // Derived from ARGON2_OPTIONS — the same object production hashing uses — so
+  // the two cannot drift. A checked-in literal, or an options-free call that
+  // merely happens to match today's defaults, would both silently diverge the
+  // moment cost parameters are tuned, and the enumeration oracle would reopen
+  // with every test still green.
+  dummyHash ??= argonHash('a value that is never a real password', ARGON2_OPTIONS);
   return dummyHash;
 }

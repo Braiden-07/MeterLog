@@ -131,6 +131,7 @@ The stored `role` is **not authoritative** — it goes stale the moment an admin
 - [ ] **Confirm no `SECURITY DEFINER` function is executable by `PUBLIC`**, and that each pins a `search_path` that does **not** contain `public` (catalog assertions 4, 11, 12).
 - [ ] **Set the `meterlog_app` password** — deliberately absent from migration SQL. One-time, from the platform secret store: `ALTER ROLE meterlog_app WITH LOGIN PASSWORD '<secret>';`
 - [ ] **Set `SESSION_SECRET`** from the secret store. `SessionService` refuses to construct without one, so an unsigned-cookie deployment cannot happen by accident.
+- [ ] **Confirm the session cookie is actually `Secure` in production.** `HttpOnly` and `SameSite=Lax` are set unconditionally and covered by an acceptance test; `Secure` cannot be, because it is gated on `NODE_ENV === 'production'` and the tests run over plain HTTP. That gate is therefore **unverifiable by CI and verifiable only here** — the same shape as the superuser-migrator gap. If `NODE_ENV` is not literally `production` on Render the flag silently does not appear, and a signed session cookie can travel over plain HTTP, which undoes the point of signing it. Run check (c) below against a real deployment.
 - [ ] **Make that refusal surface as a FAILED DEPLOY, not a booted-but-broken service.** A fail-closed guard is only worth what the moment it first runs is worth. `SessionService` throws in its constructor, so Nest's DI resolves it at bootstrap and the process exits non-zero — but only if something actually instantiates it and the platform actually watches. Confirm both: the Render service has a **health check configured against `/api/v1/health`** and the deploy is gated on it, so a container that dies at boot (or one that boots without ever touching the session layer) is caught rather than left serving. If the health check ever becomes a static route that does not exercise DI, this guard silently stops being a deploy gate.
 - [ ] Confirm `DATABASE_URL` points at `meterlog_app` and `MIGRATION_DATABASE_URL` at the migration role. Pointing `DATABASE_URL` at the migration role disables tenant isolation while every structural test still passes.
 - [ ] Re-check the ADR-004 open question with a real answer, not an assumption: the migration role needs `CREATEROLE` and role-admin rights for `20260903000000`'s `CREATE ROLE` / `ALTER ROLE ... SET`.
@@ -149,7 +150,20 @@ FROM pg_class c CROSS JOIN unnest(ARRAY['INSERT','UPDATE','DELETE']) priv
 WHERE c.relname IN ('users','tenants','memberships');   -- all must be false
 ```
 
+Check (c) — the deployed login response must carry all three cookie flags:
+
+```
+curl -is https://<host>/api/v1/auth/login -H 'content-type: application/json'   -d '{"email":"...","password":"..."}' | grep -i set-cookie
+# must contain: HttpOnly; Secure; SameSite=Lax
+```
+
 ### 16.2 Application-layer notes that bite at deploy
+
+**Every authenticated request holds an interactive transaction for its whole duration.** This is the price of the ADR-004 RLS pattern, not an accident: `SET LOCAL` is scoped to a transaction and therefore to one pooled connection, so the request and its GUCs must share that transaction. It was priced deliberately and is recorded here because of how it fails.
+
+- **A slow request holds a connection.** With `connection_limit` connections in the pool, `connection_limit` concurrent in-flight requests exhaust it, and the next request **waits** rather than erroring. Under load this presents as an apparent hang — rising latency with no error rate — which is the hardest failure shape to diagnose from an error dashboard.
+- **Three timeouts bound it, and their ordering is deliberate** (ADR-004): the app role's `statement_timeout` (4s) sits _below_ Prisma's transaction `timeout` (5s), so a runaway query is killed by Postgres with an error naming the statement rather than surfacing as an opaque transaction abort. `idle_in_transaction_session_timeout` (10s) catches a transaction left open by a stalled handler. `maxWait` (2s) is the pool-acquisition ceiling — **exceeding it means pool exhaustion, not a slow query**, and that distinction is the one to look for when latency climbs.
+- **At deploy:** size Prisma's `connection_limit` against Render's Postgres connection cap, and alert on `maxWait` timeouts specifically — they are the early signal of exhaustion, and they look like nothing else. Re-check under k6 (PROJECT_BRIEF §13).
 
 - **Duplicate-email → HTTP 409 must key on SQLSTATE `23505`, not on the constraint name.** Postgres raises `duplicate key value violates unique constraint "users_email_live_key"`, but Prisma's raw-query wrapper flattens it to `Raw query failed. Code: 23505. Message: Unique constraint failed: ` — **the constraint name is dropped**. Any handler that string-matches the constraint name will silently never fire, turning a 409 into a 500. On `register_tenant` only the email index can realistically raise `23505`; the other two keys are `gen_random_uuid()` primary keys.
 

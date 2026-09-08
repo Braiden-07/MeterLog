@@ -6,7 +6,10 @@ import type { PrismaClient } from '@prisma/client';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
+import Redis from 'ioredis';
+
 import { AppModule } from '../../src/app.module';
+import { ARGON2_OPTIONS, dummyVerifyTarget } from '../../src/auth/auth.service';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
 import { execAll, loadEnv, migratorClient } from '../db/helpers';
 
@@ -30,6 +33,7 @@ import { execAll, loadEnv, migratorClient } from '../db/helpers';
 describe('auth API (step-4 acceptance)', () => {
   let app: INestApplication;
   let migrator: PrismaClient;
+  let redis: Redis;
   let baselinePids: Set<number>;
 
   const http = () => request(app.getHttpServer());
@@ -40,6 +44,7 @@ describe('auth API (step-4 acceptance)', () => {
     if (!base) throw new Error('DATABASE_URL is not set.');
 
     migrator = migratorClient();
+    redis = new Redis(process.env.REDIS_URL!);
     baselinePids = await appRolePids(migrator);
 
     process.env.DATABASE_URL = `${base}${base.includes('?') ? '&' : '?'}connection_limit=1&pool_timeout=10`;
@@ -60,6 +65,7 @@ describe('auth API (step-4 acceptance)', () => {
     await wipe();
     await app.close();
     await migrator.$disconnect();
+    await redis.quit();
   });
 
   beforeEach(wipe);
@@ -83,6 +89,20 @@ describe('auth API (step-4 acceptance)', () => {
   async function apiPids(): Promise<number[]> {
     const now = await appRolePids(migrator);
     return [...now].filter((pid) => !baselinePids.has(pid)).sort();
+  }
+
+  /**
+   * The Redis key a cookie's session lives under.
+   *
+   * The cookie is `<id>.<hmac>` and `SessionService` stores under
+   * `meterlog:sess:<id>`, so the id is everything before the LAST dot. Read
+   * directly, deliberately: asking `SessionService.read()` would prove only that
+   * the service says the session is gone, which is the same class of circular
+   * evidence as asserting a 401 and calling the boundary closed.
+   */
+  function sessionKeyFor(cookie: string): string {
+    const value = cookie.slice(cookie.indexOf('=') + 1);
+    return `meterlog:sess:${value.slice(0, value.lastIndexOf('.'))}`;
   }
 
   const PASSWORD = 'correct horse battery staple';
@@ -147,20 +167,48 @@ describe('auth API (step-4 acceptance)', () => {
       expect(raw).toMatch(/SameSite=Lax/i);
     });
 
-    it('logout destroys the session — the same cookie stops working', async () => {
+    // Logout's two halves, as SEPARATE tests so each can fail on its own.
+    //
+    // Folded into one test they short-circuit: the Redis assertion runs first, so
+    // a mutation that breaks both never exercises the replay. Split, a
+    // cookie-only logout reddens both independently, and each states a different
+    // thing — one that the server-side session is gone, one that the endpoint
+    // refuses the old cookie.
+    //
+    // The Redis half is the one that closes the boundary. A 401 on replay does
+    // NOT prove the session was destroyed: the cookie could be refused for a
+    // reason with nothing to do with the session's existence — signature
+    // mismatch, rotation, expiry — while the key sits in Redis, replayable by
+    // anything that can present a valid cookie.
+    it('BLOCKER: logout deletes the session from Redis — before present, after absent', async () => {
       await register('Acme Metering', 'founder@acme.test');
       const { cookie } = await login('founder@acme.test');
+      const key = sessionKeyFor(cookie!);
+
+      // BEFORE. Without this the "absent after" assertion would pass against a
+      // key that never existed — a mistyped prefix would look like a clean logout.
+      const before = await redis.get(key);
+      expect(before, `no session at ${key} before logout`).not.toBeNull();
+      expect(JSON.parse(before!).userId).toMatch(/^[0-9a-f-]{36}$/);
+
       expect((await http().post('/api/v1/auth/logout').set('Cookie', cookie!)).status).toBe(204);
 
-      // 401, and specifically NOT 500. The interceptor passes session-less
-      // requests through with no context by design, so a protected handler
-      // calling requireRequestContext() would throw a raw Error and the client
-      // would get a 500 — the right refusal for the wrong reason. This assertion
-      // read 500 until @RequiresSession existed; that was documenting a defect
-      // rather than catching one.
-      const after = await http().get('/api/v1/auth/me').set('Cookie', cookie!);
-      expect(after.status).toBe(401);
-      expect(after.body.error.code).toBe('UNAUTHENTICATED');
+      // AFTER. This is the assertion that makes the claim mechanism-level rather
+      // than symptom-level.
+      expect(await redis.get(key), 'the session survived logout in Redis').toBeNull();
+    });
+
+    it('BLOCKER: the exact pre-logout cookie is refused on replay', async () => {
+      await register('Acme Metering', 'founder@acme.test');
+      const { cookie } = await login('founder@acme.test');
+      expect((await http().get('/api/v1/auth/me').set('Cookie', cookie!)).status).toBe(200);
+
+      await http().post('/api/v1/auth/logout').set('Cookie', cookie!);
+
+      const replay = await http().get('/api/v1/auth/me').set('Cookie', cookie!);
+      expect(replay.status).toBe(401);
+      expect(replay.body.error.code).toBe('UNAUTHENTICATED');
+      expect(replay.body).not.toHaveProperty('user');
     });
   });
 
@@ -398,6 +446,40 @@ describe('auth API (step-4 acceptance)', () => {
       expect(me.status).toBe(200);
       expect(me.body.activeWorkspace).toBeNull();
       expect(me.body.workspaces).toEqual([]);
+    });
+
+    it('the timing-equalisation hash uses the SAME argon2 parameters as production', async () => {
+      // The no-such-user branch runs an argon2 verify so that "unknown email"
+      // costs what "wrong password" costs. That only works while the dummy hash
+      // is as expensive as a real one — if production cost is tuned upward and
+      // the dummy is not, the two branches diverge in time and the generic error
+      // message stops hiding anything.
+      //
+      // Asserted by PARSING the encoded parameters out of both hashes rather
+      // than by eyeballing the source, so tuning one without the other fails
+      // here instead of quietly reopening the enumeration oracle.
+      const params = (encoded: string): string => {
+        const match = /^\$(argon2[a-z]+)\$v=(\d+)\$m=(\d+),t=(\d+),p=(\d+)/.exec(encoded);
+        expect(match, `unparseable argon2 hash: ${encoded.slice(0, 40)}`).not.toBeNull();
+        const [, algorithm, version, m, t, pll] = match!;
+        return `${algorithm} v=${version} m=${m} t=${t} p=${pll}`;
+      };
+
+      // A freshly-minted PRODUCTION hash, taken from the real registration path
+      // rather than by calling argon2 with options copied into the test.
+      await register('Acme Metering', 'founder@acme.test');
+      const [row] = await migrator.$queryRawUnsafe<{ password_hash: string }[]>(
+        `SELECT password_hash FROM public.users WHERE email = 'founder@acme.test'::citext`,
+      );
+      expect(row?.password_hash, 'registration stored no hash').toBeDefined();
+
+      expect(params(await dummyVerifyTarget())).toBe(params(row!.password_hash));
+
+      // And both agree with the single declared source of truth, so this cannot
+      // pass by both drifting together.
+      expect(params(row!.password_hash)).toBe(
+        `argon2id v=19 m=${ARGON2_OPTIONS.memoryCost} t=${ARGON2_OPTIONS.timeCost} p=${ARGON2_OPTIONS.parallelism}`,
+      );
     });
 
     it('login failures are generic and identical for unknown email and wrong password', async () => {
