@@ -12,7 +12,7 @@
 ## Stack
 
 - **Frontend:** Next.js (App Router) + TypeScript, Tailwind, TanStack Query, React Hook Form, Zod. Tests: Vitest + Playwright.
-- **Backend:** NestJS (modular monolith), REST under `/api/v1`, OpenAPI via Nest Swagger. Auth: JWT/session (see DECISIONS). Authz: RBAC guards. Validation: class-validator DTOs.
+- **Backend:** NestJS (modular monolith), REST under `/api/v1`, OpenAPI via Nest Swagger. Auth: session cookie + Redis, argon2id hashing (ADR-001). Authz: RBAC guards. Validation: class-validator DTOs.
 - **Data:** PostgreSQL with Row-Level Security for tenant isolation; Redis for sessions/cache. ORM + migrations: see DECISIONS.
 - **Infra:** Docker + docker-compose locally; Vercel (frontend), Railway/Render (backend + DB + Redis). CI: GitHub Actions. Errors: Sentry. Logs: pino (structured JSON).
 
@@ -23,7 +23,7 @@
 - Install: `npm install`
 - Dev (all): `cp .env.example .env` → `docker compose up -d` → `npm run db:migrate` → `npm run dev`
 - Test (unit/integration): `npm run test`
-- Test (DB suites only): `npm run test:db` — catalog RLS coverage + definer probe
+- Test (DB suites only): `npm run test:db` — catalog RLS coverage, the catalog-driven isolation harness, the membership dual-axis proof, the definer probe, the pre-auth definer functions, and the tenant-context interceptor
 - Test (e2e): `npm run test:e2e`
 - Lint: `npm run lint` · Typecheck: `npm run typecheck` · Build: `npm run build`
 - DB migrate: `npm run db:migrate` (dev) / `npm run db:migrate:deploy` (CI + prod)
