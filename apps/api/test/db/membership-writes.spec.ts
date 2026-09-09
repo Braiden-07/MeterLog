@@ -36,6 +36,43 @@ import { appClient, execAll, loadEnv, migratorClient } from './helpers';
  *
  * Seeding runs as the migration role because the app role deliberately cannot
  * write any of these tables.
+ *
+ * ==========================================================================
+ * LOAD-BEARING SUITE — DO NOT DELETE, AND DO NOT WEAKEN INTO HTTP TESTS.
+ * ==========================================================================
+ *
+ * These negatives are carrying weight that a GRANT used to carry, and that is
+ * not visible from outside this file.
+ *
+ * Until step 5 Phase 1, catalog assertion 6 read "meterlog_definer holds no
+ * UPDATE on ANY table" and expected the empty set. While that held, a definer
+ * function body that tried to UPDATE anything was **unreachable** — the
+ * privilege simply did not exist, so a whole class of body bug could not be
+ * expressed no matter how wrong the body was. change-role writes `role` and
+ * revoke writes `deleted_at` (a soft delete IS an UPDATE), so the definer role
+ * now holds `UPDATE` on `memberships` and assertion 6 has been narrowed to an
+ * equality on that exact shape.
+ *
+ * That narrowing is deliberate and signed off, and it means **the grant no
+ * longer stands underneath these functions**. What replaces it is (1) the §7
+ * checks in the function bodies and (2) THIS SUITE, which is the only thing
+ * that exercises them with nothing in front. There is no third layer.
+ *
+ * The specific ways this file can be broken while still looking green:
+ *
+ *   - Rewriting any negative to go through the Phase 2 HTTP endpoints. It would
+ *     then prove the RBAC guard, which is the OUTER check and already has its
+ *     own tests. The inner check would become untested, and DECISION B would
+ *     have silently reverted to the rejected option A — the design where a guard
+ *     is the only thing between a technician and an admin role.
+ *   - Deleting the direct-call negatives as "duplicates" of the endpoint tests.
+ *     They are not duplicates; they are the other half of defence-in-depth, and
+ *     two checks are only two checks if each is proven without the other.
+ *   - Relaxing a body check because "the guard handles it now". The Phase 1
+ *     negatives here are the tripwire for exactly that, and a red test in this
+ *     file is the intended outcome, not an inconvenience.
+ *
+ * See CLAUDE.md, "Test-suite invariants".
  */
 
 /**
