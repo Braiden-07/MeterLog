@@ -263,6 +263,7 @@ Follow SDLC phases; work in small PRs. Log decisions as you go.
 - [ ] Audit log written on every core mutation; viewable by admin/auditor.
 - [ ] All essential endpoints implemented with validation, pagination, error envelope, OpenAPI docs.
 - [ ] Frontend covers all essential journeys.
+- [ ] Invited users can set a password and log in; no invite creates an unreachable account.
 - [ ] ≥70% coverage on core logic; unit + integration + API + at least 2 e2e journeys green.
 - [ ] CI pipeline green end-to-end; deploy automated on `main`.
 - [ ] Deployed to public HTTPS URL; Sentry + uptime + `/health` live.
