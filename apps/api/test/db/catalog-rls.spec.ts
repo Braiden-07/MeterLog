@@ -188,11 +188,31 @@ describe('RLS catalog coverage', () => {
     ).toEqual([]);
   });
 
-  it('6. meterlog_definer holds no UPDATE, DELETE, TRUNCATE or REFERENCES on any table', async () => {
+  it('6. meterlog_definer holds UPDATE on memberships and NOTHING else beyond it', async () => {
     // The definer policy is deliberately broad (FOR ALL ... USING (true) WITH
     // CHECK (true)) so registration's INSERTs are not denied. What keeps that
     // safe is the grant: table privileges are checked before policies, so a
     // broad policy cannot widen what the grants withhold. Asserted, not assumed.
+    //
+    // NARROWED AT STEP 5 PHASE 1, deliberately and with sign-off. This assertion
+    // previously read "no UPDATE, DELETE, TRUNCATE or REFERENCES on ANY table"
+    // and expected the empty set. change-role writes `role` and revoke writes
+    // `deleted_at` (a soft delete IS an UPDATE), so the definer role now needs
+    // UPDATE on `memberships` and the old shape cannot hold.
+    //
+    // This is the moment DECISION B's grant-level backstop weakens on purpose,
+    // and it is worth being plain about what is lost: until now, a bug in a
+    // definer function body that tried to UPDATE anything was unreachable because
+    // the privilege did not exist. That is no longer true for `memberships`. What
+    // replaces it is the §7 body-level checks and the direct-call negatives in
+    // `membership-writes.spec.ts` — which is exactly why those negatives are
+    // produced without an HTTP guard in front of them.
+    //
+    // So the assertion is narrowed to an EQUALITY on the exact new shape, never
+    // relaxed to "has some grants". Still no UPDATE on `users` or `tenants` (no
+    // function edits an identity or an organisation — invite only INSERTs a users
+    // row), and still no DELETE, TRUNCATE or REFERENCES anywhere at all. The next
+    // grant that widens this by one privilege fails here.
     const rows = await db.$queryRawUnsafe<{ table_name: string; privilege: string }[]>(`
       SELECT c.relname AS table_name, priv AS privilege
       FROM pg_class c
@@ -204,7 +224,7 @@ describe('RLS catalog coverage', () => {
       ORDER BY 1, 2
     `);
 
-    expect(rows.map((r) => `${r.table_name}:${r.privilege}`)).toEqual([]);
+    expect(rows.map((r) => `${r.table_name}:${r.privilege}`)).toEqual(['memberships:UPDATE']);
   });
 
   it('7. the runtime role is restricted and is not the migration role', async () => {

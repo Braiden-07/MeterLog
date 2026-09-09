@@ -23,7 +23,7 @@
 - Install: `npm install`
 - Dev (all): `cp .env.example .env` → `docker compose up -d` → `npm run db:migrate` → `npm run dev`
 - Test (unit/integration): `npm run test`
-- Test (DB suites only): `npm run test:db` — catalog RLS coverage, the catalog-driven isolation harness, the membership dual-axis proof, the definer probe, the pre-auth definer functions, and the tenant-context interceptor
+- Test (DB suites only): `npm run test:db` — catalog RLS coverage, the catalog-driven isolation harness, the membership dual-axis proof, the definer probe, the pre-auth definer functions, the membership-write definer functions and their §7 body-level authorization, and the tenant-context interceptor
 - Test (e2e): `npm run test:e2e`
 - Lint: `npm run lint` · Typecheck: `npm run typecheck` · Build: `npm run build`
 - DB migrate: `npm run db:migrate` (dev) / `npm run db:migrate:deploy` (CI + prod)

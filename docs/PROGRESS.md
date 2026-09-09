@@ -6,13 +6,48 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete, pending gate review** — all four phases. Schema + two-axis RLS, the pre-auth definer surface, the two-GUC interceptor with per-request re-verification, and the five auth endpoints with the step-4 acceptance suite green over real HTTP. Step 5 (RBAC + the membership-write definer functions) next.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). Step 5 (RBAC + the membership-write definer functions) **Phase 1 of 3 complete, pending gate review** — the three definer write functions with §7 body-level authorization, proven against live Postgres with no HTTP anywhere. Phase 2 is the RBAC gate and the role-gated endpoints; Phase 3 the cross-layer negatives and the mutation sweep.
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-09 — Step 5 Phase 1: the membership-write definer functions and §7 body-level authz (§11 step 5)
+
+**Two gaps closed first, both recorded as ADR-006 §7 amendments before any code**
+
+1. **The last-admin lockout — a genuine gap.** §7 specified the three endpoints and the standing rule and said nothing about who may be demoted or removed. Decided as **option A**: refuse a change that would leave a tenant with **zero live admins**; permit "hand over then leave". The guard is simple because of a **structural collapse** — clause (a) requires a live-admin caller and the partial unique index allows one live membership per `(user, tenant)`, so demoting or revoking _anyone else_ proves a second live admin exists. **"Last admin" and "self-action" are the same condition**; there is no cross-user lockout case.
+2. **The invite credential mechanism** — flagged under-specified by §7 itself, and unavoidable because `users.password_hash` is `NOT NULL`. Resolved as a **sentinel hash** derived from `ARGON2_OPTIONS`. The **consumed-email dead-end is accepted and recorded** (DECISIONS), together with the requirement it hands the later set-password flow: pending-invite accounts are **not distinguishable from credentialled ones by any column today**.
+
+**Done**
+
+- **`20260909000000_membership_write_functions`** — `invite_member`, `change_member_role`, `revoke_member`. Every ADR-004 hardening carried over, and **every operator schema-qualified** (`OPERATOR(public.=)` for citext, `OPERATOR(pg_catalog.=)` for uuid/enum) — the citext lockout was this exact class and it is silent.
+- **§7 enforced in each body:** the acting user comes from `app.current_user`, NULLIF-guarded, **never from a parameter**; the target is resolved **by membership id** and scoped to `app.current_tenant`. Unset _and_ empty-string context fail closed.
+- **Custom SQLSTATEs `MB001`/`MB002`/`MB003`**, and the reason is a vacuity argument: the idiomatic `42501` is also what Postgres raises for a plain privilege denial, so a test asserting it would pass just as happily against a misconfigured GRANT that never reached the body. `MB002` covers "another tenant's" and "does not exist" with **one** code, so the function is not an oracle for ids the caller cannot see.
+- **`GRANT UPDATE ON public.memberships TO meterlog_definer`** — surgical, and **the moment DECISION B's grant-level backstop weakens by design**. Catalog assertion 6 is narrowed from "no UPDATE on ANY table" to an **equality** on the exact new shape (`memberships:UPDATE` and nothing else); still no UPDATE on `users`/`tenants`, still no DELETE/TRUNCATE/REFERENCES anywhere. `EXPECTED_DEFINER_FUNCTIONS` 2 → 5. Assertions 11/12 are catalog-driven and scaled to the new functions with **no edit** — confirmed live: all five are executable by the app role, none by PUBLIC, all with `search_path` pinned.
+
+**Verified against live Postgres, with negatives — and no Nest in the process (127 tests, was 97)**
+
+Every call in `test/db/membership-writes.spec.ts` is made **as `meterlog_app` with the GUCs set by hand**. That is the property under test, not a convenience: the RBAC guard is Phase 2 and does not exist yet, so these negatives cannot be the guard's. A negative that ran through HTTP would prove the guard and leave B indistinguishable from the rejected option A while looking green.
+
+- **(a) non-admin rejected, all three functions** — including a technician promoting **themselves**, the exact `UPDATE … SET role='admin' WHERE user_id=<self>` that returned `UPDATE 1` at the Phase 1 gate. Also: a real-but-unaffiliated user, and a **revoked** admin (liveness is part of the check).
+- **(b) cross-tenant rejected** — admin of A against B's **real, live** membership, asserted present first so the negative is semantic, not a missed lookup. Invite's cross-tenant case **collapses onto (a)** (it takes no tenant argument), asserted so the collapse reads as a property rather than a missing test.
+- **Fail-closed context** on a **reused** connection: `pg_backend_pid` asserted equal across two transactions, the GUC asserted to have reverted to `''`, and the refusal asserted to be `MB001` and **not** `22P02`.
+- **Atomicity under autocommit** — GUCs set at **session** scope so there is no wrapping transaction to hide a non-atomic function; forced with `CHECK (false) NOT VALID`, no orphan identity survives.
+- **The last-admin guard, sequentially and CONCURRENTLY.** The concurrent case forces the interleaving rather than hoping for it: T1 holds its locks uncommitted, T2 blocks, and **a third connection asserts T2 is genuinely waiting on a `Lock` in `pg_stat_activity`** before T1 is released — the tell that plays the role `pg_backend_pid` plays for connection reuse. T1 commits, T2 re-evaluates under READ COMMITTED, sees itself as the last admin, and is refused. The tenant is left with exactly one admin.
+- **Positives:** invite attaches to an existing identity **case-insensitively** (the `OPERATOR(public.=)` path), never overwrites an existing hash, creates identity + membership for an unknown email with a sentinel whose `m=`/`t=`/`p=` are **parsed and compared to `ARGON2_OPTIONS`**, re-invite after revoke works, revoke soft-deletes, double-revoke is refused.
+
+**Non-vacuity sweep — 5 guard drops, 5 caught, each by its intended test.** Caller-admin check → the non-admin negative reddens. Target-in-tenant check → the cross-tenant negative reddens. Last-admin guard → the sequential self-demotion negative reddens. `NULLIF` → the reused-connection test reddens with `invalid input syntax for type uuid: ""` instead of `MB001` — the 500-not-403 class, exactly as CLAUDE.md describes it. **`FOR UPDATE` → bare count → the concurrent test reddens on the interleaving assertion itself** ("T2 never actually blocked"), which is the sharpest result of the five: it proves that assertion has teeth and is not decoration. The full cross-layer sweep is Phase 3.
+
+**Not done, and not claimed.** No RBAC guard, no `@RequiresRole`, no endpoints, no Nest wiring — Phase 2. No revoke-over-HTTP re-verification — Phase 3. The **step-7 audit retrofit** for these mutations remains a referenced forward marker, unresolved.
+
+**Next**
+
+- Phase 2 — the RBAC gate and the role-gated endpoints. The gate belongs where the resolved context exists (metadata read **inside** the interceptor, as `@RequiresSession()` is), not in a `CanActivate` guard: Nest runs guards **before** interceptors, and the Phase 4 500→401 defect is the same hazard in different clothes.
+
+---
 
 ### 2026-09-08 — Step 4 Phase 4: the auth endpoints and the step-4 acceptance suite (§11 step 4)
 
