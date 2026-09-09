@@ -169,8 +169,26 @@ export class MembershipsService {
  * function body are two independent checks, and this mapping is what the body's
  * refusal looks like if it ever fires without the gate having. It fires for real
  * whenever the caller's role changes between the interceptor's read and the
- * function's — and if it ever stops being reachable, that is a signal the two
- * checks have been collapsed into one.
+ * function's.
+ *
+ * **It carries a DIFFERENT error code from the gate's 403, and that distinction
+ * is load-bearing — it was added at the Phase 3 sweep, because without it the
+ * gate could be deleted with every test still green.** Both layers refuse a
+ * non-admin, so when both produced `FORBIDDEN_ROLE` the two responses were
+ * byte-identical and nothing could tell which layer had acted. Removing
+ * `@RequiresRole('admin')` from all three routes left the entire acceptance suite
+ * passing: the body caught every case and answered identically. That is
+ * defence-in-depth doing its job, and it is also an untestable claim — "the RBAC
+ * gate works" had no negative behind it.
+ *
+ * So: the gate answers `FORBIDDEN_ROLE`, the function body answers `NOT_ADMIN`.
+ * Both are 403. A test asserting `FORBIDDEN_ROLE` now fails if the gate is
+ * removed, because the body's code arrives instead.
+ *
+ * The operational payoff is real too: `NOT_ADMIN` reaching a client means the
+ * request got past the gate and was stopped by the database — either the caller's
+ * role changed between the interceptor's read and the function's, or the gate is
+ * missing from a route that needs it. That is worth being able to see in a log.
  *
  * `MB002` is a 404: "belongs to another tenant" and "does not exist" are one
  * code by design, so the endpoint cannot be used to probe for membership ids in
@@ -187,7 +205,9 @@ function translate(error: unknown, extra: Record<string, () => Error> = {}): Err
     case NOT_ADMIN:
       return new ForbiddenException({
         error: {
-          code: 'FORBIDDEN_ROLE',
+          // NOT the gate's `FORBIDDEN_ROLE` — see the note above. Same status,
+          // different code, so the two layers are distinguishable.
+          code: 'NOT_ADMIN',
           message: 'You do not have permission to perform this action in this workspace.',
         },
       });
