@@ -139,10 +139,29 @@ describe('RLS catalog coverage', () => {
       );
       // Without a pinned search_path a SECURITY DEFINER function is itself a
       // privilege-escalation vector.
+      const pin = (fn.proconfig ?? []).find((c) => c.startsWith('search_path='));
+      expect(pin, `${fn.function_name} must pin search_path`).toBeDefined();
+
+      // Presence is not the property — CONTENT is. This assertion originally
+      // checked only that some `search_path=` entry existed, which a mutation
+      // sweep showed accepts `search_path = public, pg_catalog, pg_temp`: the pin
+      // is technically present and the hardening is gone. `public` is exactly the
+      // schema that must stay out, because it is the one an attacker who can
+      // create objects could use to shadow a function or operator the body
+      // resolves unqualified.
+      //
+      // It is not hypothetical here even without an attacker: `citext` lives in
+      // `public`, and whether `public` is on the path silently changes which `=`
+      // operator `login_lookup` binds — case-insensitive or case-sensitive. That
+      // cost a real bug in Phase 2.
+      const schemas = (pin ?? '')
+        .slice('search_path='.length)
+        .split(',')
+        .map((entry) => entry.trim().replace(/^"|"$/g, ''));
       expect(
-        (fn.proconfig ?? []).some((c) => c.startsWith('search_path=')),
-        `${fn.function_name} must pin search_path`,
-      ).toBe(true);
+        schemas,
+        `${fn.function_name} must not resolve names in 'public' — pin is: ${pin}`,
+      ).not.toContain('public');
     }
   });
 
@@ -275,6 +294,120 @@ describe('RLS catalog coverage', () => {
     expect(
       offenders,
       `policies referencing an app.* GUC without the NULLIF(current_setting('app.<guc>', true), '') wrapper:\n  ${offenders.join('\n  ')}`,
+    ).toEqual([]);
+  });
+  it('9. the app role holds no INSERT, UPDATE or DELETE on any identity table', async () => {
+    // The structural guarantee behind DECISION B (ADR-006 §3 amendment). Membership
+    // writes are denied twice over: no app-role write policy, and no write grant.
+    // This asserts the second half, because it is the half a future edit can undo
+    // in one line — `GRANT INSERT ON public.memberships TO meterlog_app` reopens the
+    // intra-tenant self-promotion escalation with nothing else complaining.
+    //
+    // It also subsumes the `tenants` gap found by mutation sweep 02: that policy's
+    // WITH CHECK is unreachable only because the app role cannot write `tenants`,
+    // and until now nothing asserted that.
+    //
+    // Deliberately catalog-driven rather than a hardcoded list of three, so a new
+    // identity table cannot arrive with write privileges unnoticed.
+    const rows = await db.$queryRawUnsafe<{ table_name: string; privilege: string }[]>(
+      `
+      SELECT c.relname AS table_name, priv AS privilege
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN unnest(ARRAY['INSERT','UPDATE','DELETE']) AS priv
+      WHERE n.nspname = 'public'
+        AND c.relkind = 'r'
+        AND c.relname = ANY ($1::text[])
+        AND has_table_privilege('meterlog_app', c.oid, priv)
+      ORDER BY 1, 2
+    `,
+      DEFINER_ACCESSIBLE_TABLES as string[],
+    );
+
+    expect(
+      rows.map((r) => `${r.table_name}:${r.privilege}`),
+      'the app role must be read-only on the identity tables — all writes go through SECURITY DEFINER functions',
+    ).toEqual([]);
+  });
+
+  it('10. the app role can still READ every identity table', async () => {
+    // Pairs with 9. On its own, assertion 9 is satisfied by a table the app role
+    // cannot touch at all, which would be fail-closed but broken. `users` is
+    // column-granted (password_hash withheld), so table-level has_table_privilege
+    // reports false for it — the read check must be column-aware or it would force
+    // the column grant to be widened to satisfy the test.
+    const rows = await db.$queryRawUnsafe<{ table_name: string; readable: boolean }[]>(
+      `
+      SELECT c.relname AS table_name,
+             EXISTS (
+               SELECT 1 FROM pg_attribute a
+               WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                 AND has_column_privilege('meterlog_app', c.oid, a.attnum, 'SELECT')
+             ) AS readable
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = ANY ($1::text[])
+      ORDER BY 1
+    `,
+      DEFINER_ACCESSIBLE_TABLES as string[],
+    );
+
+    expect(rows.map((r) => r.table_name)).toEqual([...DEFINER_ACCESSIBLE_TABLES].sort());
+    for (const row of rows) {
+      expect(row.readable, `${row.table_name} must be readable by the app role`).toBe(true);
+    }
+  });
+  it('11. no SECURITY DEFINER function is executable by PUBLIC', async () => {
+    // Postgres grants EXECUTE on a NEW function to PUBLIC by default, and a
+    // function's ACL is invisible in the places people look when reviewing a
+    // definer function (the body, the owner, the search_path all look right).
+    // Left at the default, every role in the cluster could call a function that
+    // reads password hashes with the definer's privileges.
+    //
+    // `proacl IS NULL` means "never touched", which IS the permissive default —
+    // so it has to count as a violation, not be skipped as "no grants".
+    const rows = await db.$queryRawUnsafe<{ function_name: string; reason: string }[]>(`
+      SELECT p.proname AS function_name,
+             CASE WHEN p.proacl IS NULL
+                  THEN 'default ACL — EXECUTE is implicitly granted to PUBLIC'
+                  ELSE 'EXECUTE explicitly granted to PUBLIC' END AS reason
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.prosecdef
+        AND (
+          p.proacl IS NULL
+          OR EXISTS (
+            SELECT 1 FROM aclexplode(p.proacl) a
+            WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+          )
+        )
+      ORDER BY 1
+    `);
+
+    expect(
+      rows.map((r) => `${r.function_name}: ${r.reason}`),
+      'a SECURITY DEFINER function is callable by PUBLIC',
+    ).toEqual([]);
+  });
+
+  it('12. every SECURITY DEFINER function IS executable by the app role', async () => {
+    // Pairs with 11 the way 10 pairs with 9. On its own, 11 is satisfied by a
+    // function nobody can call — fail-closed, but broken: the login and register
+    // paths would 500 rather than being denied, and no other assertion notices.
+    const rows = await db.$queryRawUnsafe<{ function_name: string; callable: boolean }[]>(`
+      SELECT p.proname AS function_name,
+             has_function_privilege('meterlog_app', p.oid, 'EXECUTE') AS callable
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.prosecdef
+      ORDER BY 1
+    `);
+
+    const uncallable = rows.filter((r) => !r.callable).map((r) => r.function_name);
+    expect(
+      uncallable,
+      `SECURITY DEFINER functions the app role cannot call: ${uncallable.join(', ')}`,
     ).toEqual([]);
   });
 });

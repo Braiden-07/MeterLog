@@ -12,7 +12,7 @@
 ## Stack
 
 - **Frontend:** Next.js (App Router) + TypeScript, Tailwind, TanStack Query, React Hook Form, Zod. Tests: Vitest + Playwright.
-- **Backend:** NestJS (modular monolith), REST under `/api/v1`, OpenAPI via Nest Swagger. Auth: JWT/session (see DECISIONS). Authz: RBAC guards. Validation: class-validator DTOs.
+- **Backend:** NestJS (modular monolith), REST under `/api/v1`, OpenAPI via Nest Swagger. Auth: session cookie + Redis, argon2id hashing (ADR-001). Authz: RBAC guards. Validation: class-validator DTOs.
 - **Data:** PostgreSQL with Row-Level Security for tenant isolation; Redis for sessions/cache. ORM + migrations: see DECISIONS.
 - **Infra:** Docker + docker-compose locally; Vercel (frontend), Railway/Render (backend + DB + Redis). CI: GitHub Actions. Errors: Sentry. Logs: pino (structured JSON).
 
@@ -23,7 +23,7 @@
 - Install: `npm install`
 - Dev (all): `cp .env.example .env` → `docker compose up -d` → `npm run db:migrate` → `npm run dev`
 - Test (unit/integration): `npm run test`
-- Test (DB suites only): `npm run test:db` — catalog RLS coverage + definer probe
+- Test (DB suites only): `npm run test:db` — catalog RLS coverage, the catalog-driven isolation harness, the membership dual-axis proof, the definer probe, the pre-auth definer functions, and the tenant-context interceptor
 - Test (e2e): `npm run test:e2e`
 - Lint: `npm run lint` · Typecheck: `npm run typecheck` · Build: `npm run build`
 - DB migrate: `npm run db:migrate` (dev) / `npm run db:migrate:deploy` (CI + prod)
@@ -41,6 +41,15 @@
 - Validation at the boundary (DTOs server-side, Zod client-side). Reject unknown fields.
 - Secrets only via env/secret stores; `.env` stays in `.gitignore`; never commit credentials.
 - Conventional commits; small PRs; trunk-based with short-lived feature branches.
+
+## Test-suite invariants (do not "optimize" these away)
+
+- **The database suites must run in a mode where connection reuse actually happens.** `apps/api/vitest.config.ts` sets `fileParallelism: false`, and `test/db/interceptor.spec.ts` pins its client to `connection_limit=1`. Both are load-bearing, not performance accidents.
+  - **Why:** the whole pooled-connection bug class is only observable across a _reused_ connection. `current_setting('app.x', true)` returns `NULL` on a connection that has never had the GUC set, but the **empty string** once `SET LOCAL` has touched it once — so a guard against the empty-string case passes on a fresh connection and fails only after reuse.
+  - **The proof this is real:** drop the `NULLIF(..., '')` from the re-verify in `tenant-context.interceptor.ts` and run `test/db/interceptor.spec.ts`. The test `a session with a BLANK user id fails closed with 403, not 500` **passes when run in isolation** (`-t` a single test → fresh connection → `NULL`) and **fails only in a full-file run**, once the connection has been reused (`''` → `''::uuid` → 22P02 → a 500 instead of a fail-closed 403).
+  - **Therefore:** do not add per-test connection isolation, do not give each test its own client, and do not enable `fileParallelism` for `test/db/**` in pursuit of CI speed. Any of those silently blinds the suite to the entire class while leaving it green.
+- **`test/db/interceptor.spec.ts` asserts `pg_backend_pid()` equality across requests.** That assertion is the guard that reuse actually occurred; without it the tests pass whether or not re-verification works.
+- Individual load-bearing tests are marked as such in their own comments (e.g. the citext case-insensitivity regression guard in `auth-definer.spec.ts`, which is the _only_ thing that can catch the silent-operator-resolution class — see ADR-004's operator amendment). Do not delete a test annotated that way as redundant.
 
 ## Guardrails (important)
 

@@ -5,13 +5,185 @@
 
 ## Status
 
-- **Current milestone:** v0.1 — planning & scaffold
-- **Build-order step (PROJECT_BRIEF §11):** 3 (scaffold) complete; 4 (auth + tenancy foundation) next
+- **Current milestone:** v0.1 — auth & tenancy foundation
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete, pending gate review** — all four phases. Schema + two-axis RLS, the pre-auth definer surface, the two-GUC interceptor with per-request re-verification, and the five auth endpoints with the step-4 acceptance suite green over real HTTP. Step 5 (RBAC + the membership-write definer functions) next.
 - **Blockers:** —
+- **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-08 — Step 4 Phase 4: the auth endpoints and the step-4 acceptance suite (§11 step 4)
+
+**Done**
+
+- **Five endpoints** (`src/auth/`): `POST /auth/register`, `POST /auth/login`, `POST /auth/switch`, `GET /auth/me`, `POST /auth/logout`, wiring ADR-006's resolved OPEN-1/2/3 behaviours. Argon2id password hashing (ADR-001) via `@node-rs/argon2` — prebuilt bindings, so CI needs no compiler.
+- **The interceptor is now bound globally** (`APP_INTERCEPTOR`), the wiring deferred through Phase 3. Global rather than per-route is correct because it opens a transaction only when a session is actually present, so `/health`, register and login pass straight through untouched.
+- **`HttpExceptionFilter`** normalises every error to the project envelope `{ error: { code, message, details? } }`, including `ValidationPipe` rejections, which otherwise ship Nest's own shape.
+- **`@RequiresSession()`** marks the routes that need identity; the interceptor enforces it. See the two defects below for why it is not a guard.
+- New dev dependency `@types/express`; new runtime dependency `@node-rs/argon2`.
+
+**Two defects found while building, both fixed rather than papered over**
+
+1. **A protected route with no session returned 500, not 401.** The interceptor deliberately does not reject session-less requests — `/health`, register and login legitimately have none — so a handler calling `requireRequestContext()` threw a raw `Error` and the filter turned it into a 500. The refusal was right; the status and the reason were wrong. Worse, the first version of the acceptance test **asserted the 500**, which documents a defect instead of catching it. Now `@RequiresSession()` + a 401 with `UNAUTHENTICATED`, and the test asserts that.
+2. **The obvious fix — a `CanActivate` guard — rejects every request, authenticated or not.** Nest runs **guards before interceptors**, so the guard cannot see a request context the interceptor has not established yet. Observed, not reasoned about: every acceptance test went 401 at once. A guard could re-read and re-verify the session itself, but that means a second Redis round-trip per request and two places deciding what a valid session is. So the _declaration_ lives at the route as metadata and the single _enforcement_ point stays inside the interceptor that already resolved the session.
+
+**Verified over real HTTP, with negatives** — every case goes through supertest with real signed session cookies through the bound interceptor. Calling `AuthService` directly would bypass the interceptor and prove strictly less, the same shape as a rolled-back wrapper hiding non-atomicity.
+
+- **DoD 1 — register → login → `/auth/me` round-trips.** 201 → 200 with the single membership auto-selected → `/auth/me` naming the person, the active workspace and its role. Cookie asserted `HttpOnly` and `SameSite=Lax`. Logout destroys the session and the same cookie then 401s.
+- **Risk A — the interceptor is genuinely live.** _Positive:_ `/auth/me` returns real content, which is only possible if both GUCs were set — `users` and `tenants` are under FORCE RLS with policies keyed on them. _Negative:_ no cookie, a garbage cookie, and a well-formed-shape-but-bad-signature cookie all return **401**, not 200-with-nothing. Pre-auth routes still work, so the global binding costs them nothing.
+- **DoD 2 — the multi-membership switch.** Two memberships ⇒ login returns 200 with `activeWorkspace: null` and both workspaces; `POST /auth/switch` moves the active tenant and it persists to the next request.
+- **DoD 3 / Risk B — unauthorized switch.** Proven against a **real, existent second tenant with a real membership belonging to someone else** — 403 `NOT_A_MEMBER`, and nothing of that tenant becomes reachable afterwards. A malformed uuid would only have proven that `@IsUUID` runs; it says nothing about the boundary. The nonexistent-but-well-formed uuid case is covered separately, also 403.
+- **DoD 4 — revocation over HTTP.** Request 1 succeeds; the membership is revoked (`UPDATE 1`, asserted); request 2 returns **403 `MEMBERSHIP_REVOKED`** on the **same pooled backend** — pids read from `pg_stat_activity`, baseline-subtracted so a stray connection from another suite cannot make the assertion vacuous. The pooled-connection discipline does not lapse because there is an HTTP layer on top. Request 3 then succeeds with an empty workspace list rather than 403-looping, because the 403 cleared the session's active tenant.
+- **DoD 5 — role follows the active membership.** The same person is `admin` in one workspace and `technician` in the other, switching between them; and a role changed underneath a live session is picked up on the very next request.
+- **DoD 6 — isolation holds through the API.** A member of two tenants sees exactly those two and never the third.
+- **OPEN-1** duplicate register ⇒ **409** keyed on SQLSTATE `23505`, with no orphan tenant left behind, and case-insensitively (matching the index). **OPEN-2** zero memberships ⇒ **200** with no active tenant, landing in the no-active-tenant state without 403-looping. Login failures are byte-identical for unknown-email and wrong-password, and the no-such-user branch still performs an argon2 verify against a real dummy hash so the timing does not answer the question either.
+
+**Mutation sweep — 6 mutations, 6 caught** (after making one reachable).
+
+Interceptor unbound (**13 red** — the single most consequential wiring in the phase); switch authorization removed (2 red, both against the real-second-tenant case); the 409 keyed on the constraint name in the message rather than SQLSTATE (2 red — the Phase 2 carry-forward, now proven rather than asserted); `@RequiresSession` not enforced (2 red); login skipping password verification (1 red); and the app-side liveness predicate dropped from the workspace query.
+
+**The one that initially escaped, and why it mattered.** Dropping `AND m.deleted_at IS NULL` from `readWorkspaces` reddened nothing — the `JOIN` to `tenants` is filtered by `tenants_workspace_list`, which carries liveness of its own, so a workspace held **only** through a revoked membership is dropped by the join regardless. The obvious revoked-workspace test therefore proves nothing about that predicate. The reachable case is **re-invitation**, which ADR-006 §2 designs the _partial_ unique index for: `(user_id, tenant_id) WHERE deleted_at IS NULL` permits one live membership alongside any number of revoked ones for the same tenant. The tenant is then visible through the live row, the join keeps **both**, and the workspace appears twice — the duplicate carrying whatever role the person held before removal. In the added test that stale role is `admin` against a current `auditor`, so without the predicate the switcher would offer someone admin of a workspace they are an auditor in. Same treatment as Phase 3's `NULLIF`: diagnosed as unreachable-by-construction, then made reachable through a real scenario rather than left flagged.
+
+**Two boundaries closed at the gate, and one cost priced.**
+
+- **Logout is now a two-assertion negative, split into two tests so each fails on its own.** It was asserted positive-only ("the cookie stops working"), which is a 401 doing a negative's job: a cookie can be refused for reasons unrelated to the session's existence — signature, rotation, expiry — while the Redis key sits there replayable server-side. Now: the session key is read **directly out of Redis**, asserted present before logout (so a mistyped prefix cannot masquerade as a clean logout) and absent after; and the exact pre-logout cookie is separately replayed and refused. A cookie-only logout reddens both.
+- **The argon2 timing-equalisation hash is bound to the production parameters, not confirmed against them.** The no-such-user login branch runs a real argon2 verify so "unknown email" costs what "wrong password" costs. Both call sites previously omitted options and agreed **by coincidence of library default**, which is a drift vector regardless of whether the numbers match today — tune production cost, forget the dummy, and the enumeration oracle reopens with every test green. There is now one exported `ARGON2_OPTIONS`, used by both, and a test that **parses `m=`, `t=`, `p=` out of the dummy hash and out of a hash taken from the real registration path** and asserts they agree. Not a comment; a test.
+- **The interactive-transaction-per-request cost is now on the record** (ARCHITECTURE §16.2) rather than implicit. Every authenticated request holds a transaction for its duration — the price of `SET LOCAL`-scoped RLS. It matters because of how it fails: pool exhaustion presents as an **apparent hang**, rising latency with no error rate, and `maxWait` timeouts are the one signal that distinguishes exhaustion from a slow query. Priced deliberately, not stumbled into.
+
+**Mutation sweep on the two blockers — 5 mutations, 4 caught, 1 equivalent.** Cookie-only logout and clear-active-tenant-instead-of-destroy each redden both logout tests. A dummy hash cheaper than production, and production tuned upward with the dummy left behind (the actual drift scenario), each redden the parameter assertion. The fifth — reverting the dummy to an options-free call — reddens nothing, and correctly so: library defaults currently equal `ARGON2_OPTIONS`, so it is a **behaviourally equivalent mutant**, not an untested guard. It is the pre-fix state, and the reason the explicit binding exists is to remove the vector rather than to change today's behaviour.
+
+**Not done, and not claimed.** No RBAC guard and no role-gated endpoints — step 5. No membership-write definer functions (invite / revoke / change-role); when they land they are bound by the standing rule in ADR-006 §7, and their gate requires **live authorization negatives**, not just atomicity. No frontend: the empty-state page for the zero-membership login is step 8, and only the API behaviour exists today.
+
+**Next**
+
+- Step 5 — RBAC, and the admin-checking membership-write definer functions Decision B requires. `EXPECTED_DEFINER_FUNCTIONS` must be edited deliberately when they land.
+
+---
+
+### 2026-09-08 — Step 4 Phase 3: the two-GUC interceptor and per-request re-verification (§11 step 4)
+
+**Done**
+
+- **`TenantContextInterceptor`** (`src/common/tenant-context/`) — the request machinery from ADR-004 + ADR-006 §4. One interactive transaction per authenticated request, because `SET LOCAL` is scoped to a transaction and therefore to the single pooled connection it holds. Ordering is **verify, then set**: set `app.current_user`; re-verify the claimed tenant with it passed as a **bound parameter**, never read from a GUC; zero rows ⇒ 403 with `app.current_tenant` never assigned; one row ⇒ set the tenant GUC and use the freshly-read role.
+- **`RequestContext`** (`src/common/request-context/`) — `AsyncLocalStorage` carrying the transaction client, user, tenant and re-verified role. `requireRequestContext()` throws rather than returning an empty context: a handler reaching for tenant scope outside a request is a bug, and it must be loud rather than silently unscoped.
+- **`SessionService`** (`src/common/session/`) — Redis-backed sessions (ADR-001), signed-cookie ids (HMAC-SHA256 over a 128-bit id, `timingSafeEqual`). The client holds only an opaque id, so it cannot forge an active tenant — the "belt" half of ADR-006 §4. **New dependency: `ioredis`**, executing ADR-001's recorded choice; Redis was already in compose, CI and `.env`.
+- **`CommonModule`** provides all three. The interceptor is deliberately **not** bound via `APP_INTERCEPTOR` yet — there are no authenticated routes until Phase 4, and binding it globally now would wrap `/health` in an interactive transaction for nothing.
+- **CI gained `SESSION_SECRET`.** `SessionService` refuses to construct without one, on purpose, so an unsigned-cookie deployment cannot happen by accident.
+
+**Verified against live Postgres, with negatives**
+
+Every case runs the **real interceptor**, and the app client is pinned to `connection_limit=1` because the failure surface this phase exists to cover is **pooled-connection statefulness**, not policy correctness — Phase 1 already proved the policy.
+
+- **The hard one — revocation between two requests on a reused connection.** Request 1 succeeds with `app.current_tenant = A`; the membership is revoked between requests (`UPDATE 1`, asserted, so the fixture cannot silently no-op); request 2 on the **same backend** throws `ForbiddenException`, **the route handler never runs**, and the connection is left with `app.current_tenant = ''` and zero rows of A reachable. The vacuity guard is explicit: `pg_backend_pid()` is asserted equal across the two requests, because a request 2 landing on a fresh connection would prove nothing about pooled statefulness and would pass either way. (Confirmed separately that pids do differ across connections, so the assertion has real content.)
+- **The session's active tenant is cleared on the 403**, so a third request stops re-asserting a workspace the user no longer holds — it succeeds with no tenant context rather than 403-looping.
+- **Role changes follow the membership, not the session.** The session still cached `admin`; after an `UPDATE ... SET role = 'auditor'` the very next request reports `auditor`, with the stale session copy still sitting there unused.
+- **GUC hygiene across pooled requests.** M-in-A followed by N-in-B on the same backend: no bleed, correct counts, and an unauthenticated third request gets no context at all. Asserted on **both a fresh and a reused connection**, because the ADR-004 heisenbug is asymmetric — `current_setting` returns NULL on a connection that has never had the GUC set, and the **empty string** once `SET LOCAL` has touched it. Checking only one is how that bug survived review the first time.
+- **Verify-before-set ordering.** The behavioural cases cannot separate the two orderings — both end in a 403 with a rolled-back transaction and no residue — so ordering is asserted on the **emitted SQL** via Prisma query events: `set_config('app.current_user')` → the memberships re-verify → `set_config('app.current_tenant')`.
+- **Liveness through the interceptor.** OPEN-5's DB-side claim, now exercised end-to-end rather than against the policy in isolation: a revoked membership yields zero rows at the re-verify ⇒ 403, with the soft-deleted row asserted still present so the test cannot pass on a fixture that failed to revoke anything.
+- **Fail-closed on poisoned context:** a session naming a non-existent user, a tampered cookie signature, and a valid signature over a destroyed session all get no context.
+
+**Mutation sweep — 9 mutations, 9 caught** (after one fix, below).
+
+`verify-after-set`; re-verify skipped entirely; `SET` instead of `SET LOCAL` on the tenant GUC; the same on the user GUC; the `NULLIF` guard dropped; `deleted_at IS NULL` dropped from the re-verify; the re-verify moved above the user-GUC assignment; that same reordering plus the dropped `NULLIF`; and the tenant read from a GUC instead of a bound parameter.
+
+**The one that initially escaped, and what it taught.** Dropping the `NULLIF` from the re-verify reddened _nothing_ — because the interceptor sets `app.current_user` immediately beforehand, so `current_setting` always returns a valid uuid and the guard never fires. It was unreachable-by-construction, not unnecessary: mutations 7 and 8 differ by that guard alone, and the failure modes differ exactly as ADR-004 predicts — **with** the `NULLIF` the misordered code still throws `ForbiddenException` (fail closed), **without** it a `PrismaClientKnownRequestError`, i.e. a 500 instead of a 403. Rather than leave it flagged-but-untested, a reachable case was added: a session with a **blank** `userId` writes `''` into the GUC, which is exactly the state the guard exists for. That is a real poisoned-session state (corrupted Redis value, or a future path that forgets to populate it), not a contrivance, and the property — fail closed with 403, never 500 — is one worth holding. Dropping the `NULLIF` now reddens it.
+
+That test also demonstrated the heisenbug in miniature: run in isolation it **passes** under the mutation, because a fresh connection returns NULL rather than `''`. It only fails in a full run, once the connection has been reused. A per-test-isolation habit would have hidden it.
+
+**Not done, and not claimed.** No endpoints — no `/auth/register`, `/auth/login`, `/auth/me`, `/auth/switch`, `/auth/logout`. No RBAC guard. The interceptor is not globally bound. Step 4's definition of done needs the round-trip, the multi-membership switch, unauthorized-switch 403, revocation as an **observable endpoint behaviour**, and role-follows-active-membership — Phase 3 makes the machinery correct and proves revocation fails closed at the re-verify layer, but none of it is observable over HTTP until Phase 4 exists.
+
+**Next**
+
+- **Phase 4** — the auth endpoints on top of this machinery, binding the interceptor where it belongs, and the `23505` → 409 mapping recorded in `ARCHITECTURE.md` §16.2.
+
+---
+
+### 2026-09-08 — Step 4 Phase 2: the pre-auth SECURITY DEFINER surface (§11 step 4)
+
+**Done**
+
+- **Migration `20260908000000_auth_definer_functions`** — `login_lookup(citext)` and `register_tenant(text, citext, text)`, the complete definer surface ADR-006 §6 allows. Both owned by `meterlog_definer`, `SET search_path = pg_catalog, pg_temp`, bodies fully schema-qualified, `EXECUTE` revoked from `PUBLIC` and granted only to `meterlog_app`. `EXPECTED_DEFINER_FUNCTIONS` already named both, so the allowlist needed no edit — which is the point of having declared it early.
+- **`register_tenant` writes three rows atomically** — tenant, person, admin membership. Atomicity is structural rather than coded: the body opens no subtransaction because it carries no `EXCEPTION` handler, so any failure unwinds all three. The migration says so at length, because adding a handler around a _subset_ of the inserts is the one edit that breaks it silently.
+- **Ownership on a non-superuser migration role.** `ALTER FUNCTION ... OWNER TO meterlog_definer` requires membership in the target role. Locally and in CI the migration role is the bootstrap superuser and this is invisible; **on Render it is not**, and this is the first migration that would have failed there. The migration now grants itself membership only if it lacks it (it holds `ADMIN OPTION` from having created the role in `20260903000000`), does the two `ALTER`s, and **revokes the membership again** — not tidiness: RLS matches policy roles by _membership_, so a migration role left inside `meterlog_definer` would silently pick up every `TO meterlog_definer USING (true)` policy on every identity table. This closes part of the open "migration privileges on Render" question ahead of step 10.
+- **Catalog assertions 11 and 12** — no `SECURITY DEFINER` function is executable by `PUBLIC` (counting `proacl IS NULL`, which _is_ the permissive default, as a violation), and every one of them is executable by `meterlog_app` so 11 cannot be satisfied by a function nobody can call.
+- **Catalog assertion 4 tightened from presence to content.** It checked only that some `search_path=` entry existed. A mutation showed that accepts `search_path = public, pg_catalog, pg_temp` — pin present, hardening gone. It now asserts `public` is absent from the resolution path.
+
+**The bug this phase found — a silent, unrecoverable account lockout**
+
+`login_lookup` was written with a bare `u.email = p_email`. Both sides are `citext`, so that looks correct and reviews as correct. It is not, under a pinned `search_path`: **citext's `=` operator lives in `public`**, which the pin deliberately excludes. The reference does not fail to resolve — it falls back through citext's implicit cast to `text` and binds case-**sensitive** `text = text`. Verified directly:
+
+```
+search_path = pg_catalog, pg_temp   ->  'a'::citext = 'A'::citext  =  false
+search_path = public, pg_catalog    ->  'a'::citext = 'A'::citext  =  true
+```
+
+The blast radius is worse than a wrong answer. `users_email_live_key` resolved its citext operator class at `CREATE INDEX` time, with `public` in scope, so **uniqueness stayed case-insensitive while the lookup became case-sensitive**. Register as `Founder@acme.test`, then log in as `founder@acme.test`: no row, generic auth failure — and re-registering is refused by the index. The account is unreachable and unrecoverable, with no error anywhere.
+
+Fixed by schema-qualifying the operator, `u.email OPERATOR(public.=) p_email` — **not** by adding `public` to the `search_path`, which is the whole thing the pin exists to prevent. Note the shape: ADR-004 justified the pin on the grounds that an unqualified reference "fails outright rather than resolving wrongly". That is true of functions and tables. It is **not** true of operators, which fall back through implicit casts and resolve to something plausible and wrong. Definer-probe case E covers the failing kind; this was the silent kind.
+
+**Verified against live Postgres, with negatives** (as `meterlog_app`, no request context set)
+
+- **`register_tenant` positive:** three linked rows, membership role `admin`, reachable with no context at all. **Negative:** the same `INSERT`s attempted directly by the app role — `permission denied` on both `tenants` and `users`.
+- **Atomicity, failure on insert #2** (duplicate email, the natural OPEN-1 path): raises, and **no orphan tenant survives**. Run in autocommit, because a rolled-back wrapper would make the assertion pass against a non-atomic function. The survival check runs as the **migration** role, because `tenants` is under FORCE RLS and asking the app role would return zero rows regardless — a guaranteed green proving nothing.
+- **Atomicity, failure on insert #3** (forced with a `CHECK (false) NOT VALID` constraint on `memberships`, since nothing natural trips that insert): no tenant and no user survive. This is the failure that strands the most state.
+- **`login_lookup` positive:** returns `id`, `password_hash`, `deleted_at` with no context. **Negative:** the same role reading `password_hash` directly — `permission denied`, the column-level grant doing what RLS cannot.
+- Case-insensitive across mixed/lower/upper; exact-match only (prefix, suffix, trailing space and `%` all miss); at most one row when a soft-deleted account shares the address, preferring the live one.
+- **Mutation sweep, 8 mutations, 8 caught** after the assertion-4 tightening: bare `=` restored, `ORDER BY/LIMIT` dropped, an `EXCEPTION` handler added that strands an orphan tenant, `EXECUTE` granted to `PUBLIC`, `EXECUTE` revoked from the app role, owner reverted to the migration role, `search_path` unpinned, and `search_path` widened to include `public`.
+
+**A Prisma detail that changes Phase 4.** Postgres raises `duplicate key value violates unique constraint "users_email_live_key"`, but Prisma's raw-query wrapper reduces it to `Raw query failed. Code: 23505. Message: Unique constraint failed: ` — **the constraint name is dropped**. Registration's duplicate-email → 409 mapping must therefore key on SQLSTATE `23505`, not on the constraint name. On this function only the email index can realistically raise it; the other two keys are `gen_random_uuid()` primary keys.
+
+**Recorded, not built: the standing rule Decision B created.** B closed the app-role write path, and in doing so **relocated the write-correctness burden into the definer function bodies**. Pre-B, `memberships_tenant` was `FOR ALL USING/WITH CHECK (tenant_id = current_tenant)` — the policy enforced tenant-scoping on every write, so even a buggy function body could not cross a tenant boundary. Post-B the only write path is the definer, whose policy is `USING (true) WITH CHECK (true)` and constrains nothing. Tenant-scoping and the admin check are now both the function body's sole responsibility. ADR-006 §7 and DECISIONS.md now carry the rule: **every definer write function acting for an authenticated caller must enforce, in its own body, that the caller is an admin of the active tenant and that the target row belongs to it.** `register_tenant` is exempt because it runs pre-auth and creates the tenant it writes into; `login_lookup` is read-only. Everything added after them is subject to it — and the **step-5 gate now requires live authorization negatives, not just atomicity**: a non-admin call rejected, and an admin of A unable to touch B through the function.
+
+**Not done, and not claimed.** No interceptor, no session, no per-request re-verify, no endpoints — Phases 3–4. No step-5 membership-write functions. Step 4's definition of done still needs `register → login → /auth/me`, the multi-membership switch, unauthorized-switch 403, revocation-on-next-request and role-follows-active-membership; none of that exists yet.
+
+**Next**
+
+- **Phase 3** — the interceptor: two GUCs, verify-then-set ordering, per-request membership re-verification with the claimed tenant passed as a bound parameter.
+- Phase 4 — the auth endpoints, including the `23505` → 409 mapping above.
+
+---
+
+### 2026-09-08 — Step 4 Phase 1: identity/tenancy schema + two-axis RLS (§11 step 4)
+
+**Done**
+
+- **Migration `20260907000000_identity_tenancy_schema`** — `tenants`, `users` (pure identity, globally-unique live email via partial index, `citext`), `memberships` (the join carrying `role`), the `membership_role` enum, partial unique on `(user_id, tenant_id) WHERE deleted_at IS NULL`, `ENABLE` + `FORCE ROW LEVEL SECURITY` on all three, eight policies, and column-limited grants. Implements ADR-006, with two amendments recorded there.
+- **`users` policy set — an ADR gap, surfaced rather than assumed.** ADR-006 never specified one, and `users` had lost the `tenant_id` its ADR-004 policy keyed on; it would have shipped with a broken policy or none at all. Added `users_self_read`, `users_tenant_members_read`, `users_definer`, **no app-role write policy**, and `password_hash` withheld by **column-level grant** (RLS is row-level and cannot hide a column).
+- **DECISION B — the database backstops intra-tenant role authorization.** The gate review found that `memberships_tenant`, specified `FOR ALL TO meterlog_app` with the admin check left to a step-5 RBAC guard, permitted **intra-tenant privilege escalation**: a technician in tenant A ran `UPDATE public.memberships SET role='admin' WHERE user_id=<self>` and got `UPDATE 1`. Neither policy clause carries a role term, and `tenant_id` never changes during a role edit. The axis is now `FOR SELECT`, the app role's `INSERT`/`UPDATE` grants on `memberships` are withdrawn, and invite/revoke/change-role move to admin-checking `SECURITY DEFINER` functions in step 5. Recorded in ADR-006 §3 and §7 and in DECISIONS.md, with the A/B/C rationale.
+- **Co-member visibility recorded as intentional.** Every member of a tenant reads every co-member's identity and role. That was an unremarked side effect of the tenant axis keying on `tenant_id` alone; it is now a decision (team-SaaS default), and reads stay un-gated because a role term in a _read_ policy is the shape that produced OPEN-5.
+- **Catalog assertions 9 and 10** — the app role holds no `INSERT`/`UPDATE`/`DELETE` on any identity table, and can still read all three. 9 is what keeps Decision B durable: one stray `GRANT` would otherwise reopen the escalation with nothing complaining. It also closes the previously-untested `tenants` write-privilege gap.
+- **Revoked-membership fixtures.** The OPEN-5 residual argument — "liveness is enforced in-policy on the read paths, so a revoked workspace disappears from `/auth/me`" — is recorded in three places and was tested by nothing: no fixture had a soft-deleted membership, so deleting either liveness predicate was a green mutation. Two revoked memberships now exist in the suite, with assertions on both read paths, plus an assertion pinning the residual itself so nobody "fixes" what cannot be fixed.
+
+**Verified against live Postgres, with negatives** (`meterlog_app`, `rolbypassrls = f`, on a database built only by `prisma migrate deploy`)
+
+- **The escalation, before and after.** Pre-B: `INSERT 0 1` for the active tenant, and `UPDATE 1` → `role_now = admin`. Post-B: both `permission denied for table memberships`.
+- **Both denial layers, separately.** The grant layer is shown by the plain rejections above. The **policy** layer is isolated by restoring the write grants inside a rolled-back transaction — then `INSERT` raises `new row violates row-level security policy`, while `UPDATE`/`DELETE` **do not raise**: no applicable policy means no visible row, so Postgres returns `UPDATE 0` / `DELETE 0` cleanly with the row unchanged. A test asserting a thrown error on the UPDATE path would have failed against a correct database; the suite asserts zero-rows-and-unchanged there deliberately.
+- **Cross-tenant boundary unregressed**, and reads unregressed — a technician in A still reads all of A's co-members (the accepted behaviour).
+- **`register_tenant` unaffected — proven, not asserted.** Built as ADR-006 §6 specifies inside a rolled-back transaction: the three-row insert succeeds as `meterlog_definer`; the identical insert as `meterlog_app` is denied. Same treatment for `login_lookup`, which still reads `password_hash` through the definer while the app role gets `permission denied`.
+- **Mutation sweep, 21 mutations, 20 caught.** Every `USING`/`WITH CHECK` predicate, every `NULLIF` guard, both liveness predicates, the `FOR SELECT`→`FOR ALL` reversals, and stray write grants, dropped one at a time. Reverting `memberships_tenant` to `FOR ALL` is caught **only** by the policy-layer block, which is why that block exists. The one uncaught mutation (`tenants_active` `WITH CHECK` → `true`) is unreachable rather than unguarded — the app role cannot write `tenants` — and assertion 9 now guards the privilege that makes it unreachable, which mutation 21B confirms. All 21 reverted; post-sweep schema dump identical to a freshly-migrated one.
+- **Drift** — schema, policies (full `USING`/`WITH CHECK` text), RLS flags, table and column grants and indexes diffed against a scratch database built only from the migrations: identical.
+
+**Verified in CI** — see the run linked on PR #1. 45 tests (catalog-rls 10, membership-isolation 23, isolation 6, definer-probe 5, health 1), up from 34.
+
+**Process smell worth naming.** The local database was found carrying the Phase 1 tables with **no `_prisma_migrations` table at all** — the schema had been applied out-of-band at least once, so `prisma migrate status` reported both migrations unapplied while the objects existed. It was byte-identical to what the migrations produce, so nothing was wrong with the schema; what was wrong is that this could not have been known without diffing. Migrations must be the only path that ever touches a database, most of all Render — an out-of-band change there is invisible, unreviewable, and unreproducible. The local ledger was baselined with `prisma migrate resolve --applied`; CI-on-a-fresh-database remains the real reproducibility proof.
+
+**Repo / process**
+
+- Branch protection on `main`: PR required, CI status check required, no direct pushes, no force-push, no deletion, **0 required approvals** (solo repo). Verified by a refused push, not by reading the settings.
+- Secrets scan over full history (gitleaks + a provider-token grep across every blob): clean. The single gitleaks hit is the literal placeholder `replace-me-with-32-bytes-of-hex` in `.env.example`.
+
+**Not done, and not claimed.** Step 4's definition of done needs `register → login → /auth/me` round-tripping, the multi-membership switch, unauthorized-switch 403, revocation-on-next-request and role-follows-active-membership. None of that exists — it is Phases 2–4. What Phase 1 proves is the harder novel part: the shared-user, dual-axis membership isolation, and now a real intra-tenant write boundary at the database layer.
+
+**Next**
+
+- **Phase 2** — the two `SECURITY DEFINER` functions (`login_lookup`, `register_tenant`), including the forced-failure test that asserts no tenant survives a partial registration.
+- Phase 3 — the interceptor: two GUCs, verify-then-set, per-request membership re-verification.
+- Phase 4 — the auth endpoints.
+- Step 5 will add the admin-checking membership-write definer functions Decision B requires, and must edit `EXPECTED_DEFINER_FUNCTIONS` deliberately when it does.
+
+---
 
 ### 2026-09-03 — Scaffold (§11 step 3)
 
