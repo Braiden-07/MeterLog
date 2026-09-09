@@ -75,10 +75,29 @@ export const DEFINER_ACCESSIBLE_TABLES: readonly string[] = ['tenants', 'users',
  * Fixed by ADR-006 §6. `login_lookup(email)` takes email alone — ADR-004's
  * login-identity question is dissolved rather than answered, since email is now
  * globally unique. `register_tenant` performs the three-row atomic insert
- * (tenant + user + membership). Both land in build-order step 4; until then this
- * list is asserted against an empty catalog.
+ * (tenant + user + membership). Both land in build-order step 4.
+ *
+ * STEP 5 PHASE 1 grew this list from two to five, which ADR-006 §7 names in
+ * advance as the reason it would change: DECISION B made `meterlog_app`
+ * structurally incapable of writing `memberships`, so invite / change-role /
+ * revoke can only exist as definer functions.
+ *
+ * The three additions differ from the original two in the way that matters: they
+ * act ON BEHALF OF AN AUTHENTICATED CALLER, so they are bound by the §7 standing
+ * rule and must enforce, in their own bodies, that the caller is an admin of the
+ * active tenant and that the target row belongs to it. `register_tenant` is
+ * exempt (pre-auth, no acting caller); `login_lookup` is read-only. Anything
+ * added here later is subject to the rule, and to `membership-writes.spec.ts`'s
+ * standard of proof: the negatives are produced by calling the function directly
+ * as `meterlog_app` with the GUCs set by hand, never through an HTTP guard.
  */
-export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = ['login_lookup', 'register_tenant'];
+export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = [
+  'login_lookup',
+  'register_tenant',
+  'invite_member',
+  'change_member_role',
+  'revoke_member',
+];
 
 /**
  * Tables deliberately excluded from the generic tenant-only isolation matrix

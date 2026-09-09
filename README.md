@@ -4,7 +4,7 @@ Multi-tenant SaaS for tracking physical assets — utility meters, equipment —
 
 Tenant isolation is enforced by **PostgreSQL Row-Level Security**, not by application `WHERE` clauses, under a **membership model**: a person is not a property of a tenant. One user can hold memberships in several tenants with a different role in each, and the isolation guarantee has to hold even for that user.
 
-**Status: build-order step 4 of 11 complete** (auth + tenancy foundation). 97 tests green in CI. RBAC is step 5, the domain entities are step 6, and nothing is deployed yet — see [what is not yet proven](docs/ISOLATION.md#8-what-this-does-not-prove).
+**Status: build-order step 4 of 11 complete** (auth + tenancy foundation); **step 5 (RBAC) in progress — phase 1 of 3**, the membership-write definer functions and their database-level authorization. 127 tests green in CI. The RBAC guard and role-gated endpoints are the rest of step 5, the domain entities are step 6, and nothing is deployed yet — see [what is not yet proven](docs/ISOLATION.md#8-what-this-does-not-prove).
 
 ---
 
@@ -41,7 +41,7 @@ cp .env.example .env      # then set SESSION_SECRET
 docker compose up -d      # Postgres 16 + Redis 7
 npm install
 npm run db:migrate
-npm run test              # 97 tests, including every DB suite
+npm run test              # 127 tests, including every DB suite
 npm run dev
 ```
 
