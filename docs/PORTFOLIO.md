@@ -5,7 +5,7 @@
 The finished write-up is [`docs/ISOLATION.md`](https://github.com/Braiden-07/MeterLog/blob/main/docs/ISOLATION.md), where every technical claim carries a `file:line` link into the repository and every security property is backed by a rejected write, a zero-row read, or a refused request quoted as real output.
 
 **Stack:** TypeScript · NestJS · PostgreSQL 16 (Row-Level Security) · Prisma · Redis · Next.js · GitHub Actions
-**State:** build-order step 4 of 11 complete — auth and tenancy foundation; step 5 (RBAC) phase 1 of 3 landed — the membership-write definer functions with their authorization proven at the database layer. 127 tests green in CI. Not yet deployed.
+**State:** build-order step 4 of 11 complete — auth and tenancy foundation; step 5 (RBAC) phases 1 and 2 of 3 landed — the membership-write definer functions with their authorization proven at the database layer, and the role-gated endpoints proven over real HTTP on top of them. 146 tests green in CI. Not yet deployed.
 
 ---
 
