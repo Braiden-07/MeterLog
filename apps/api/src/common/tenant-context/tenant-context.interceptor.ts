@@ -9,6 +9,7 @@ import {
 import { Reflector } from '@nestjs/core';
 import { Observable, firstValueFrom, from } from 'rxjs';
 
+import { REQUIRES_ROLE } from '../auth/requires-role.decorator';
 import { REQUIRES_SESSION } from '../auth/requires-session.decorator';
 
 import { PrismaService, TRANSACTION_OPTIONS } from '../prisma/prisma.service';
@@ -60,6 +61,16 @@ export class TenantContextInterceptor implements NestInterceptor {
     const cookie = SessionService.readCookie(request?.headers?.cookie, SESSION_COOKIE);
     const session = await this.sessions.read(cookie);
 
+    // Both route declarations are read up front. `@RequiresRole()` IMPLIES a
+    // session: a role-gated route cannot be served without identity, so it is
+    // treated as session-required below even if `@RequiresSession()` was not
+    // written alongside it. Forgetting one of the two decorators must not leave a
+    // gated route anonymously reachable.
+    const requiredRoles = this.reflector.getAllAndOverride<string[] | undefined>(REQUIRES_ROLE, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
     if (!session) {
       // No identity to scope by, so no transaction and no GUCs.
       //
@@ -75,7 +86,7 @@ export class TenantContextInterceptor implements NestInterceptor {
         context.getHandler(),
         context.getClass(),
       ]);
-      if (required) {
+      if (required || (requiredRoles && requiredRoles.length > 0)) {
         throw new UnauthorizedException({
           error: { code: 'UNAUTHENTICATED', message: 'Sign in to continue.' },
         });
@@ -137,6 +148,37 @@ export class TenantContextInterceptor implements NestInterceptor {
           session.activeTenantId,
         );
         tenantId = session.activeTenantId;
+      }
+
+      // (5) The role gate — @RequiresRole(), enforced HERE and nowhere else.
+      //
+      // This is the only point in the request where the answer exists. It is
+      // after (4), so `role` is the value just re-read from the database for the
+      // active membership — never the copy in the session, which goes stale the
+      // moment an admin changes it. And it is inside the interceptor rather than
+      // in a CanActivate guard because Nest runs guards BEFORE interceptors: a
+      // guard would be asking for a role that has not been resolved yet, and
+      // would 500 on every gated route. See requires-role.decorator.ts — this is
+      // the Phase 4 ordering defect one layer up, and it is not being repeated.
+      //
+      // A null role means no active workspace (zero or several memberships, none
+      // selected). That fails the gate: there is no tenant in which the caller
+      // holds the required role, so the answer is 403, not "allow".
+      //
+      // This is the OUTER of two checks. The definer function bodies re-check the
+      // caller is a live admin of the active tenant, and that check is the one
+      // that cannot be bypassed — anything holding the app connection can call
+      // the function directly, guard or no guard (ADR-006 §7). Removing this gate
+      // must never be justified by the body check, nor the body check by this
+      // gate; test/db/membership-writes.spec.ts proves the inner one with nothing
+      // in front of it, and is marked load-bearing for exactly that reason.
+      if (requiredRoles && requiredRoles.length > 0 && (!role || !requiredRoles.includes(role))) {
+        throw new ForbiddenException({
+          error: {
+            code: 'FORBIDDEN_ROLE',
+            message: 'You do not have permission to perform this action in this workspace.',
+          },
+        });
       }
 
       return runWithRequestContext({ tx, userId: session.userId, tenantId, role }, () =>

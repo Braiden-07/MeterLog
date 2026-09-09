@@ -21,9 +21,10 @@ meterlog/
 │   │   │   ├── common/session/          Redis sessions + signed cookie ids
 │   │   │   ├── common/request-context/  AsyncLocalStorage: tx, user, tenant, role
 │   │   │   ├── common/tenant-context/   the two-GUC interceptor (verify-before-set)
-│   │   │   ├── common/auth/             @RequiresSession route metadata
+│   │   │   ├── common/auth/             @RequiresSession + @RequiresRole metadata
 │   │   │   ├── common/http/             error-envelope exception filter
 │   │   │   ├── auth/                    register · login · switch · me · logout
+│   │   │   ├── memberships/             GET/POST/PATCH/DELETE /users (RBAC-gated)
 │   │   │   └── health/                  GET /api/v1/health
 │   │   ├── test/db/                     catalog RLS · isolation · definer · interceptor
 │   │   └── test/api/                    step-4 acceptance, real HTTP + real cookies
@@ -52,7 +53,16 @@ Routes needing identity are marked `@RequiresSession()`; the tenant-context inte
 
 ### 4.2 Tenants
 
-### 4.3 Users
+### 4.3 Users (memberships)
+
+`GET / POST / PATCH / DELETE /users` under `/api/v1`. The Users module is a **memberships** module in substance (ADR-006 §7): the resource is a person's access to the active workspace, not the person. `:id` is a **membership id**, not a user id — that makes §7's clause (b) a direct check on the row being written.
+
+- **list** — every member of the active tenant, joined to identity. **Not role-gated**, by decision (ADR-006 §3): co-member visibility is the team-SaaS default, and gating a read on role means a role term in a read policy, the shape that produced OPEN-5. Scoped by `memberships_tenant`, not by a `WHERE tenant_id` clause — app-layer filtering is not what isolates it.
+- **invite** (`POST`, admin) — `invite_member` (definer). Existing live identity ⇒ a new membership attaches to it; unknown email ⇒ identity and membership created together, the identity carrying a **sentinel** hash it cannot authenticate with. Already a live member ⇒ **409**, keyed on SQLSTATE `23505`.
+- **change-role** (`PATCH`, admin) — `change_member_role` (definer).
+- **revoke** (`DELETE`, admin) — `revoke_member` (definer), a soft delete.
+
+Writes carry **two independent checks**: the `@RequiresRole('admin')` gate below, which produces the clean `403` and is where role policy for the API is expressed, and the definer function body, which re-checks the caller is a live admin of the active tenant. The body check is the one that cannot be bypassed — the functions are `EXECUTE`-able by `meterlog_app`, so anything holding that connection can call them directly. Neither may be relaxed on the strength of the other; `test/db/membership-writes.spec.ts` proves the inner one with nothing in front of it.
 
 ### 4.4 Assets
 
@@ -106,6 +116,21 @@ Session cookie + Redis (ADR-001). `SessionService` stores `{ userId, activeTenan
 The stored `role` is **not authoritative** — it goes stale the moment an admin changes it. Authorization uses `RequestContext.role`, re-read from the database each request.
 
 ## 9. Authorization (RBAC matrix)
+
+Role comes from `RequestContext.role` — the active membership's role, re-read from the database every request (§7.2). The session's copy is never used for an authorization decision, so a role change takes effect on the next request rather than at next login.
+
+`@RequiresRole('admin')` marks a route; the **tenant-context interceptor enforces it**, at step (5), immediately after the role is resolved.
+
+**It is not a `CanActivate` guard, and that is load-bearing.** Nest runs guards _before_ interceptors, so a role guard executes before the transaction is open, the GUCs are set, or the membership is read — it asks for a role that does not exist yet. Measured at the Phase 2 gate: such a guard 500s **every** request, the admin's included, not merely the non-admin's. This is the Phase 4 session-guard defect one layer up. A null role (no active workspace) fails the gate rather than passing it.
+
+`@RequiresRole()` **implies** `@RequiresSession()`, so forgetting one of the two cannot leave a gated route anonymously reachable.
+
+| Endpoint            | admin | technician | auditor |
+| ------------------- | ----- | ---------- | ------- |
+| `GET /users`        | ✓     | ✓          | ✓       |
+| `POST /users`       | ✓     | 403        | 403     |
+| `PATCH /users/:id`  | ✓     | 403        | 403     |
+| `DELETE /users/:id` | ✓     | 403        | 403     |
 
 ## 10. Audit logging
 

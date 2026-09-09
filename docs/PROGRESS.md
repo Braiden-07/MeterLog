@@ -6,13 +6,48 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). Step 5 (RBAC + the membership-write definer functions) **Phase 1 of 3 complete, pending gate review** — the three definer write functions with §7 body-level authorization, proven against live Postgres with no HTTP anywhere. Phase 2 is the RBAC gate and the role-gated endpoints; Phase 3 the cross-layer negatives and the mutation sweep.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). Step 5 (RBAC + the membership-write definer functions): **Phase 1 complete and merged** (PR #2) — the three definer write functions with §7 body-level authorization, proven against live Postgres with no HTTP anywhere; **Phase 2 of 3 complete, pending gate review** — the RBAC gate and the role-gated membership endpoints over real HTTP. Phase 3 is the cross-layer mutation sweep and the revocation-on-next-request proof.
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-09 — Step 5 Phase 2: the RBAC gate and the role-gated endpoints (§11 step 5)
+
+**Done**
+
+- **`@RequiresRole('admin')`** (`src/common/auth/requires-role.decorator.ts`) — route metadata, enforced at **step (5) of the interceptor**, immediately after the role is resolved from the live database read. Same shape as `@RequiresSession()`, for the same reason.
+- **Memberships module** (`src/memberships/`) — `GET / POST / PATCH / DELETE /users`, `:id` = **membership id**. Writes admin-gated; **`GET` deliberately un-gated** per ADR-006 §3, with the absence of the decorator commented so it does not read as an oversight.
+- **SQLSTATE → HTTP mapping** keyed on `PrismaClientKnownRequestError.meta.code`, verified to carry the custom code structurally (`P2010`, `meta = { code: 'MB001', … }`) rather than only in the message: `MB001` → 403, `MB002` → 404, `MB003` → 409, `23505` → 409. `MB002` maps to 404 so "belongs to another tenant" and "does not exist" stay indistinguishable.
+- **`@RequiresRole` implies `@RequiresSession`** in the interceptor, so forgetting one decorator cannot leave a gated route anonymously reachable.
+
+**The ordering defect, measured rather than avoided by argument**
+
+The decorator's comment used to be a claim. It is now an observation: a `CanActivate` role guard reading `requireRequestContext().role` was written, wired to `POST /users`, and the suite went red on the **admin's** invite — `expected 201, got 500` — before any non-admin case was reached. The guard does not mis-handle non-admins; it **500s every request**, admin included, because at guard time no request has a context yet. That is the Phase 4 session-guard defect one layer up. Probe reverted; the finding is recorded in the decorator and in ARCHITECTURE §9.
+
+**Verified over real HTTP, with negatives (146 tests, was 127)**
+
+Every case goes through supertest with real signed session cookies through the bound interceptor. Calling `MembershipsService` directly would be testing a world where the gate does not exist.
+
+- **Positives:** invite an unknown email (identity + membership), invite an existing email (attaches — one human, two memberships, original untouched), change a role, revoke (asserted **soft** — the row survives, which is what re-invite needs). Last-admin surfaces as a clean **409 `LAST_ADMIN`**.
+- **Negative — non-admin:** technician gets **403 `FORBIDDEN_ROLE`** on POST / PATCH / DELETE, each paired with a database assertion that nothing changed. Self-promotion to admin — the escalation DECISION B exists to prevent — is now attempted through the front door and refused. **Plus the pairing case: the same technician's `GET /users` still returns 200**, so the three 403s cannot be passing because the controller was unreachable.
+- **Negative — semantic cross-tenant:** admin of A against a **real, live** membership in a real tenant B ⇒ **404**, with B asserted unchanged and asserted live first so the negative is not vacuous. A well-formed nonexistent id returns the same 404.
+- **No session ⇒ 401**, not 403 and not 500. **Authenticated with no active workspace ⇒ 403** — a null role fails the gate rather than passing it.
+- **Role follows the active membership:** one person, admin in Beta and technician in Acme, switching between them — 201 in one workspace and 403 in the other. And a role changed underneath a live session is refused on the **next** request, with no re-login.
+
+**The Phase 2 gate condition — the Phase 1 suite still passes, unchanged**
+
+`git diff main -- test/db/membership-writes.spec.ts` and the migration are **empty**: neither was touched. The suite runs **30/30 green** alongside the new endpoints. No body check was relaxed on the strength of the guard, which is the way DECISION B would silently revert to option A.
+
+**Not done, and not claimed.** No mutation sweep — Phase 3, and its own reviewable artifact. No revocation-on-next-request proof: the revoke _endpoint_ exists and authorizes here, but the proof that a revoked member's subsequent request fails closed on the pooled connection is Phase 3. The **step-7 audit retrofit** stays a referenced forward marker, unresolved.
+
+**Next**
+
+- Phase 3 — the cross-layer mutation sweep (drop the gate → the HTTP negatives redden; drop a body check → the Phase 1 direct-call negatives redden), and revocation-on-next-request driven by a real `revoke` write with the `pg_backend_pid` discipline.
+
+---
 
 ### 2026-09-09 — Step 5 Phase 1: the membership-write definer functions and §7 body-level authz (§11 step 5)
 
