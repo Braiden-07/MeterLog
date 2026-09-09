@@ -630,10 +630,115 @@ describe('membership write functions — §7 body-level authorization', () => {
         const error = await t2Outcome;
         expect(String(error), 'T2 was allowed to zero the tenant').toMatch(/MB003/);
 
+        // MB003 SPECIFICALLY, and explicitly not a deadlock. This is what makes
+        // the lock ORDER testable rather than just the presence of FOR UPDATE.
+        //
+        // Locking the target row before the admin set is the natural way to write
+        // this function and it is wrong: two admins self-demoting each hold their
+        // own row and then reach for the other's, and Postgres breaks the cycle
+        // with 40P01 rather than letting this function refuse. The tenant does
+        // keep an admin, so `liveAdminCount` below stays 1 and a test that only
+        // asserted "the loser failed" would pass on the deadlock — the ordering
+        // property would be silently untested. Asserting the code, in both
+        // directions, is what closes that.
+        expect(
+          String(error),
+          'T2 lost to a DEADLOCK, not to the last-admin guard — the admin set must be locked BEFORE the target row, ORDER BY id',
+        ).not.toMatch(/40P01|deadlock/i);
+
         // The property that matters, independent of who won.
         expect(await liveAdminCount(tenantA), 'the tenant was left with no admins').toBe(1);
       } finally {
         releaseT1();
+        await c1.$disconnect();
+        await c2.$disconnect();
+      }
+    });
+
+    it('UNFORCED CONCURRENCY: simultaneous self-demotions never deadlock — the lock ORDER', async () => {
+      // ADDED AT THE PHASE 3 SWEEP, because the test above cannot see the bug it
+      // was assumed to cover.
+      //
+      // The mutation "lock the target row BEFORE the admin set" — which is the
+      // natural way to write the function, and wrong — was expected to redden the
+      // forced-interleaving test above with 40P01. It does not. It passes.
+      //
+      // The diagnosis: that test forces the schedule "T1 runs its ENTIRE call to
+      // completion, then T2 starts". A deadlock needs both transactions to be
+      // holding their own target row BEFORE either begins its admin-set scan —
+      // they must overlap *inside* the statement. The very determinism that makes
+      // the forced test a real proof of the READ COMMITTED race is what makes it
+      // structurally blind to the lock ORDER. Two different properties; the
+      // orchestration that proves one excludes the other.
+      //
+      // So this test removes the orchestration entirely. Both self-demotions are
+      // fired simultaneously, autocommit, no gates — the schedule is left to
+      // Postgres. Correct lock order makes a deadlock **impossible**, not merely
+      // unlikely: every transaction takes the tenant's admin rows in the same id
+      // order, so no cycle can form. This test therefore CANNOT flake on correct
+      // code — a red here is always a real defect. The flipped order produces a
+      // cycle on any real overlap, and across several rounds that is effectively
+      // certain.
+      const rounds = 6;
+      const c1 = pinnedAppClient();
+      const c2 = pinnedAppClient();
+
+      try {
+        // Session-scoped GUCs (is_local => false) so each call can run as a bare
+        // autocommit statement. An interactive transaction would let the harness
+        // serialise the two, which is exactly what must not happen here.
+        for (const [client, actor] of [
+          [c1, adminA],
+          [c2, techA],
+        ] as const) {
+          await client.$executeRawUnsafe(`SELECT set_config('app.current_user', $1, false)`, actor);
+          await client.$executeRawUnsafe(
+            `SELECT set_config('app.current_tenant', $1, false)`,
+            tenantA,
+          );
+        }
+
+        for (let round = 0; round < rounds; round++) {
+          // Reset to exactly two live admins, so each round is a fresh race for
+          // the last-admin guard rather than a no-op.
+          await migrator.$executeRawUnsafe(
+            `UPDATE public.memberships SET role = 'admin', deleted_at = NULL
+              WHERE tenant_id = $1::uuid`,
+            tenantA,
+          );
+
+          const fire = (client: PrismaClient, membershipId: string) =>
+            client
+              .$executeRawUnsafe(
+                `SELECT public.change_member_role($1::uuid, 'technician')`,
+                membershipId,
+              )
+              .then(
+                () => null,
+                (e: Error) => e,
+              );
+
+          const [e1, e2] = await Promise.all([fire(c1, mAdminA), fire(c2, mTechA)]);
+          const errors = [e1, e2].filter((e): e is Error => e !== null).map(String);
+
+          for (const err of errors) {
+            expect(
+              err,
+              `round ${round}: a DEADLOCK (40P01), which means the admin set was not locked before the target row, ORDER BY id`,
+            ).not.toMatch(/40P01|deadlock/i);
+          }
+
+          // Exactly one must lose, and it must lose to the guard. Both succeeding
+          // would mean the tenant was zeroed; both failing would mean nobody could
+          // ever hand over.
+          expect(errors, `round ${round}: expected exactly one refusal`).toHaveLength(1);
+          expect(errors[0]).toMatch(/MB003/);
+          expect(
+            await liveAdminCount(tenantA),
+            `round ${round}: tenant left without an admin`,
+          ).toBe(1);
+        }
+      } finally {
         await c1.$disconnect();
         await c2.$disconnect();
       }

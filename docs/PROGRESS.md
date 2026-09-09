@@ -6,13 +6,51 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). Step 5 (RBAC + the membership-write definer functions): **Phase 1 complete and merged** (PR #2) — the three definer write functions with §7 body-level authorization, proven against live Postgres with no HTTP anywhere; **Phase 2 of 3 complete, pending gate review** — the RBAC gate and the role-gated membership endpoints over real HTTP. Phase 3 is the cross-layer mutation sweep and the revocation-on-next-request proof.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). **Step 5 (RBAC + membership management) COMPLETE across all three phases, pending final gate review** — the definer write functions with §7 body-level authorization (PR #2), the RBAC gate and role-gated endpoints (PR #3), and the cross-layer mutation sweep plus revocation-on-next-request driven by a real revoke (this PR). **Step 6 (domain entities — assets/readings) is next**, and is where the catalog-driven isolation matrix stops generating zero cases.
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-09 — Step 5 Phase 3: the cross-layer sweep, the real-revoke proof, and Step 5 closeout (§11 step 5)
+
+**Done**
+
+- **Revocation-on-next-request, driven by a real revoke** (`test/api/revocation.spec.ts`). Step 4 proved this property against a hand-written `UPDATE ... SET deleted_at` executed by the migration role — a fixture standing in for a feature that did not exist. The revoke is now performed the way an admin performs it: over HTTP, through the RBAC gate, through `revoke_member`, as the app role. M's request 1 succeeds on pooled backend P; the admin's `DELETE /users/:id` returns 204 and the soft delete is **asserted** (so a silent no-op cannot make the next 403 look like proof); M's request 2 fails closed **403 `MEMBERSHIP_REVOKED`** with `pg_backend_pid` asserted equal to P, baseline-subtracted. The admin's delete runs on that same backend _between_ M's two requests, so request 2 arrives on a connection whose last transaction belonged to a different user — a sharper version of the reuse hazard than step 4 had.
+- **ADR-006 §7 amendment (5)** — the `MB002` anti-enumeration property recorded as a design rule with the refactor that would reopen it, same shape as the invite-hash vector: cross-tenant and absent both return one indistinguishable 404, and the "more helpful error messages" pass that splits them into 403/404 _is_ the oracle.
+
+**The mutation sweep — 7 mutations, 7 caught, and TWO of them escaped first**
+
+Both escapers were real defects with no coverage, not equivalent mutants, and both were made reachable rather than waved through.
+
+- **Escaper 1 — the lock ORDER.** Flipping it (target row locked before the admin set) was expected to redden the concurrent test with `40P01`. It **passed**. Diagnosis: that test forces the schedule "T1 runs its entire call to completion, then T2 starts", and a deadlock needs both transactions to hold their own target row _before_ either scans the admin set — they must overlap **inside** the statement. The determinism that makes it a real proof of the READ COMMITTED race is exactly what makes it blind to the lock order. Two different properties; the orchestration that proves one excludes the other. Fixed with a second test that removes the orchestration entirely — both self-demotions fired simultaneously, autocommit, six rounds. Correct lock order makes a deadlock **impossible**, so it cannot flake on correct code; the flipped order now reddens 5/5 runs on round 0-2 with the exact 40P01 diagnosis.
+- **Escaper 2 — the RBAC gate itself.** Removing `@RequiresRole('admin')` from all three routes left the **entire** Phase 2 suite green. Diagnosis: the definer body refuses the same callers with `MB001`, which mapped to a 403 carrying the _same_ `FORBIDDEN_ROLE` code — the two responses were byte-identical, so nothing could tell which layer acted. Defence-in-depth doing its job, and simultaneously an untestable claim. Fixed by making the layers distinguishable: the gate answers `FORBIDDEN_ROLE`, the function body answers `NOT_ADMIN`, both 403. Dropping the gate now reddens three tests with `expected 'NOT_ADMIN' to be 'FORBIDDEN_ROLE'`. The operational payoff is real too — `NOT_ADMIN` reaching a client means the request got past the gate and was stopped by the database.
+
+All seven reverted; function bodies byte-verified (NULLIF present, admin-set lock ordered before the target, no mutation residue, owner `meterlog_definer`) and the three route decorators restored.
+
+**150 tests green** (was 146). Lint, typecheck, build and format clean.
+
+**Step 5 is done. What it proved**
+
+Three membership-write definer functions with §7 body-level authorization proven **directly, with nothing in front** (Phase 1); the last-admin guard with a genuinely concurrent negative and now a lock-order negative too; the RBAC guard and role-gated write endpoints without reintroducing the guards-before-interceptors defect, reads left un-gated per §3 (Phase 2); the cross-tenant enumeration oracle closed and _tested_ (Phase 3); revocation-on-next-request behind a real revoke (Phase 3); every negative proven non-vacuous by a mutation. The Phase 1 backstop suite is byte-identical to what merged and green throughout — no body check was relaxed on the strength of the guard.
+
+**What Step 5 does NOT do — stated plainly so "RBAC landed" does not imply more than it should**
+
+- **Domain isolation is still step 6.** `assets`, `readings`, `maintenance_records` do not exist. The catalog-driven isolation matrix still generates **zero cases against real tables** — `ISOLATION_FIXTURES` is empty and `memberships`/`users`/`tenants` are registered as bespoke-handled. The isolation proof today covers the identity/tenancy tables only.
+- **No `audit_log` row is written for any membership mutation**, and no invited person can log in. Both are owed by this step and paid later — see the two forward debts immediately below.
+
+**TWO FORWARD DEBTS NOW POINT AT STEP-5 CODE — both are owed by this step, neither is paid here.** Listed together so whoever opens this entry next sees both at once instead of discovering them a step apart:
+
+1. **The audit retrofit — step 7.** The membership mutations (`invite_member`, `change_member_role`, `revoke_member`) are exactly the writes where role-at-time-of-action matters most, and they land **two steps before** the audit module, so step 7's "audit_log write on every mutation" will not cover them unless it goes back for them. Step 7 must retrofit audit writes onto these three functions, and that is also where **OPEN-4** is finally answered. Unresolved; recorded in `DECISIONS.md`.
+2. **The set-password / invite-token flow — first slice of step 8, hard deadline step 10 (deploy).** `invite_member` creates an identity with a sentinel hash that authenticates against nothing, so today an invite produces a person who can never log in and cannot self-recover (registering their own org is a 409 — OPEN-1). This is **not** an acceptable v1.0 limitation: essential scope includes the admin user-management UI (`PROJECT_BRIEF.md` §2 line 32) and the DoD requires the frontend to cover all essential journeys (§12 line 265), so an invite button that dead-ends fails the DoD on its own terms. Scheduled to step 8 because that is where the auth pages live (§11 line 251) and because it enables the strongest step-9 e2e journey — _admin invites a colleague → they set a password → they log in → they see exactly one workspace_. The real deadline is **step 10**: before deploy the only people this can lock out are test fixtures; after deploy they are real. Enforced by a **DoD checkbox** in `PROJECT_BRIEF.md` §12 rather than by this note, because markers drift and checklists block. Full reasoning in `DECISIONS.md`.
+
+**Next**
+
+- Step 6 — domain entities (assets, readings, maintenance records), and the fixture registry that finally makes the generic isolation matrix generate real cases.
+
+---
 
 ### 2026-09-09 — Step 5 Phase 2: the RBAC gate and the role-gated endpoints (§11 step 5)
 
