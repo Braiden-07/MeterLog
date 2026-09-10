@@ -7,14 +7,15 @@ import {
   APPEND_ONLY_TABLES,
   ISOLATION_BESPOKE_TABLES,
   ISOLATION_FIXTURES,
-  type IsolationSeedContext,
   RLS_EXEMPT_TABLES,
   appClient,
   capturePgFailure,
   execAll,
   migratorClient,
+  resetDatabase,
   seedIsolationContext,
   seedIsolationUser,
+  type IsolationSeedContext,
   withTenant,
 } from './helpers';
 
@@ -58,26 +59,24 @@ describe('catalog-driven tenant isolation', () => {
     // had ever run against was a scratch table with no foreign keys. `assets`
     // references `public.tenants`, and the app role is SELECT-only there, so the
     // parents must be seeded by the MIGRATION role before anything else happens.
+    // RESET FIRST, THEN SEED — the order matters and is therefore explicit here
+    // rather than hidden inside a seeding helper. resetDatabase truncates `users`
+    // and `tenants` as well as the domain tables, so seeding the attribution user
+    // before the reset would destroy it and every child row's created_by FK would
+    // fail with 23503.
+    await resetDatabase(migrator);
     await seedIsolationUser(migrator, FIXTURE_USER);
     contexts = await seedIsolationContext(migrator, [TENANT_A, TENANT_B], FIXTURE_USER);
   });
 
   afterAll(async () => {
-    // Domain rows first: `assets.tenant_id` is ON DELETE RESTRICT, so a leftover
-    // asset would make a later suite's `DELETE FROM public.tenants` fail with
-    // 23503 rather than a legible error about this suite.
-    await execAll(migrator, [
-      // CHILDREN BEFORE PARENTS. Both children reference assets ON DELETE
-      // RESTRICT, so deleting assets first raises 23503 and the failure surfaces
-      // as an opaque teardown error rather than anything about this suite. Every
-      // new FK-child of assets must be added to this list.
-      'DELETE FROM public.readings',
-      'DELETE FROM public.asset_events',
-      'DELETE FROM public.assets',
-      `DELETE FROM public.users WHERE id = '${FIXTURE_USER}'`,
-      `DELETE FROM public.tenants WHERE id = '${TENANT_A}'`,
-      `DELETE FROM public.tenants WHERE id = '${TENANT_B}'`,
-    ]);
+    // Shared catalog-derived teardown. This used to be a hand-ordered list of
+    // DELETEs carrying a note that every new FK-child of `assets` had to be added
+    // to it — the note was accurate and still did not work: `readings` landed and
+    // the list was not updated, which broke 31 tests in a suite this file does not
+    // touch. TRUNCATE ... CASCADE hands the ordering to Postgres, and
+    // resetDatabase verifies zero rows afterwards.
+    await resetDatabase(migrator);
     await app.$disconnect();
     await migrator.$disconnect();
   });

@@ -14,6 +14,36 @@
 
 ## Session log
 
+### 2026-09-10 — Test-teardown hardening: one catalog-derived TRUNCATE, twelve sites collapsed
+
+Test infrastructure only — no migration, schema, policy, grant or API change. Follows the cross-suite coupling surfaced (and deliberately not fixed) at the close of step 6 phase 2.
+
+**The trap, and why it was worth a PR of its own.** Teardown ordering was duplicated across the suite, hand-coupled to the child-table set, and silent. When `readings` landed, `isolation.spec.ts`'s list did not know about it, threw `23503` partway, never reached its `users`/`tenants` deletes, and the residue broke **31 tests in `membership-writes.spec.ts`** — a file with no relationship to the change, reporting a foreign-key error naming neither cause nor culprit.
+
+**The grep found more sites than the brief named.** The brief listed five; the exhaustive sweep found **twelve teardown sites across nine files** — ten blanket `memberships → users → tenants` triples plus two domain-aware cleanups. The three unnamed files (`interceptor.spec.ts`, `membership-isolation.spec.ts`, `membership-writes.spec.ts`) each carried **two** sites, a `beforeEach`/`beforeAll` reset as well as an `afterAll`. Every one converted. Three `DELETE`s were deliberately left alone: they are **behavioural assertions inside tests** (the matrix's cross-tenant DELETE case, and two membership revocation negatives), not teardown.
+
+**The mechanism.** `resetDatabase(migrator)` in `helpers.ts` issues one `TRUNCATE "t1", "t2", … CASCADE` over a catalog-derived list — `pg_tables` in `public`, minus the reused `RLS_EXEMPT_TABLES` (which already names `_prisma_migrations`, correctly excluded because truncating it destroys migration-state tracking). **Postgres resolves the FK graph**, so the ordering knowledge does not move into a helper someone still has to extend — it ceases to exist. `maintenance_records` and `audit_log` will need zero edits.
+
+Four hazards documented at the site: it runs as the **migrator, never the app client** (catalog assertion 6 asserts `meterlog_app` holds no `TRUNCATE`, so the obvious "fix" for a `permission denied` silently defeats a real assertion); `CASCADE` is deliberately broader than its arguments; `_prisma_migrations` is excluded; and the row counts are taken on the migrator because an app-client count is RLS-filtered to zero with no GUC set, which would make the guard **vacuous forever**.
+
+**The half never fixed — silence.** `assertNoResidualRows(migrator)` runs after every truncate and throws naming each offending table and the fix. Passing by construction today, which is the point: it is the regression guard. If teardown ever stops cleaning, the suite that caused it fails **at its own site** rather than three suites away.
+
+**Proven to fire, not assumed.** `test/db/teardown.spec.ts` (4 tests) plants a single stray row and calls the guard directly — the same method that confirmed the phase 2 breakage. It also asserts every dirty table is named (not just the first), and truncates a full tenant → asset → readings/asset_events graph in one statement to show CASCADE doing the ordering.
+
+**And proven to fire in the REAL path, by mutation.** Making `resetDatabase` skip one table produced, from `auth-definer.spec.ts`'s own teardown: `teardown left rows behind: tenants=1. A later suite's cleanup will fail with an opaque foreign-key error instead of naming this. Call resetDatabase(migrator) rather than hand-rolling DELETEs.` That is the whole claim demonstrated — named, at the causing site. Reverted.
+
+**A regression caught during the work, worth recording.** Routing `seedIsolationContext` through `resetDatabase` broke 6 isolation tests: the helper used to clear only domain tables, but `resetDatabase` truncates `users` and `tenants` too, destroying the `FIXTURE_USER` seeded moments earlier so every child's `created_by` FK failed. Fixed by making the reset the **caller's** responsibility, ordered explicitly at the call site — reset, then seed — with the reason commented in both places. A self-resetting seed helper was safe only while it deleted less than it appeared to.
+
+**Load-bearing invariants verified untouched:** `fileParallelism: false`, `connection_limit=1`, and the `pg_backend_pid` equality assertions all intact. Teardown ordering is orthogonal to the connection-reuse invariants — nothing here changes which connection a test gets or how many run at once.
+
+**181 tests green** (was 177; +4 guard tests), three consecutive runs. Lint, typecheck, build, format clean. A `CLAUDE.md` test-suite invariant records the helper and the never-grant-TRUNCATE rule.
+
+**Next**
+
+- Step 6 Phase 3 — the API surface, the `assets` ↔ `asset_events` lifecycle wiring per ARCHITECTURE §9.2, and the ADR-006 §8.3 shared-user headline test over real HTTP.
+
+---
+
 ### 2026-09-10 — Step 6 Phase 2: readings, and the EXPLAIN ANALYZE requirement (§11 step 6)
 
 Deliberately short and low-risk: every mechanism `readings` needs was built and proven at Phase 1. The job was to land the table faithfully, register its fixture, and prove `readings` is genuinely **under** the contract rather than assuming it inherits.

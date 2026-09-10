@@ -11,7 +11,7 @@ import Redis from 'ioredis';
 import { AppModule } from '../../src/app.module';
 import { ARGON2_OPTIONS, dummyVerifyTarget } from '../../src/auth/auth.service';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
-import { execAll, loadEnv, migratorClient } from '../db/helpers';
+import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
 
 /**
  * Step 4, Phase 4 — the API acceptance suite. This is the step-4 definition of
@@ -71,11 +71,9 @@ describe('auth API (step-4 acceptance)', () => {
   beforeEach(wipe);
 
   async function wipe(): Promise<void> {
-    await execAll(migrator, [
-      `DELETE FROM public.memberships`,
-      `DELETE FROM public.users`,
-      `DELETE FROM public.tenants`,
-    ]);
+    // Shared catalog-derived teardown: TRUNCATE ... CASCADE lets Postgres resolve
+    // the FK order, so this no longer breaks when a new domain table lands.
+    await resetDatabase(migrator);
   }
 
   /** Backend pids currently held by the app role, minus whatever was already there. */

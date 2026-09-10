@@ -325,27 +325,125 @@ export const ISOLATION_FIXTURES: Readonly<Record<string, IsolationFixture>> = {
 };
 
 /**
+ * Every table this suite is allowed to wipe, read from the catalog.
+ *
+ * Derived rather than listed, because a hand-maintained list is the thing that
+ * broke: `readings` landed at step 6 phase 2 and five separate teardowns did not
+ * know about it. A catalog query cannot fall behind the schema.
+ *
+ * `RLS_EXEMPT_TABLES` is REUSED as the exclusion rather than a second list being
+ * written. It names `_prisma_migrations`, which is the correct exclusion for both
+ * purposes: it is not tenant data (so it needs no RLS) and it tracks which
+ * migrations have been applied (so truncating it would destroy migration state and
+ * make the next `migrate deploy` try to re-run everything).
+ */
+async function listManagedTables(migrator: PrismaClient): Promise<string[]> {
+  const rows = await migrator.$queryRawUnsafe<{ tablename: string }[]>(
+    `SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`,
+  );
+  return rows.map((r) => r.tablename).filter((t) => !RLS_EXEMPT_TABLES.includes(t));
+}
+
+/**
+ * Asserts the database holds no rows in any managed table. Throws naming the
+ * offenders.
+ *
+ * THIS IS THE HALF THE ORIGINAL COMPLAINT NEVER FIXED. Teardown was wrong in two
+ * ways — wrong ORDER and SILENT. `resetDatabase` fixes the order by delegating it
+ * to Postgres; this fixes the silence. Today it passes by construction, which is
+ * the point: it is a regression guard, not a check for a known bug.
+ *
+ * What it buys: if teardown ever stops fully cleaning — someone reverts to
+ * hand-rolled DELETEs that miss a table, or a future table escapes the catalog
+ * derivation — the suite that failed to clean up fails **at its own site, naming
+ * the table**, instead of surfacing three suites later as a `23503` foreign-key
+ * violation that names neither the cause nor the culprit. That is exactly how the
+ * step 6 phase 2 breakage presented: 31 failures in `membership-writes.spec.ts`,
+ * caused by `isolation.spec.ts`.
+ *
+ * COUNTS ON THE MIGRATOR, AND THAT IS LOAD-BEARING. An app-client count is
+ * RLS-filtered: with no `app.current_tenant` set it returns zero rows whatever the
+ * table actually holds, so the guard would pass vacuously and forever. No role
+ * holds `BYPASSRLS` (ADR-004), so the migration role's cross-tenant visibility is
+ * the only way to see residue — the same reason the teardown itself runs as the
+ * migrator.
+ */
+export async function assertNoResidualRows(migrator: PrismaClient): Promise<void> {
+  const tables = await listManagedTables(migrator);
+  if (tables.length === 0) return;
+
+  // One statement, per-table counts, so the failure message names the offender
+  // rather than merely reporting that something somewhere is dirty.
+  const union = tables
+    .map((t) => `SELECT '${t}' AS table_name, count(*)::int AS n FROM public."${t}"`)
+    .join(' UNION ALL ');
+
+  const rows = await migrator.$queryRawUnsafe<{ table_name: string; n: number }[]>(union);
+  const dirty = rows.filter((r) => r.n > 0);
+
+  if (dirty.length > 0) {
+    const detail = dirty.map((r) => `${r.table_name}=${r.n}`).join(', ');
+    throw new Error(
+      `teardown left rows behind: ${detail}. ` +
+        `A later suite's cleanup will fail with an opaque foreign-key error instead of naming this. ` +
+        `Call resetDatabase(migrator) rather than hand-rolling DELETEs.`,
+    );
+  }
+}
+
+/**
+ * THE shared teardown. Empties every managed table, then proves it.
+ *
+ * `TRUNCATE ... CASCADE` is the mechanism deliberately, in place of an ordered
+ * list of DELETEs. **Postgres resolves the foreign-key graph itself**, so the
+ * ordering knowledge does not move into this helper — it ceases to exist. That is
+ * the difference between fixing the bug and relocating it: when
+ * `maintenance_records` and `audit_log` land, this function needs no edit, and
+ * nobody has to remember that children go before parents.
+ *
+ * Three things a reader will trip over, so they are written down:
+ *
+ * 1. **It runs as the MIGRATOR, never the app client.** Catalog assertion 6
+ *    asserts `meterlog_app` holds no `TRUNCATE` on any table, on purpose. So when
+ *    a teardown here raises `permission denied`, the obvious fix —
+ *    `GRANT TRUNCATE ... TO meterlog_app` — silently defeats a real assertion and
+ *    widens the runtime role's privileges to make a test convenient. **Never do
+ *    that.** Pass a `migratorClient()`.
+ * 2. **`CASCADE` is broader than the tables named.** It also truncates any table
+ *    referencing them, even one absent from the argument list. That is what makes
+ *    the ordering problem disappear, and it is surprising to anyone reading a
+ *    delete list as exhaustive. Today the derived list already IS every non-exempt
+ *    table in `public`, so nothing lies outside it — the note is for the schemas
+ *    that come later.
+ * 3. **`_prisma_migrations` is excluded** via `RLS_EXEMPT_TABLES`; see
+ *    `listManagedTables`.
+ */
+export async function resetDatabase(migrator: PrismaClient): Promise<void> {
+  const tables = await listManagedTables(migrator);
+  if (tables.length === 0) return;
+
+  const quoted = tables.map((t) => `public."${t}"`).join(', ');
+  await migrator.$executeRawUnsafe(`TRUNCATE ${quoted} CASCADE`);
+
+  await assertNoResidualRows(migrator);
+}
+
+/**
  * Seeds the parent rows every FK-carrying fixture needs, AS THE MIGRATION ROLE,
  * and returns a context per tenant. Closes wrinkle 1.
  *
- * Deletes the domain tables first so residue from a crashed run cannot survive
- * into this one — and, more importantly, cannot leave `assets` rows pointing at
- * tenants that a later suite tries to `DELETE FROM public.tenants`, which
- * `ON DELETE RESTRICT` would refuse. Domain tables are exclusively this suite's
- * at Phase 1; identity rows are removed by id in the caller's teardown.
+ * DOES NOT reset the database — the caller must call `resetDatabase` BEFORE seeding
+ * the attribution user, not after. This function used to clear the domain tables
+ * itself, which was safe only while it deleted domain tables alone; `resetDatabase`
+ * truncates `users` and `tenants` too, so a self-reset here would silently destroy
+ * the user seeded moments earlier and every `created_by` FK would fail. Reset,
+ * then seed, in that order, at the call site where the order is visible.
  */
 export async function seedIsolationContext(
   migrator: PrismaClient,
   tenantIds: readonly string[],
   userId: string,
 ): Promise<Record<string, IsolationSeedContext>> {
-  // Children before parents — both reference assets ON DELETE RESTRICT.
-  await execAll(migrator, [
-    'DELETE FROM public.readings',
-    'DELETE FROM public.asset_events',
-    'DELETE FROM public.assets',
-  ]);
-
   const contexts: Record<string, IsolationSeedContext> = {};
 
   for (const tenantId of tenantIds) {

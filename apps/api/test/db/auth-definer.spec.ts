@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { PrismaClient } from '@prisma/client';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
-import { appClient, execAll, migratorClient } from './helpers';
+import { appClient, migratorClient, resetDatabase } from './helpers';
 
 /**
  * The pre-auth SECURITY DEFINER surface (ADR-006 §6), Phase 2 of step 4.
@@ -31,24 +31,18 @@ describe('pre-auth SECURITY DEFINER functions', () => {
   let app: PrismaClient;
   let migrator: PrismaClient;
 
-  const wipe = [
-    `DELETE FROM public.memberships`,
-    `DELETE FROM public.users`,
-    `DELETE FROM public.tenants`,
-  ];
-
   beforeAll(async () => {
     app = appClient();
     migrator = migratorClient();
-    await execAll(migrator, wipe);
+    await resetDatabase(migrator);
   });
 
   afterEach(async () => {
-    await execAll(migrator, wipe);
+    await resetDatabase(migrator);
   });
 
   afterAll(async () => {
-    await execAll(migrator, wipe);
+    await resetDatabase(migrator);
     await app.$disconnect();
     await migrator.$disconnect();
   });
@@ -193,13 +187,13 @@ describe('pre-auth SECURITY DEFINER functions', () => {
   describe('login_lookup', () => {
     const email = 'Founder@Acme.TEST';
 
-    // beforeEach, not beforeAll: the outer afterEach wipes all three tables after
+    // beforeEach, not beforeAll: the outer afterEach resets the whole database after
     // every test, and afterEach hooks run innermost-first, so a seed placed in an
     // inner afterEach is destroyed before the next test ever sees it. That failure
     // is silent and looks exactly like a broken function — three of these cases
     // first failed that way, not because login_lookup was wrong.
     beforeEach(async () => {
-      await execAll(migrator, wipe);
+      await resetDatabase(migrator);
       await register('Acme Metering', email, 'argon2-real-hash');
     });
 
