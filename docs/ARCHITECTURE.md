@@ -132,6 +132,50 @@ Role comes from `RequestContext.role` — the active membership's role, re-read 
 | `PATCH /users/:id`  | ✓     | 403        | 403     |
 | `DELETE /users/:id` | ✓     | 403        | 403     |
 
+### 9.1 Domain endpoints (recorded at step 6 Phase 1; enforced at Phase 3)
+
+`PROJECT_BRIEF.md` gives the role intent in prose — §1 casts technicians as the people who "record readings/maintenance", and §7 requires that "an auditor is read-only" — but it contains no per-endpoint matrix for the domain tables. This is that matrix, decided and recorded **now**, at the step where the tables land, so Phase 3 implements a written decision rather than re-deriving one from prose.
+
+**The tables exist as of Phase 1; none of these endpoints do.** Enforcement arrives in Phase 3 via `@RequiresRole(...)`, resolved inside the interceptor at step (5) exactly as §9 above requires — never a `CanActivate` guard.
+
+| Endpoint                    | admin | technician | auditor |
+| --------------------------- | ----- | ---------- | ------- |
+| `GET /assets`               | ✓     | ✓          | ✓       |
+| `GET /assets/:id`           | ✓     | ✓          | ✓       |
+| `POST /assets`              | ✓     | ✓          | 403     |
+| `PATCH /assets/:id`         | ✓     | ✓          | 403     |
+| `DELETE /assets/:id` (soft) | ✓     | 403        | 403     |
+| `GET /assets/:id/events`    | ✓     | ✓          | ✓       |
+| `POST /assets/:id/events`   | ✓     | ✓          | 403     |
+| `GET /assets/:id/readings`  | ✓     | ✓          | ✓       |
+| `POST /assets/:id/readings` | ✓     | ✓          | 403     |
+
+**The one cell that was genuinely open, and how it was resolved.** `POST /assets` could defensibly have been admin-only. It is **admin _and_ technician**: registering an asset is field work — the technician installing a meter is the person who knows its serial number, type and location, and routing that through an admin invents a bottleneck the product has no reason to have. The destructive act is **decommissioning**, and that is where the admin-only line is drawn: `DELETE /assets/:id` is admin-only.
+
+**Auditor is read-only across every row of the table**, with no exceptions — the §7 requirement, applied without special cases.
+
+**Reads are open to all three roles and are deliberately not role-gated**, consistent with ADR-006 §3's treatment of the member list: gating a read on role means a role term in a read policy, which is the shape this project has repeatedly been burned by. Tenant isolation on reads is RLS's job and RLS's alone.
+
+**None of this is enforced in a policy.** Every domain policy is the canonical single-column tenant expression with no role term anywhere — role logic stays out of RLS (DECISION B), and these distinctions live entirely at the endpoint. The database's contribution is that a technician and an admin acting in tenant A can both only ever touch tenant A's rows.
+
+### 9.2 Asset lifecycle events (recorded step 6 phase 1; emitted at Phase 3)
+
+`asset_events` exists as of Phase 1 and **nothing writes to it yet**. This section records the emission contract now, in the same "recorded now, enforced later" shape as §9.1, so Phase 3 wires a written decision instead of re-deriving one.
+
+The enum is `created`, `installed`, `activated`, `maintenance_started`, `maintenance_completed`, `decommissioned`. `created` records **row genesis**; the other five record **status transitions**.
+
+**Registering an asset emits TWO events: `created` and `installed`.**
+
+The invariant that forces it: **every status an asset has ever held must have an event that put it there.** Emit only `created`, and an asset that goes `installed` → `active` → `decommissioned` has no event marking when it became `installed` — its first status is simply unexplained. Replaying the log to reconstruct "what status did this asset hold at time T" then breaks, and that reconstruction is the entire reason to keep an append-only lifecycle log rather than just reading `assets.status`. A log you cannot replay is a log with no purpose.
+
+**`created` deliberately has no counterpart in the status enum.** Assets start at `installed` (the column default), so there is no `created` status for it to mirror. The asymmetry is intentional, not an oversight.
+
+**The enum encodes TRANSITIONS, not STATES — and anyone wiring emission must know this before writing a lookup table.** `activated` and `maintenance_completed` both land on status `active`. So `event_type` is **not a function of the resulting status alone**: a naïve `statusToEventType[newStatus]` map is wrong by construction and will silently record "activated" for a maintenance completion. The event type depends on the transition — where the asset came from — not merely where it arrived.
+
+**Why `created` is kept rather than collapsing to five values.** Letting `installed` serve as genesis is the more elegant option and it was traded away deliberately. Keeping `created` makes **genesis uniform**: a future bulk import of already-active assets emits `created` + `activated` with no special case, whereas the five-value design would need one — either a fake `installed` event that never happened, or a branch. Import uniformity and a complete, replayable log are worth one extra enum value.
+
+**Against step 7 — this is not redundant with `audit_log`.** They answer different questions. `audit_log` records **the mutation**: who changed what, when, with before/after. `asset_events` records **the domain lifecycle**: what happened to this physical asset. An asset can gain a lifecycle event with no user-facing mutation (a bulk import), and a mutation can touch an asset without being a lifecycle event (correcting a typo in `location`). Neither table's rows are derivable from the other's.
+
 ## 10. Audit logging
 
 ## 11. API conventions

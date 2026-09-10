@@ -2,6 +2,7 @@ import type { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  APPEND_ONLY_TABLES,
   DEFINER_ACCESSIBLE_TABLES,
   EXPECTED_DEFINER_FUNCTIONS,
   RLS_EXEMPT_TABLES,
@@ -429,5 +430,55 @@ describe('RLS catalog coverage', () => {
       uncallable,
       `SECURITY DEFINER functions the app role cannot call: ${uncallable.join(', ')}`,
     ).toEqual([]);
+  });
+
+  it('13. every append-only table grants the app role exactly SELECT, INSERT', async () => {
+    // BINDS THE DECLARATION TO THE GRANT (step 6 Phase 1).
+    //
+    // Append-only is a DECLARED property — CLAUDE.md states it, APPEND_ONLY_TABLES
+    // is its executable mirror. A declaration nothing enforces is a comment, and
+    // this repo has already paid for two properties that were true by convention
+    // until they silently were not (WITH CHECK defaulting from USING; an operator
+    // resolving through an implicit cast).
+    //
+    // The failure this closes is one line long and completely silent:
+    //
+    //     GRANT UPDATE ON public.asset_events TO meterlog_app;
+    //
+    // Nothing else in the suite would notice. Assertion 9 does not cover it —
+    // that one is scoped to DEFINER_ACCESSIBLE_TABLES, the three identity tables,
+    // deliberately, so it has nothing to say about domain tables. The isolation
+    // matrix would not notice either: its write cases branch on the fixture's
+    // DECLARED capability, so it would keep asserting "refused outright" and keep
+    // passing — because the missing POLICY, not the missing grant, would still
+    // refuse the cross-tenant statement it happens to attempt.
+    //
+    // Asserted as an EQUALITY, not a subset. "Holds no UPDATE" would be satisfied
+    // by a table the app role cannot read or insert into at all — fail-closed but
+    // broken, the same trap assertion 10 exists to close for assertion 9.
+    const rows = await db.$queryRawUnsafe<{ table_name: string; privileges: string }[]>(
+      `
+      SELECT c.relname AS table_name,
+             coalesce(string_agg(priv, ', ' ORDER BY priv), '') AS privileges
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES']) AS priv
+      WHERE n.nspname = 'public'
+        AND c.relkind = 'r'
+        AND c.relname = ANY ($1::text[])
+        AND has_table_privilege('meterlog_app', c.oid, priv)
+      GROUP BY 1
+      ORDER BY 1
+    `,
+      APPEND_ONLY_TABLES as string[],
+    );
+
+    const actual = Object.fromEntries(rows.map((r) => [r.table_name, r.privileges]));
+    const expected = Object.fromEntries(APPEND_ONLY_TABLES.map((t) => [t, 'INSERT, SELECT']));
+
+    expect(
+      actual,
+      'an append-only table must hold exactly SELECT, INSERT for the app role — a stray GRANT reopens it to mutation',
+    ).toEqual(expected);
   });
 });
