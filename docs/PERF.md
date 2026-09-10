@@ -92,6 +92,68 @@ The index's **write** cost. `readings` is insert-heavy and every insert maintain
 
 ---
 
+## 2. Keyset pagination and the `id` tiebreaker — the two-column vs three-column index
+
+**Question:** phase 3a paginates by keyset, so every query carries `id` as a tiebreaker (`ORDER BY sort_col DESC, id DESC`, cursor predicate `(sort_col, id) < (?, ?)`). The existing indexes are **two columns** — `readings (asset_id, read_at)` and `asset_events (asset_id, created_at)`. Postgres can use them and sort the tail. Should they be amended to three?
+
+Measured, not assumed: 100,000 readings and 20,000 events across 5 assets, cursor taken from 5,000 rows deep (readings) / 500 deep (events) so this is not a first-page measurement. Run as `meterlog_app` with the tenant GUC set.
+
+```sql
+SELECT id, value, unit, read_at FROM public.readings
+ WHERE asset_id = $1 AND (read_at, id) < ($2, $3)
+ ORDER BY read_at DESC, id DESC LIMIT 50;
+```
+
+### readings
+
+|                     | 2-col `(asset_id, read_at)`                | 3-col `(asset_id, read_at, id)`                 |
+| ------------------- | ------------------------------------------ | ----------------------------------------------- |
+| Plan                | **Incremental Sort** → Index Scan Backward | Index Scan Backward, **no sort node**           |
+| Cursor predicate    | `Filter:` `ROW(read_at, id) < ROW(...)`    | **`Index Cond:`** `ROW(read_at, id) < ROW(...)` |
+| Index Cond          | `read_at <= $2` only                       | both columns                                    |
+| Rows scanned for 50 | 52                                         | 50                                              |
+| Buffers             | 60                                         | 50                                              |
+| Execution           | 0.354 ms                                   | **0.186 ms**                                    |
+
+### asset_events
+
+|                     | 2-col                                      | 3-col                                 |
+| ------------------- | ------------------------------------------ | ------------------------------------- |
+| Plan                | **Incremental Sort** → Index Scan Backward | Index Scan Backward, **no sort node** |
+| Cursor predicate    | `Filter:`                                  | **`Index Cond:`**                     |
+| Rows scanned for 50 | 51                                         | 50                                    |
+| Buffers             | 29                                         | 28                                    |
+| Execution           | 0.145 ms                                   | **0.094 ms**                          |
+
+### What the numbers actually say
+
+**The timing delta is not the argument.** Both are sub-millisecond; `Incremental Sort` with a presorted leading key is cheap, and at this data size the 2-col index is perfectly serviceable. Quoting "1.9× faster" would overstate it.
+
+**The structural difference is the argument.** With two columns the row-wise cursor comparison is demoted to a **`Filter`** — Postgres seeks on `read_at <= cursor` and then _scans and discards_ rows that fail the full tuple comparison. With three columns it becomes an **`Index Cond`**: the cursor position is sought directly.
+
+That distinction is invisible at 52-rows-scanned-for-50 and becomes the whole cost when timestamps tie. **For `asset_events` ties are guaranteed by design**, not incidental: ARCHITECTURE §9.2 has registration emit `created` and `installed` in one transaction, so every asset's genesis is two rows sharing a `created_at`. Any bulk operation — an import, a batch reading upload — produces runs of identical timestamps too. With _n_ rows sharing the cursor's timestamp, the 2-col plan reads and discards up to _n_ of them on every page; the 3-col plan seeks past them.
+
+### Cost
+
+Index size, measured on 100k rows of the same shape:
+
+|                                 | size    |
+| ------------------------------- | ------- |
+| 2-col `(asset_id, read_at)`     | 3984 kB |
+| 3-col `(asset_id, read_at, id)` | 5768 kB |
+
+**+45%**, and `readings` is the most insert-heavy table in the schema, so this is real write amplification on the hot path.
+
+### Recommendation — **amend both, replacing not stacking** (awaiting approval)
+
+The three-column index still leads with `asset_id`, so it continues to support the ADR-007 composite FK's `ON DELETE RESTRICT` check, and it still serves the `(asset_id, sort_col)` range prefix that §1 measured. The two-column index is therefore **redundant once the three-column one exists** — a third index alongside would be write cost for nothing, the same judgment that rejected a `memberships(user_id)` index (ADR-006 §2).
+
+If approved this is a new migration (the phase 1 and 2 migrations are frozen and merged), dropping each two-column index and creating its three-column replacement.
+
+**Not amended in phase 3a.** This touches merged indexes and is the author's call. Nothing is blocked by deferring it: the 2-col indexes produce **correct** results — `Incremental Sort` yields the same total order — so this is purely a performance decision, reversible in either direction.
+
+---
+
 ## Method note
 
 The dataset and both plans were produced by a throwaway harness run once against local Postgres and **deliberately not committed** — it is a measurement, not a test. Committing it would add ~5 s and a 100k-row insert to every CI run to re-prove a decision that is already recorded here. Re-run it by seeding `readings` and running the query above with and without the index.

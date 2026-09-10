@@ -6,13 +6,59 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phase 1 merged (`assets` + `asset_events`, matrix 0 -> 10); Phase 2 complete: `readings`, matrix 10 -> 15, plus the standing `EXPLAIN ANALYZE` requirement discharged.** Phase 3 is the API surface and event wiring; Phase 4 / 6b `maintenance_records` (slippable).
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phases 1 and 2 merged (`assets`, `asset_events`, `readings`; matrix 0 -> 15). Phase 3a complete: the asset READ surface, cursor pagination, and the §8.3 read axis.** Phase 3b is basic writes + the RBAC matrix + genesis emission; 3c the transition engine; 3d the §8.3 capstone. Phase 4 / 6b `maintenance_records` (slippable within step 6, but essential v1.0 scope — needed before step 8's frontend).
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-10 — Step 6 Phase 3a: the asset read surface (§11 step 6)
+
+First of four sub-phases. Deliberately the low-risk one: RLS and the existing interceptor do the isolation, so the handlers query and paginate. It establishes the controller/DTO/pagination patterns 3b–3d reuse.
+
+**What landed.** `AssetsModule` — controller, service, DTOs — with four reads, all `@RequiresSession()` and **none role-gated**: `GET /assets` (cursor-paginated, filters `status`/`type`/`serialNumber`/`includeDecommissioned`, sort `createdAt` desc or `serialNumber` asc), `GET /assets/:id`, `GET /assets/:id/events` (filter `eventType`), `GET /assets/:id/readings` (filter `from`/`to` on `read_at`). Plus `common/pagination/cursor.ts`.
+
+**No `tenant_id` appears in any WHERE clause, deliberately.** Every query runs on the request transaction where the interceptor set `app.current_tenant`, so the policies scope the results. A redundant app-layer tenant predicate would not strengthen isolation — it would keep returning correct results after the thing that actually protects the data stopped working, hiding a policy regression. Same rule as `MembershipsService.list`.
+
+**Cursor pagination, and the tiebreaker.** Keyset, opaque base64 cursors, `limit + 1` lookahead for `nextCursor`, no total count. Every `ORDER BY` carries `id`: `readings (read_at, id)`, `events (created_at, id)`, `assets (created_at|serial_number, id)`. **For events the tie is guaranteed, not occasional** — §9.2 has registration emit `created` and `installed` in one transaction, so every asset's genesis is two rows sharing a `created_at` to the microsecond, and a page boundary landing between them without a tiebreaker is a certainty rather than a race.
+
+**The soft-delete rule, asserted both ways.** `deleted_at IS NULL` is a **list-scope default**, never an existence check: `GET /assets` hides decommissioned assets, `?includeDecommissioned=true` includes them, and `GET /assets/:id` plus both child reads return them regardless. Filtering them in `findOne` would 404 a row the list endpoint returns with one query parameter. The filter lives in the query builder and **never in a policy** — a liveness predicate in a policy is the OPEN-5 shape that blocks the very UPDATE performing the soft delete.
+
+**The §8.3 read axis is green.** User M holds a legitimate membership in both tenants; active in A, M sees A's assets/readings/events and 404s on B's — then, after `POST /auth/switch` on the _same session_, sees B's and 404s on A's. The boundary follows the active tenant, not the person or the session.
+
+**A mutation escaped, was diagnosed, and the gap was closed.** 7 mutations run; 6 caught immediately. **N2 — dropping the `id` tiebreaker from the _readings_ ORDER BY and cursor tuple — went green.** Diagnosis: the tied-timestamp test seeded tied _events_ (where §9.2 guarantees the tie) but never tied _readings_, so the readings keyset never met a tie and the tiebreaker was unreachable. Readings tie in practice — a bulk upload, or two meters recorded at the same rounded minute. Added a tied-`read_at` case; N2 re-run now reddens it. Final: **7 mutations, 7 caught.**
+
+| #   | mutation                                                          | caught by                                                 |
+| --- | ----------------------------------------------------------------- | --------------------------------------------------------- |
+| N1  | events: drop the `id` tiebreaker                                  | tied-timestamp ordering                                   |
+| N2  | readings: drop the `id` tiebreaker                                | **escaped, then caught** by the added tied-`read_at` case |
+| N3  | remove the soft-delete list default                               | 2 list-scope tests                                        |
+| N4  | `findOne` filters soft-deleted rows                               | the decommissioned-still-readable test                    |
+| N5  | naive boolean coercion (`includeDecommissioned=false` fails open) | the fail-open test                                        |
+| N6  | `listEvents` skips the existence check                            | the §8.3 read-axis test                                   |
+| N7  | drop the `limit + 1` lookahead                                    | 3 pagination tests                                        |
+
+**The index question — measured, recommendation deferred to the gate (`docs/PERF.md` §2).** Keyset queries against the existing two-column indexes vs three-column replacements, 100k readings / 20k events, cursor 5,000 rows deep, run as the app role with the GUC set:
+
+|                        | 2-col                                      | 3-col                        |
+| ---------------------- | ------------------------------------------ | ---------------------------- |
+| readings plan          | **Incremental Sort** → Index Scan Backward | Index Scan Backward, no sort |
+| cursor predicate       | `Filter:` (scan and discard)               | **`Index Cond:`** (seek)     |
+| readings execution     | 0.354 ms                                   | 0.186 ms                     |
+| events execution       | 0.145 ms                                   | 0.094 ms                     |
+| index size (100k rows) | 3984 kB                                    | 5768 kB (**+45%**)           |
+
+**The timing delta is not the argument** — both are sub-millisecond and `Incremental Sort` with a presorted key is cheap. The structural difference is: with two columns the row-wise cursor comparison is demoted to a **Filter**, so rows failing the tuple comparison are read and discarded; with three it becomes an **Index Cond** and the position is sought. That is invisible at 52-scanned-for-50 and becomes the whole cost when timestamps tie — which for `asset_events` is guaranteed by the genesis pair. **Recommendation: amend both, replacing rather than stacking** (the 3-col still leads with `asset_id`, so the composite-FK support and the range prefix survive, making the 2-col redundant). **Not done in 3a** — it touches merged indexes and is the author's call; nothing is blocked, because the 2-col indexes are correct, just less direct.
+
+**202 tests green** (was 181; +21). Lint, typecheck, build and format verified **by exit code** — the phase-2 lesson, after a piped `| tail` hid three real lint errors.
+
+**Next**
+
+- Phase 3b — `POST /assets` (emitting the fixed `created` + `installed` genesis pair), `POST /assets/:id/readings`, `PATCH /assets/:id` (metadata only, `status` rejected), and all nine §9.1 RBAC cells with live 403 negatives.
+
+---
 
 ### 2026-09-10 — Test-teardown hardening: one catalog-derived TRUNCATE, twelve sites collapsed
 
