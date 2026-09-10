@@ -47,11 +47,11 @@
 
 **The list.** These tables are append-only: rows are inserted and read, never updated and never deleted. A correction is a **new row**, not an edit.
 
-| Table          | Declared since | Basis                                                              |
-| -------------- | -------------- | ------------------------------------------------------------------ |
-| `asset_events` | step 6 phase 1 | `PROJECT_BRIEF.md` §5 :137 — "**append-only**, no updates/deletes" |
-| `readings`     | step 6 phase 2 | `PROJECT_BRIEF.md` §5 :138 + :146 — implied by omission; see below |
-| `audit_log`    | step 7         | `PROJECT_BRIEF.md` §5 :140 — "**append-only**"                     |
+| Table          | Declared since | Basis                                                                                                              |
+| -------------- | -------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `asset_events` | step 6 phase 1 | `PROJECT_BRIEF.md` §5 :137 — "**append-only**, no updates/deletes"                                                 |
+| `readings`     | step 6 phase 2 | `PROJECT_BRIEF.md` §5 :138 + :146 — implied by omission; see below. **Declared and enforced from step 6 phase 2.** |
+| `audit_log`    | step 7         | `PROJECT_BRIEF.md` §5 :140 — "**append-only**"                                                                     |
 
 **Why this is written down instead of left to be noticed.** The brief marks `asset_events` (:137) and `audit_log` (:140) append-only in so many words. It never says it about `readings` (:138) — the property is there only **by omission**, because :146 says "append-only tables get `created_at` only" and `readings` is the one domain table with no `updated_at` and no `deleted_at`. That is a true inference and a **dangerous way to hold a security-relevant property.**
 

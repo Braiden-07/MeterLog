@@ -6,13 +6,85 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phase 1 complete: `assets` + `asset_events`, and the catalog-driven isolation matrix now generates REAL cases (0 -> 10).** Phase 2 is `readings`; Phase 3 the API surface and event wiring; Phase 4 / 6b `maintenance_records` (slippable).
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phase 1 merged (`assets` + `asset_events`, matrix 0 -> 10); Phase 2 complete: `readings`, matrix 10 -> 15, plus the standing `EXPLAIN ANALYZE` requirement discharged.** Phase 3 is the API surface and event wiring; Phase 4 / 6b `maintenance_records` (slippable).
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-10 — Step 6 Phase 2: readings, and the EXPLAIN ANALYZE requirement (§11 step 6)
+
+Deliberately short and low-risk: every mechanism `readings` needs was built and proven at Phase 1. The job was to land the table faithfully, register its fixture, and prove `readings` is genuinely **under** the contract rather than assuming it inherits.
+
+**THE HEADLINE — the matrix generalised to a second child: 10 -> 15 cases.**
+
+|                        | Phase 1 | Phase 2                                           |
+| ---------------------- | ------- | ------------------------------------------------- |
+| generated matrix cases | 10      | **15** (5 × `assets`, `asset_events`, `readings`) |
+| suite total            | 171     | **177**                                           |
+
+**No new mechanism, and that is the result.** `readings` needed no special case anywhere — same canonical policy, same ADR-007 composite FK, same append-only grant shape, same fixture contract. Had it needed one, the Phase 1 contract would have been wrong. The `appWrites`/`dependsOn`/seed-context design met a table it was not written against and held.
+
+**The migration.** Faithful to `PROJECT_BRIEF` §5 (:138), with the decisions recorded at the columns:
+
+- `value numeric` **unbounded, NOT NULL, no CHECK** — no precision commitment (a cumulative meter total has no natural ceiling, and truncation in an append-only table is unrecoverable), and no non-negativity or monotonicity rule because value-domain logic is the **anomaly-flagging** feature the brief schedules as stretch (:42). A CHECK now would pre-empt that design by _rejecting_ rows where the feature wants to _flag_ them — and a meter reading lower than last month is a real event (replacement, rollover, correction) that must be recordable.
+- `unit text NOT NULL` — free text, not an enum. The brief marks `status` and `event_type` as enums and pointedly does **not** mark `unit`. NOT NULL because a number without a unit is unusable data.
+- `read_at timestamptz NOT NULL, no default` vs `created_at ... DEFAULT now()` — **domain time versus server time**, and both exist because they answer different questions ("when was the meter read" / "when did we learn about it"). No default on `read_at`: a server-generated value would be a lie about the physical world, and back-dating after a site visit is ordinary use.
+- **`readings` is a LEAF — no `UNIQUE (id, tenant_id)`.** That composite on `assets` is the _parent half_ of a child's FK; nothing in v1.0 is a child of a reading. Adding one would be cargo-culting the pattern, paying an index's write cost on the hottest-inserting table in the schema for a relationship that does not exist.
+- **`created_by` unindexed — third instance**, now named as one pattern rather than three omissions (with `asset_events.created_by` and the rejected `memberships(user_id)` index, ADR-006 §2). Nothing queries readings by actor, and the unindexed-FK penalty falls on parent deletes, which `ON DELETE RESTRICT` plus soft-deleted identity makes impossible.
+- Indexes: `readings_tenant_id_idx`, and the brief's explicitly-named `readings_asset_id_read_at_idx (asset_id, read_at)` — whose leading column also gives the composite FK its `ON DELETE RESTRICT` check an index, so no separate `asset_id` index.
+
+**`readings` is append-only BY CONSTRUCTION — the dangerous kind, foregrounded at the table.** `asset_events` (:137) and `audit_log` (:140) are marked append-only in the brief in words. **`readings` (:138) is not.** It is append-only only because :138 gives it no `updated_at`/`deleted_at` and :146 turns that absence into the property. The migration states plainly that **the authority is the CLAUDE.md declaration, not the absent columns**, and that adding `updated_at` "for consistency with assets" would silently end the property — caught only by catalog assertion 13, which binds the declaration to the grant. This is the entry the whole declaration mechanism was built for.
+
+**The proofs.**
+
+- **Composite-FK negative for `readings`** — acting in B, `tenant_id = B` (so the WITH CHECK is satisfied), pointing at A's asset: `23503` + `readings_asset_tenant_fkey`, asserted `.not /row-level security/`. Constructed so only the FK can fire, mirroring the `asset_events` negative. The privileged-connection sibling was not repeated: that is a property of the _mechanism_, proven once at Phase 1.
+- **Catalog assertion 13 now covers `readings`** — declared append-only, holding exactly `SELECT, INSERT`. Green.
+- **Two targeted mutations**, the proportionate stand-in for a full sweep re-run:
+
+| #   | mutation                          | result                                                                                                        |
+| --- | --------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| M9  | `readings` policy keyed on `true` | **caught** — 3 readings-specific cases (read isolation, WITH CHECK, fail-closed baseline)                     |
+| M10 | `GRANT UPDATE ON readings`        | **caught twice** — assertion 13 (now listing both append-only tables) _and_ the matrix's readings UPDATE case |
+
+Both reverted; policy clauses and grants re-verified against the catalog (`readings` at `SELECT, INSERT`, both policy clauses present).
+
+**A REAL DEFECT CAUGHT BY THE NEW TABLE — and it broke a different suite.**
+
+The first full run after `readings` landed failed **31 tests in `membership-writes.spec.ts`**, a file Phase 2 never touched. Diagnosed rather than re-run until green:
+
+`isolation.spec.ts`'s teardown deleted `asset_events` then `assets` — written at Phase 1 when those were the only domain tables. `readings` also references `assets` `ON DELETE RESTRICT`, so the teardown threw `23503` partway, which meant the _subsequent_ `DELETE FROM public.users` and `DELETE FROM public.tenants` never ran. The leftover `assets` rows then blocked `membership-writes`'s own blanket `DELETE FROM public.tenants`.
+
+**Confirmed by direct reproduction, not inference:** planting a single stray `assets` row and running `membership-writes.spec.ts` alone reproduces it exactly — `update or delete on table "tenants" violates foreign key constraint "assets_tenant_id_fkey"`. Fixed by ordering children before parents in both cleanup paths (`isolation.spec.ts` teardown and `seedIsolationContext`'s residue clear), each now carrying a comment that every new FK-child of `assets` must be added.
+
+**The coupling this exposes is worth naming, and is NOT fixed here.** `membership-writes.spec.ts` and `membership-isolation.spec.ts` both blanket-`DELETE FROM public.tenants`, so **any** domain row left anywhere breaks them, with an error naming neither the suite nor the cause. It gets worse with `maintenance_records` and `audit_log`. Hardening those two files to clear domain tables first would make them ordering-independent, but they are marked load-bearing and are outside Phase 2's boundary — **recommended as a small follow-up, deliberately not done unilaterally.**
+
+**The standing `EXPLAIN ANALYZE` requirement — discharged (`docs/PERF.md`, new).**
+
+`PROJECT_BRIEF` :150 / :279 require proving one index decision with before/after plans. `readings` is its natural table. 100,000 readings across 5 assets, measured **as `meterlog_app` with the tenant GUC set** so the RLS predicate is part of the plan rather than something measured around:
+
+|                      | without index                           | with index                                  | delta            |
+| -------------------- | --------------------------------------- | ------------------------------------------- | ---------------- |
+| Execution time       | 18.128 ms                               | **1.565 ms**                                | **11.6× faster** |
+| Buffers (shared hit) | 1576                                    | **81**                                      | **19.5× fewer**  |
+| Rows discarded       | 49,579 per worker                       | 0                                           | —                |
+| Plan                 | Parallel Seq Scan → Sort → Gather Merge | Bitmap Index Scan → Bitmap Heap Scan → Sort | —                |
+
+The honest framing is in the doc: **the plan shape matters more than the 11.6×.** The seq-scan cost grows with the table, the index-scan cost with the result — at 10M rows the factor is far larger, and the unindexed plan also recruited a parallel worker to reach 18 ms. Two observations recorded so they are not misread later: the RLS filter is visible in both plans (evidence the measurement used the real path), and a `Sort` node survives the indexed plan because a bitmap scan does not return rows in index order. The harness was run once and **deliberately not committed** — a measurement, not a test; committing it would add a 100k-row insert to every CI run to re-prove a recorded decision.
+
+**177 tests green**, three consecutive clean runs after the teardown fix. Lint, typecheck, build, format clean.
+
+**One open cell for the author.** `value` carries no `CHECK`, per the locked decision. My view, for the record: I agree with leaving it off — a `CHECK (value >= 0)` reads as obviously safe but would make a meter rollover or a corrected over-read unrecordable in a table that has no UPDATE path to fix them, and negative deltas are exactly what anomaly flagging (:42) is meant to surface rather than refuse. If you want it enforced now, it is a one-line migration.
+
+**Boundary held:** no `maintenance_records`, no API or emission wiring, no changes to Phase-1 mechanisms. **No registry-empty doc refresh** — and note those docs are now _further_ stale: `ISOLATION.md`, `README.md` and `PORTFOLIO.md` still say the fixture registry is empty, when it holds **three** domain fixtures generating 15 cases. Still the scoped later turn.
+
+**Next**
+
+- Phase 3 — the API surface, the `assets` ↔ `asset_events` lifecycle wiring per ARCHITECTURE §9.2 (a status transition emits an event, atomically), and the ADR-006 §8.3 shared-user headline test over real HTTP.
+
+---
 
 ### 2026-09-10 — Step 6 Phase 1: assets + asset_events, and the isolation harness made real (§11 step 6)
 

@@ -67,6 +67,11 @@ describe('catalog-driven tenant isolation', () => {
     // asset would make a later suite's `DELETE FROM public.tenants` fail with
     // 23503 rather than a legible error about this suite.
     await execAll(migrator, [
+      // CHILDREN BEFORE PARENTS. Both children reference assets ON DELETE
+      // RESTRICT, so deleting assets first raises 23503 and the failure surfaces
+      // as an opaque teardown error rather than anything about this suite. Every
+      // new FK-child of assets must be added to this list.
+      'DELETE FROM public.readings',
       'DELETE FROM public.asset_events',
       'DELETE FROM public.assets',
       `DELETE FROM public.users WHERE id = '${FIXTURE_USER}'`,
@@ -317,6 +322,33 @@ describe('catalog-driven tenant isolation', () => {
         tx.$queryRawUnsafe<{ n: number }[]>(`SELECT count(*)::int AS n FROM public.asset_events`),
       );
       expect(after[0]!.n).toBe(before[0]!.n + 1);
+    });
+
+    it('rejects a mismatched READING too — the mechanism generalises (23503)', async () => {
+      // THE POINT OF PHASE 2. asset_events proved the composite FK works; this
+      // proves it is a REUSABLE CONTRACT rather than something wired by hand for
+      // one table. Same constraint shape, same SQLSTATE, different child, no new
+      // mechanism — and if readings had needed one, the Phase 1 design was wrong.
+      //
+      // Constructed so ONLY the FK can fire, exactly as the asset_events negative
+      // is: acting in B, writing tenant_id = B so the WITH CHECK is satisfied, but
+      // pointing at an asset owned by A.
+      const failure = await capturePgFailure(
+        withTenant(app, TENANT_B, (tx) =>
+          tx.$executeRawUnsafe(
+            `INSERT INTO public.readings (tenant_id, asset_id, value, unit, read_at, created_by)
+             VALUES ($1::uuid, $2::uuid, 1.0, 'kWh', now(), $3::uuid)`,
+            TENANT_B,
+            contexts[TENANT_A]!.assetId,
+            FIXTURE_USER,
+          ),
+        ),
+      );
+
+      expect(failure.sqlstate).toBe('23503');
+      expect(failure.message).toMatch(/readings_asset_tenant_fkey/);
+      // Distinctly NOT the RLS rejection — two mechanisms, two assertions.
+      expect(failure.message).not.toMatch(/row-level security/i);
     });
 
     it('the migration role cannot write a mismatched child either', async () => {

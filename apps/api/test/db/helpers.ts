@@ -177,9 +177,14 @@ export async function withContext<T>(
  *   * the fixture/declaration agreement check in isolation.spec.ts — a table
  *     listed here must have a fixture declaring no update and no delete.
  *
- * `readings` joins at step 6 Phase 2, `audit_log` at step 7.
+ * `readings` JOINED AT STEP 6 PHASE 2, and it is the entry this whole mechanism
+ * was built for. `asset_events` and `audit_log` are marked append-only in the
+ * brief in words (:137, :140); `readings` (:138) is NOT — it is append-only only
+ * because :146 turns "no updated_at, no deleted_at" into that property. Inferring
+ * it from absent columns is precisely what this list refuses to do. `audit_log`
+ * joins at step 7.
  */
-export const APPEND_ONLY_TABLES: readonly string[] = ['asset_events'];
+export const APPEND_ONLY_TABLES: readonly string[] = ['asset_events', 'readings'];
 
 /**
  * What the app role may do to a table beyond `SELECT` and `INSERT`, DECLARED per
@@ -279,6 +284,26 @@ export const ISOLATION_FIXTURES: Readonly<Record<string, IsolationFixture>> = {
     },
   },
 
+  readings: {
+    // Append-only — declared in APPEND_ONLY_TABLES, NOT inferred from the absence
+    // of updated_at/deleted_at (PROJECT_BRIEF never states it for this table).
+    appWrites: { update: false, delete: false },
+    async seed(client, ctx) {
+      // Second FK-child of assets. Reads its parent out of the seed context, the
+      // same as asset_events — no self-seeding, no dependsOn (retired at Phase 1).
+      // asset_id and tenant_id come from the SAME context object, so the ADR-007
+      // composite FK is satisfied; the deliberate mismatch is a dedicated negative
+      // in isolation.spec.ts asserted on 23503.
+      await client.$executeRawUnsafe(
+        `INSERT INTO public.readings (tenant_id, asset_id, value, unit, read_at, created_by)
+         VALUES ($1::uuid, $2::uuid, 42.5, 'kWh', now(), $3::uuid)`,
+        ctx.tenantId,
+        ctx.assetId,
+        ctx.userId,
+      );
+    },
+  },
+
   asset_events: {
     // Append-only (PROJECT_BRIEF section 5 :137, declared in APPEND_ONLY_TABLES).
     appWrites: { update: false, delete: false },
@@ -314,7 +339,12 @@ export async function seedIsolationContext(
   tenantIds: readonly string[],
   userId: string,
 ): Promise<Record<string, IsolationSeedContext>> {
-  await execAll(migrator, ['DELETE FROM public.asset_events', 'DELETE FROM public.assets']);
+  // Children before parents — both reference assets ON DELETE RESTRICT.
+  await execAll(migrator, [
+    'DELETE FROM public.readings',
+    'DELETE FROM public.asset_events',
+    'DELETE FROM public.assets',
+  ]);
 
   const contexts: Record<string, IsolationSeedContext> = {};
 
