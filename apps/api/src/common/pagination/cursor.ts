@@ -60,9 +60,31 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * RLS filters the result to the caller's tenant regardless of where the cursor
  * came from. The cursor selects a POSITION, never a permission.
  */
-export function encodeCursor(sortValue: Date | string, id: string): string {
-  const k = sortValue instanceof Date ? sortValue.toISOString() : sortValue;
-  return Buffer.from(JSON.stringify({ k, i: id }), 'utf8').toString('base64url');
+/**
+ * **`sortValue` MUST be the raw database text, never a JS `Date`.** This signature
+ * deliberately refuses a `Date`, and the reason is a real bug this cursor shipped
+ * with in phase 3a:
+ *
+ *   Postgres `timestamptz` has MICROSECOND precision. A JS `Date` has
+ *   MILLISECOND precision. Encoding a cursor via `date.toISOString()` silently
+ *   truncates the last three digits, so the cursor points at an instant slightly
+ *   EARLIER than the row it came from. The next page's predicate
+ *   `(created_at, id) < (truncated, id)` then excludes that row *and every row
+ *   sharing its millisecond* — the page comes back empty and pagination stops
+ *   early, losing rows.
+ *
+ * It was invisible in phase 3a because those tests seeded whole-second timestamps,
+ * where truncation is lossless. It appeared the moment phase 3b created real rows
+ * with `now()` — and worst on the genesis pair, where two rows share a microsecond
+ * timestamp by design, which is exactly the case the tiebreaker exists for.
+ *
+ * So every paginated query selects its sort column a second time as `::text`
+ * (`cursor_key`) and that exact string is what travels in the cursor and goes back
+ * to Postgres as `$n::timestamptz`. The round trip is lossless because the value
+ * never passes through a JS date at all.
+ */
+export function encodeCursor(sortValue: string, id: string): string {
+  return Buffer.from(JSON.stringify({ k: sortValue, i: id }), 'utf8').toString('base64url');
 }
 
 /**

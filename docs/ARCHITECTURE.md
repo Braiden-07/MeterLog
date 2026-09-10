@@ -136,7 +136,9 @@ Role comes from `RequestContext.role` — the active membership's role, re-read 
 
 `PROJECT_BRIEF.md` gives the role intent in prose — §1 casts technicians as the people who "record readings/maintenance", and §7 requires that "an auditor is read-only" — but it contains no per-endpoint matrix for the domain tables. This is that matrix, decided and recorded **now**, at the step where the tables land, so Phase 3 implements a written decision rather than re-deriving one from prose.
 
-**The tables exist as of Phase 1; none of these endpoints do.** Enforcement arrives in Phase 3 via `@RequiresRole(...)`, resolved inside the interceptor at step (5) exactly as §9 above requires — never a `CanActivate` guard.
+**Enforcement status.** The reads landed **un-gated** at phase 3a. `POST /assets`, `PATCH /assets/:id` and `POST /assets/:id/readings` are **enforced as of phase 3b**, via `@RequiresRole('admin', 'technician')` resolved inside the interceptor at step (5) exactly as §9 above requires — never a `CanActivate` guard. `DELETE /assets/:id` and `POST /assets/:id/events` arrive with the transition engine in phase 3c; the maintenance rows are phase 4 / 6b.
+
+A caller with **no active tenant** has a null role, which **fails the gate with 403 rather than erroring** — there is no workspace in which they hold the required role, so "denied" is the answer, not "broken". Asserted live.
 
 | Endpoint                    | admin | technician | auditor |
 | --------------------------- | ----- | ---------- | ------- |

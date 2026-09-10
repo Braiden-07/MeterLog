@@ -492,7 +492,14 @@ describe('catalog-driven tenant isolation', () => {
 
       const softDeleted = await withTenant(app, TENANT_A, (tx) =>
         tx.$executeRawUnsafe(
-          `UPDATE public.assets SET deleted_at = now()
+          // Decommission sets BOTH columns. Phase 3b added the
+          // `assets_decommissioned_iff_deleted` CHECK, which makes
+          // `deleted_at`-without-`status` unrepresentable — and this fixture used
+          // to write exactly that. Corrected rather than the constraint weakened:
+          // soft-deleting an asset IS decommissioning it (decision 9), so a
+          // fixture that set only `deleted_at` was modelling a state the product
+          // does not have.
+          `UPDATE public.assets SET deleted_at = now(), status = 'decommissioned'
             WHERE tenant_id = $1::uuid AND serial_number = $2`,
           TENANT_A,
           serial,

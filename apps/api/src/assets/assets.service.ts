@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import {
   DEFAULT_LIMIT,
@@ -8,7 +8,14 @@ import {
   toPage,
 } from '../common/pagination/cursor';
 import { requireRequestContext } from '../common/request-context/request-context';
-import type { ListAssetsQuery, ListEventsQuery, ListReadingsQuery } from './dto/assets.dto';
+import type {
+  CreateAssetDto,
+  CreateReadingDto,
+  ListAssetsQuery,
+  ListEventsQuery,
+  ListReadingsQuery,
+  UpdateAssetDto,
+} from './dto/assets.dto';
 
 export interface Asset {
   id: string;
@@ -39,6 +46,36 @@ export interface Reading {
   readAt: Date;
   createdBy: string;
   createdAt: Date;
+}
+
+/**
+ * A raw row as Postgres returns it: snake_case, plus `cursor_key` — the sort column
+ * re-selected as text so the cursor round-trips without losing microseconds.
+ */
+/* eslint-disable-next-line @typescript-eslint/no-explicit-any -- raw rows are untyped by Prisma. */
+type RawRow = Record<string, any>;
+
+/**
+ * Pages raw rows, builds the cursor from `cursor_key`, then maps to the DTO shape.
+ *
+ * The cursor is built from the RAW row deliberately: deriving it from the mapped
+ * object would mean reading a JS `Date` and truncating microseconds, which is the
+ * bug documented in `encodeCursor`.
+ */
+/**
+ * An `INSERT ... RETURNING` always yields a row, but the type system cannot know
+ * that. Throwing beats `!`: if the invariant ever breaks the failure is loud and
+ * named, rather than a `TypeError` on an undefined property three frames away.
+ */
+function firstRow(rows: RawRow[], what: string): RawRow {
+  const row = rows[0];
+  if (!row) throw new Error(`${what} returned no row`);
+  return row;
+}
+
+function mapPage<T>(rows: RawRow[], limit: number, map: (r: RawRow) => T): Page<T> {
+  const paged = toPage(rows, limit, (r) => encodeCursor(String(r.cursor_key), String(r.id)));
+  return { items: paged.items.map(map), nextCursor: paged.nextCursor };
 }
 
 /** Sort columns, mapped from API names to real columns. */
@@ -95,16 +132,22 @@ export class AssetsService {
       // The row-wise comparison IS the keyset. `id` is in the tuple because the
       // sort column is not unique; see cursor.ts.
       const op = direction === 'DESC' ? '<' : '>';
-      const cast = column === 'created_at' ? '::timestamptz' : '';
+      // The cursor key is text; cast it back to the column's own type so the
+      // comparison is exact rather than lexicographic.
+      const cast = column === 'created_at' ? '::timestamptz' : '::text';
       where.push(
         `(a.${column}, a.id) ${op} ($${params.length - 1}${cast}, $${params.length}::uuid)`,
       );
     }
 
     params.push(limit + 1);
-    const rows = await tx.$queryRawUnsafe<Record<string, never>[]>(
+    // `cursor_key` is the sort column re-selected as TEXT. It must not be derived
+    // from the mapped `Date`: a JS Date is millisecond-precision and would truncate
+    // a microsecond timestamptz, breaking the next page. See encodeCursor.
+    const rows = await tx.$queryRawUnsafe<RawRow[]>(
       `SELECT a.id::text AS id, a.serial_number, a.type, a.status::text AS status,
-              a.location, a.installed_at, a.created_at, a.updated_at, a.deleted_at
+              a.location, a.installed_at, a.created_at, a.updated_at, a.deleted_at,
+              a.${column}::text AS cursor_key
          FROM public.assets a
         ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
         ORDER BY a.${column} ${direction}, a.id ${direction}
@@ -112,10 +155,7 @@ export class AssetsService {
       ...params,
     );
 
-    const assets = rows.map(toAsset);
-    return toPage(assets, limit, (a) =>
-      encodeCursor(column === 'created_at' ? a.createdAt : a.serialNumber, a.id),
-    );
+    return mapPage(rows, limit, toAsset);
   }
 
   /**
@@ -135,7 +175,7 @@ export class AssetsService {
    */
   async findOne(id: string): Promise<Asset> {
     const { tx } = requireRequestContext();
-    const rows = await tx.$queryRawUnsafe<Record<string, never>[]>(
+    const rows = await tx.$queryRawUnsafe<RawRow[]>(
       `SELECT a.id::text AS id, a.serial_number, a.type, a.status::text AS status,
               a.location, a.installed_at, a.created_at, a.updated_at, a.deleted_at
          FROM public.assets a
@@ -171,9 +211,10 @@ export class AssetsService {
     }
 
     params.push(limit + 1);
-    const rows = await tx.$queryRawUnsafe<Record<string, never>[]>(
+    const rows = await tx.$queryRawUnsafe<RawRow[]>(
       `SELECT e.id::text AS id, e.asset_id::text AS asset_id, e.event_type::text AS event_type,
-              e.payload, e.created_by::text AS created_by, e.created_at
+              e.payload, e.created_by::text AS created_by, e.created_at,
+              e.created_at::text AS cursor_key
          FROM public.asset_events e
         WHERE ${where.join(' AND ')}
         ORDER BY e.created_at DESC, e.id DESC
@@ -181,8 +222,7 @@ export class AssetsService {
       ...params,
     );
 
-    const events = rows.map(toEvent);
-    return toPage(events, limit, (e) => encodeCursor(e.createdAt, e.id));
+    return mapPage(rows, limit, toEvent);
   }
 
   async listReadings(assetId: string, query: ListReadingsQuery): Promise<Page<Reading>> {
@@ -210,9 +250,10 @@ export class AssetsService {
     }
 
     params.push(limit + 1);
-    const rows = await tx.$queryRawUnsafe<Record<string, never>[]>(
+    const rows = await tx.$queryRawUnsafe<RawRow[]>(
       `SELECT r.id::text AS id, r.asset_id::text AS asset_id, r.value::text AS value,
-              r.unit, r.read_at, r.created_by::text AS created_by, r.created_at
+              r.unit, r.read_at, r.created_by::text AS created_by, r.created_at,
+              r.read_at::text AS cursor_key
          FROM public.readings r
         WHERE ${where.join(' AND ')}
         ORDER BY r.read_at DESC, r.id DESC
@@ -220,9 +261,194 @@ export class AssetsService {
       ...params,
     );
 
-    const readings = rows.map(toReading);
-    return toPage(readings, limit, (r) => encodeCursor(r.readAt, r.id));
+    return mapPage(rows, limit, toReading);
   }
+
+  /**
+   * Registers an asset. **Writes THREE rows in ONE transaction**: the asset, then
+   * its `created` and `installed` events.
+   *
+   * ATOMICITY COMES FOR FREE, AND THAT IS THE WHOLE DESIGN (decision 3). The
+   * interceptor already opened an interactive transaction to issue `SET LOCAL`,
+   * and `requireRequestContext().tx` is that transaction — so these three
+   * statements are in it by construction. No new machinery, no `SECURITY DEFINER`
+   * (there is no privilege gap: the app role holds `INSERT` on both tables), and
+   * no trigger.
+   *
+   * THE TRIGGER WAS REJECTED FOR A CONCRETE REPO REASON, recorded here because it
+   * is the obvious "make emission unbypassable" suggestion: a trigger needs
+   * `created_by`, which is `NOT NULL`, and would have to read it from
+   * `app.current_user`. Every migrator-seeded fixture — `seedIsolationContext`,
+   * the PERF harness, every db suite — inserts assets with no such GUC set, so the
+   * trigger would need a "skip when unset" fallback. That fallback IS the silent
+   * skip the trigger existed to prevent, only now fail-open by default.
+   *
+   * WHAT GUARDS EMISSION INSTEAD: emission lives at this single choke point (there
+   * is no other code path that inserts into `assets`), the §9.2 invariant is
+   * asserted by test, and 3c routes every transition through one `applyTransition`
+   * method for the same reason.
+   *
+   * `tenant_id` comes from `app.current_tenant` via the RLS policy's `WITH CHECK`,
+   * not from the client — `CreateAssetDto` has no `tenantId` field, so a
+   * cross-tenant write is not expressible at the API boundary at all.
+   */
+  async create(dto: CreateAssetDto): Promise<Asset> {
+    const { tx, userId } = requireRequestContext();
+
+    // The policy's WITH CHECK requires tenant_id to equal the GUC, so it is read
+    // from the GUC rather than passed in. Writing it any other way would either be
+    // refused by the policy or — worse — be a value the API let a client choose.
+    const inserted = await tx
+      .$queryRawUnsafe<RawRow[]>(
+        `INSERT INTO public.assets (tenant_id, serial_number, type, location, installed_at)
+       VALUES (NULLIF(current_setting('app.current_tenant', true), '')::uuid,
+               $1, $2, $3, $4::timestamptz)
+       RETURNING id::text AS id, serial_number, type, status::text AS status,
+                 location, installed_at, created_at, updated_at, deleted_at`,
+        dto.serialNumber,
+        dto.type,
+        dto.location ?? null,
+        dto.installedAt ?? null,
+      )
+      .catch(rethrowDuplicateSerial);
+
+    const asset = toAsset(firstRow(inserted, 'assets INSERT ... RETURNING'));
+
+    // THE GENESIS PAIR (ARCHITECTURE §9.2). BOTH events, not just `created`.
+    //
+    // The invariant: every status an asset has ever held must have an event that
+    // put it there. A new asset is `installed`, so emitting only `created` would
+    // leave its first status unexplained and make the log unreplayable — and
+    // replaying the log to reconstruct status at a past time is the entire reason
+    // to keep an append-only lifecycle log instead of just reading `status`.
+    //
+    // Both rows are inserted in ONE statement so they share a `created_at` to the
+    // microsecond. That shared timestamp is the observable evidence of the single
+    // transaction, and it is also why every events cursor carries `id` as a
+    // tiebreaker (cursor.ts) — this is the guaranteed tie.
+    await tx.$executeRawUnsafe(
+      `INSERT INTO public.asset_events (tenant_id, asset_id, event_type, payload, created_by)
+       VALUES (NULLIF(current_setting('app.current_tenant', true), '')::uuid,
+               $1::uuid, 'created', '{}'::jsonb, $2::uuid),
+              (NULLIF(current_setting('app.current_tenant', true), '')::uuid,
+               $1::uuid, 'installed', $3::jsonb, $2::uuid)`,
+      asset.id,
+      userId,
+      JSON.stringify({ from: null, to: 'installed' }),
+    );
+
+    return asset;
+  }
+
+  /**
+   * Metadata-only update. **Emits nothing, by design.**
+   *
+   * Correcting a typo in `location` is not a lifecycle event — it is exactly the
+   * §9.2 case that distinguishes `asset_events` from `audit_log`: this mutation
+   * will belong in the audit log (step 7) and must NOT appear in the lifecycle
+   * log, because nothing happened to the physical asset.
+   *
+   * `status` and `deletedAt` cannot arrive here: they are absent from
+   * `UpdateAssetDto`, so `forbidNonWhitelisted` rejects them with a 400. Note
+   * carefully that the pipe is not the guard — it only refuses fields the DTO does
+   * not declare, and would happily accept `status` the moment someone added it.
+   * **The DTO shape is the guard**, and the test asserting the 400 is what pins it.
+   */
+  async update(id: string, dto: UpdateAssetDto): Promise<Asset> {
+    const { tx } = requireRequestContext();
+    await this.findOne(id);
+
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    if (dto.type !== undefined) {
+      params.push(dto.type);
+      sets.push(`type = $${params.length}`);
+    }
+    if (dto.location !== undefined) {
+      params.push(dto.location);
+      sets.push(`location = $${params.length}`);
+    }
+    if (dto.installedAt !== undefined) {
+      params.push(dto.installedAt);
+      sets.push(`installed_at = $${params.length}::timestamptz`);
+    }
+
+    if (sets.length === 0) return this.findOne(id);
+
+    sets.push('updated_at = now()');
+    params.push(id);
+
+    const rows = await tx.$queryRawUnsafe<RawRow[]>(
+      `UPDATE public.assets SET ${sets.join(', ')}
+        WHERE id = $${params.length}::uuid
+       RETURNING id::text AS id, serial_number, type, status::text AS status,
+                 location, installed_at, created_at, updated_at, deleted_at`,
+      ...params,
+    );
+
+    // RLS makes another tenant's row invisible, so zero rows here means the same
+    // thing findOne's zero rows means. Re-checked rather than assumed: a silent
+    // no-op returning 200 would be worse than a 404.
+    const row = rows[0];
+    if (!row) throw assetNotFound();
+    return toAsset(row);
+  }
+
+  /**
+   * Records a reading. **Emits no event**, asserted by test.
+   *
+   * A reading is an OBSERVATION of an asset, not a change to its lifecycle. The
+   * asset's status is unaffected, so there is nothing for the lifecycle log to
+   * record and writing one would corrupt a replay.
+   */
+  async createReading(assetId: string, dto: CreateReadingDto): Promise<Reading> {
+    const { tx, userId } = requireRequestContext();
+    await this.findOne(assetId);
+
+    // asset_id and tenant_id must agree (ADR-007's composite FK). tenant_id comes
+    // from the GUC and asset_id has just been confirmed visible under that same
+    // GUC, so the pair agrees by construction; the FK is the floor under that
+    // reasoning rather than a thing this code has to get right.
+    const rows = await tx.$queryRawUnsafe<RawRow[]>(
+      `INSERT INTO public.readings (tenant_id, asset_id, value, unit, read_at, created_by)
+       VALUES (NULLIF(current_setting('app.current_tenant', true), '')::uuid,
+               $1::uuid, $2::numeric, $3, $4::timestamptz, $5::uuid)
+       RETURNING id::text AS id, asset_id::text AS asset_id, value::text AS value,
+                 unit, read_at, created_by::text AS created_by, created_at`,
+      assetId,
+      dto.value,
+      dto.unit,
+      dto.readAt,
+      userId,
+    );
+
+    return toReading(firstRow(rows, 'readings INSERT ... RETURNING'));
+  }
+}
+
+/**
+ * The partial unique index refuses a duplicate live serial within a tenant
+ * (`assets_tenant_serial_live_key`). Mapped to 409 rather than surfacing as a 500.
+ *
+ * Matched on the SQLSTATE, never the message: Prisma normalises unique violations
+ * and DISCARDS the constraint name (measured at the phase 1 close-out — the app
+ * role sees `Unique constraint failed: ` with an empty target), so a mapping keyed
+ * on the index name would never fire. `assets` has exactly one other unique index,
+ * `(id, tenant_id)`, whose columns are server-generated, so 23505 on this INSERT
+ * can only be the serial.
+ */
+function rethrowDuplicateSerial(error: unknown): never {
+  const code = (error as { meta?: { code?: unknown } }).meta?.code;
+  if (code === '23505') {
+    throw new ConflictException({
+      error: {
+        code: 'ASSET_SERIAL_EXISTS',
+        message: 'An active asset with that serial number already exists in this workspace.',
+      },
+    });
+  }
+  throw error;
 }
 
 function assetNotFound(): NotFoundException {
@@ -231,8 +457,7 @@ function assetNotFound(): NotFoundException {
   });
 }
 
-/* eslint-disable @typescript-eslint/no-explicit-any -- raw rows are snake_case and untyped by Prisma. */
-function toAsset(r: any): Asset {
+function toAsset(r: RawRow): Asset {
   return {
     id: r.id,
     serialNumber: r.serial_number,
@@ -246,7 +471,7 @@ function toAsset(r: any): Asset {
   };
 }
 
-function toEvent(r: any): AssetEvent {
+function toEvent(r: RawRow): AssetEvent {
   return {
     id: r.id,
     assetId: r.asset_id,
@@ -257,7 +482,7 @@ function toEvent(r: any): AssetEvent {
   };
 }
 
-function toReading(r: any): Reading {
+function toReading(r: RawRow): Reading {
   return {
     id: r.id,
     assetId: r.asset_id,
@@ -271,4 +496,3 @@ function toReading(r: any): Reading {
     createdAt: r.created_at,
   };
 }
-/* eslint-enable @typescript-eslint/no-explicit-any */

@@ -1,6 +1,17 @@
-import { ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsIn, IsInt, IsISO8601, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import {
+  IsIn,
+  IsInt,
+  IsISO8601,
+  IsNumberString,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+  MinLength,
+} from 'class-validator';
 
 import { DEFAULT_LIMIT, MAX_LIMIT } from '../../common/pagination/cursor';
 
@@ -95,4 +106,119 @@ export class ListReadingsQuery extends PaginationQuery {
   @IsOptional()
   @IsISO8601()
   to?: string;
+}
+
+/**
+ * Registering an asset.
+ *
+ * **`tenantId` is deliberately absent and must stay absent.** The tenant comes
+ * from `app.current_tenant`, which the interceptor set from a re-verified
+ * membership. Accepting it from the client would make cross-tenant writes
+ * *expressible* — RLS would still refuse them, but the API would be inviting an
+ * attempt, and `forbidNonWhitelisted` means sending it is a 400 rather than a
+ * silently ignored field.
+ *
+ * `status` is absent too: a new asset is always `installed` (the column default),
+ * and every later status is a TRANSITION, which is phase 3c's `POST /events`.
+ */
+export class CreateAssetDto {
+  @ApiProperty({ example: 'SN-00042' })
+  @IsString()
+  @MaxLength(120)
+  @MinLength(1)
+  serialNumber!: string;
+
+  @ApiProperty({ example: 'meter' })
+  @IsString()
+  @MaxLength(120)
+  @MinLength(1)
+  type!: string;
+
+  @ApiPropertyOptional({ example: 'Building C, riser 4' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  location?: string;
+
+  /**
+   * DOMAIN TIME, client-supplied, and deliberately NOT defaulted to `now()`
+   * (decision 14). A server timestamp would be a lie about the physical world, and
+   * registering today an asset installed last week is ordinary field work. The
+   * column is nullable, so "not known" is representable.
+   *
+   * Distinct from `created_at` (server insertion time) — the same distinction
+   * `readings.read_at` carries, and the gap between the two is meaningful data.
+   */
+  @ApiPropertyOptional({ description: 'When the asset was physically installed (ISO-8601).' })
+  @IsOptional()
+  @IsISO8601()
+  installedAt?: string;
+}
+
+/**
+ * Metadata-only update. **`status` and `deletedAt` are deliberately NOT here.**
+ *
+ * A status change is a lifecycle TRANSITION — it must emit an event, and the
+ * event type depends on where the asset came from, not only where it is going
+ * (ARCHITECTURE §9.2). Allowing `PATCH { status }` would create a second
+ * status-write path whose event type had to be inferred from the target state,
+ * which is the `statusToEventType[newStatus]` trap §9.2 exists to warn about.
+ * Transitions go through `POST /assets/:id/events` (phase 3c) and nowhere else.
+ *
+ * `deletedAt` is absent because decommissioning is a transition too, and because
+ * the `assets_decommissioned_iff_deleted` CHECK would reject a `deleted_at` set
+ * without its matching status anyway.
+ *
+ * `serialNumber` is absent: it identifies the physical unit. Correcting a
+ * mis-typed serial is a real need, but it interacts with the partial unique index
+ * and with re-registration, so it is a deliberate decision rather than a field to
+ * add in passing.
+ */
+export class UpdateAssetDto {
+  @ApiPropertyOptional({ example: 'meter' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  @MinLength(1)
+  type?: string;
+
+  @ApiPropertyOptional({ example: 'Building C, riser 4' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  location?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsISO8601()
+  installedAt?: string;
+}
+
+/**
+ * Recording a reading. Emits NOTHING — a reading is an observation of an asset,
+ * not a change to its lifecycle, so `asset_events` is untouched (asserted).
+ */
+export class CreateReadingDto {
+  /**
+   * Sent as a STRING, not a number. `value` is unbounded `numeric` precisely so a
+   * cumulative meter total cannot be truncated (see the readings migration), and
+   * routing it through a JS `number` would reintroduce exactly that loss at the
+   * API boundary — 64-bit float mantissa, ~15-16 significant digits. A decimal
+   * string preserves what the column was chosen to preserve.
+   */
+  @ApiProperty({ example: '10432.75', description: 'Decimal string — not a JSON number.' })
+  @IsNumberString({ no_symbols: false })
+  @MaxLength(64)
+  value!: string;
+
+  @ApiProperty({ example: 'kWh' })
+  @IsString()
+  @MaxLength(40)
+  @MinLength(1)
+  unit!: string;
+
+  /** Domain time — when the meter was actually read. Required: a reading with no time is unusable. */
+  @ApiProperty({ description: 'When the reading was taken (ISO-8601).' })
+  @IsISO8601()
+  readAt!: string;
 }

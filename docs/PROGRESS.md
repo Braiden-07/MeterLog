@@ -6,13 +6,65 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phases 1 and 2 merged (`assets`, `asset_events`, `readings`; matrix 0 -> 15). Phase 3a complete: the asset READ surface, cursor pagination, and the §8.3 read axis.** Phase 3b is basic writes + the RBAC matrix + genesis emission; 3c the transition engine; 3d the §8.3 capstone. Phase 4 / 6b `maintenance_records` (slippable within step 6, but essential v1.0 scope — needed before step 8's frontend).
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phases 1 and 2 merged (`assets`, `asset_events`, `readings`; matrix 0 -> 15). Phases 3a and 3b complete: the READ surface with cursor pagination, then the basic WRITE surface with the RBAC matrix and the genesis emission.** Phase 3c is the transition engine; 3d the §8.3 capstone. Phase 4 / 6b `maintenance_records` (slippable within step 6, but essential v1.0 scope — needed before step 8's frontend).
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-10 — Step 6 Phase 3b: the write surface, RBAC, and the genesis emission (§11 step 6)
+
+The writes whose emission is trivial or absent, so the novel (from -> to) transition logic stays quarantined in 3c. Also the project's first write to `asset_events`, which establishes the emission pattern 3c extends.
+
+**Three endpoints, all `@RequiresRole('admin', 'technician')`.** `POST /assets`, `PATCH /assets/:id` (metadata only), `POST /assets/:id/readings`.
+
+**The genesis pair — three rows, one transaction, proven on disk.** `POST /assets` writes the asset then **both** `created` and `installed` in a single statement. Asserted by reading back as the migration role rather than trusting the response: exactly one asset (`installed`, `deleted_at` null, correct `tenant_id`), exactly **two** events, payloads `{}` and `{"from": null, "to": "installed"}` (decision 10), `created_by` = caller on both, and **identical `created_at`** — the observable evidence of the single transaction.
+
+**Atomicity came for free, which was the point of decision 3.** The interceptor already opens an interactive transaction to issue `SET LOCAL`, and `requireRequestContext().tx` _is_ that transaction, so the three statements are in it by construction. No new machinery, no definer (no privilege gap — the app role holds `INSERT` on both tables), no trigger. The trigger rejection is recorded at the call site with its concrete repo reason, because it is the obvious suggestion: a trigger needs `created_by`, would have to read `app.current_user`, and every migrator-seeded fixture inserts assets with no such GUC — so it would need a "skip when unset" fallback, and that fallback _is_ the silent skip the trigger existed to prevent, now fail-open.
+
+**`tenant_id` is not client-supplied and a cross-tenant write is not expressible.** `CreateAssetDto` has no `tenantId` field, so `forbidNonWhitelisted` makes the attempt a 400 rather than a field RLS then quietly refuses. Same for `status`.
+
+**The biconditional CHECK — the DB floor, in before 3c builds the path it guards.** New migration: `CHECK ((status = 'decommissioned') = (deleted_at IS NOT NULL))`. One row, no subquery, no policy interaction — which is why a `CHECK` works here and could not for ADR-007 (that needed a _parent_ table). Verified to reject **both** directions and accept both consistent shapes, including against the migration role — the whole reason it is a constraint rather than a service invariant.
+
+**It immediately forced one fixture consistent, exactly as expected.** The phase-1 serial re-registration test soft-deleted by setting `deleted_at` alone, which the constraint now forbids. **Corrected, not weakened:** soft-deleting an asset _is_ decommissioning it (decision 9), so a fixture writing only `deleted_at` was modelling a state the product does not have. That was the only one in 225 tests.
+
+**A REAL BUG IN 3a's CURSOR, found by 3b's real data.** The genesis-pair pagination test failed: walking two tied events at `limit=1` returned **one** row, not two.
+
+Diagnosis: `encodeCursor` took a JS `Date` and called `.toISOString()`. **Postgres `timestamptz` is microsecond-precision; a JS `Date` is millisecond.** The cursor therefore pointed at an instant slightly _earlier_ than the row it came from, so `(created_at, id) < (truncated, id)` excluded that row **and every row sharing its millisecond**, and pagination stopped early having silently lost rows.
+
+It was invisible in 3a because those tests seeded whole-second timestamps, where truncation is lossless. It appeared the moment real rows were created with `now()` — and worst on the genesis pair, where two rows share a microsecond timestamp _by design_, which is precisely the case the tiebreaker exists for. **This was merged in 3a and was a live defect**, not a new-code mistake.
+
+Fixed by never letting the value pass through a JS date: every paginated query now re-selects its sort column as `::text` (`cursor_key`), that exact string travels in the cursor, and it returns to Postgres as `$n::timestamptz`. `encodeCursor`'s signature now **refuses** a `Date`, so the mistake cannot recur silently.
+
+**Mutation sweep — 7 mutations, 7 caught.**
+
+| #   | mutation                                                                         | caught by                             |
+| --- | -------------------------------------------------------------------------------- | ------------------------------------- |
+| P1  | emit only `created`, drop `installed`                                            | genesis shape + the cursor-tie test   |
+| P2  | wrong `installed` payload                                                        | genesis shape                         |
+| P3  | **build the cursor from the mapped `Date`** (the precision bug restored)         | the genesis cursor-tie test           |
+| P4  | remove `@RequiresRole` from all three routes                                     | auditor-403 + null-role               |
+| P5  | **add `status` to `UpdateAssetDto`** (the future "so the UI can set it" mistake) | the `PATCH { status }` 400 test       |
+| P6  | emit an event on reading creation                                                | "leaves asset_events untouched"       |
+| P7  | drop the CHECK constraint                                                        | the DB-enforced-against-migrator test |
+
+**P5 is the one worth naming.** `forbidNonWhitelisted` only refuses fields the DTO does not declare — it does nothing the moment someone adds `status` to the DTO, which would make `PATCH` a second status-write path with no emission and silently break §9.2. So **the DTO shape is the guard, not the pipe**, and the test exists to pin that absence. The comment says so, because the test otherwise reads like it is testing ValidationPipe.
+
+**RBAC, live over HTTP.** admin ✓ / technician ✓ / auditor **403** on all three endpoints, with `FORBIDDEN_ROLE` asserted by **code and message** (the step-5 lesson: two byte-identical 403s from different layers made the gate untestable), plus the auditor's attempts verified to have written nothing. `401 UNAUTHENTICATED` distinct from 403. And the **null-role case: 403, never 500** — the CanActivate-ordering defect one layer up.
+
+**§8.3 write axis (for 3b's endpoints).** M, a member of both tenants and active in A, gets **404** — not 403 — on `PATCH` and on attaching a reading to B's asset, because B's row does not exist for that request; B's asset is verified untouched with zero readings. And M's own `POST` lands in A, never B — since the tenant is not client-supplied, writing into B is _inexpressible_ rather than merely refused.
+
+**The forward-marker register — `DECISIONS.md`, "Open items register".** Put there rather than in a new `docs/` file so each debt sits beside the ADR that created it; `PROGRESS.md` stays the narrative log, the register is the checklist. Four enumerated rows with owed-by and due-step: **OPEN-4** (role-at-time-of-action → step 7), **OPEN-6** (the audit retrofit, **extended from three to seven mutation types** — the five step-5/3b ones plus 3c's transition and decommission; with `PATCH` flagged specifically, since it emits no lifecycle event and so is the one Phase 3 mutation for which `audit_log` will be the _only_ record), **OPEN-7** (set-password, step 8 / deadline step 10), **OPEN-8** (`maintenance_records`: does it get a `DELETE` grant at all — `SELECT, INSERT, UPDATE`, a shape no existing table has, or the project's first genuine hard delete against an all-soft-delete, all-RESTRICT codebase). Rows are marked `DONE` when paid, never deleted.
+
+**225 tests green** (was 202; +23). Lint, typecheck, build and format verified by exit code.
+
+**Next**
+
+- Phase 3c — the transition engine: the legal (from -> to) graph, `POST /assets/:id/events` as the single transition driver, `DELETE /assets/:id` as decommission, 409 on an illegal transition, and the route-inventory guard once every append-only route is registered.
+
+---
 
 ### 2026-09-10 — Step 6 Phase 3a: the asset read surface (§11 step 6)
 
