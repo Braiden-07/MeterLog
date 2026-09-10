@@ -28,6 +28,7 @@
 | 004 | RLS enforcement: per-request tenant context + restricted DB role | Accepted |
 | 005 | Repository layout: npm-workspaces monorepo                       | Accepted |
 | 006 | Membership-based multi-tenancy (two-axis RLS)                    | Accepted |
+| 007 | Child-table tenant consistency: composite foreign key            | Accepted |
 
 ---
 
@@ -277,3 +278,43 @@ The cost is honest: every new tenant-scoped table now requires a fixture before 
 - **Amended at Phase 1 of step 4 — co-member visibility accepted as an intentional default.** Every member of a tenant can read every co-member's identity and role. This existed only as a side effect of the tenant axis being keyed on `tenant_id` alone; it is now a decision. Co-member visibility is the right default for team SaaS. Reads are deliberately **not** role-gated, because gating a read on role means a role term in a read policy — the option-C danger above — and co-member identity and role are not sensitive enough to justify reopening that class. What genuinely is sensitive (`password_hash`) is withheld by column grant.
 - **Alternatives considered:**
   - **Keep the brief's one-tenant-per-user model** — less work, and defensible against "do not over-build". Rejected because a membership model deepens the single thing the project exists to demonstrate rather than adding an orthogonal feature, and `PROJECT_BRIEF` §5 explicitly invites schema refinement.
+
+## ADR-007 — Child-table tenant consistency: composite foreign key
+
+- **Date:** 2026-09-09
+- **Status:** Accepted
+- **Context:** Step 6 introduces the first tables that are **children of another tenant-scoped table**: `asset_events`, `readings` and `maintenance_records` all belong to an `asset`, and the asset belongs to a tenant. That creates a question the identity/tenancy tables never raised — how does a child row's tenancy stay consistent with its parent's?
+
+  Two shapes were on the table. **(b) FK-derived:** the child carries no `tenant_id` and its RLS policy establishes tenancy by joining to `assets`. **(a) denormalized:** the child carries its own `tenant_id` and its policy keys directly on `app.current_tenant`, exactly like every other tenant-scoped table.
+
+  **(a) is not a free choice — it is what the authoritative documents already specify.** `PROJECT_BRIEF.md` §5 gives `tenant_id (fk)` to `asset_events` (:137), `readings` (:138) and `maintenance_records` (:139) individually, and its first design rule (:144) is "every tenant-scoped table has `tenant_id` and an RLS policy keyed to the current tenant". ADR-006 §3 lists all three among the tables whose policy is "keyed on `app.current_tenant`". This ADR does not re-decide that; it decides the part both documents leave open — **what keeps the denormalized `tenant_id` honest.**
+
+  **(b) was never available anyway, and the reason is this project's entire bug history.** A policy that derives one row's tenancy by joining to another table is a **subquery inside an RLS policy on a `FORCE ROW LEVEL SECURITY` table** — the precise shape that produced the OPEN-5 `deleted_at` deadlock (a policy predicate blocking the very statement it was meant to guard), the `FOR ALL` write-vector defaults (ADR-006 §0.1, §3), and the citext operator-resolution lockout (ADR-004's operator amendment). Three separate wounds, one shape. It is also slower on every read of a hot time-series table.
+
+  Denormalization has a real cost, and naming it is the point of this entry: `readings.tenant_id` must **stay** equal to its asset's. Nothing in shape (a) makes that true by itself. Left to application discipline, a single service that sets `tenant_id` from the session while taking `asset_id` from the request body writes a row whose two halves disagree — and it is **invisible to RLS**, because the policy only ever checks `tenant_id` against the GUC and that half is correct. The row is isolated; it is simply attached to the wrong asset. So the mechanism is the decision.
+
+- **Decision:** A **composite foreign key**, declared in migration SQL.
+
+  ```sql
+  -- parent
+  ALTER TABLE public.assets ADD CONSTRAINT assets_id_tenant_key UNIQUE (id, tenant_id);
+
+  -- every child
+  FOREIGN KEY (asset_id, tenant_id)
+    REFERENCES public.assets (id, tenant_id) ON DELETE RESTRICT
+  ```
+
+  The child keeps its own `tenant_id` (so its policy stays the canonical single-column expression, no subquery), and the composite FK makes a mismatched pair **unrepresentable** rather than merely discouraged.
+
+- **Consequences:**
+  - **It is declarative and always-on.** It holds against the app role, against the migration role, against any future `SECURITY DEFINER` function, against a `psql` session, and against any code path that bypasses the application entirely. This is the property a trigger cannot match without being written as `ALWAYS` and written correctly, and the property application-layer validation cannot match at all.
+  - **It adds no procedural code to the danger zone.** ADR-004 and ADR-006 are a sustained argument that logic inside policies and inside definer bodies is where this project's bugs live. A constraint is not logic; it is a shape. Nothing new becomes bypassable, and nothing new needs a mutation test to prove it is reachable — though one is run anyway (step 6 Phase 1 sweep).
+  - **`UNIQUE (id, tenant_id)` on `assets` is not an extra artifact.** `PROJECT_BRIEF.md` §5 (:148) already calls for "composite `(tenant_id, id)` patterns". The unique index is required by Postgres as the FK's referenced target, and it serves the brief's index rule at the same time.
+  - **An asset's `tenant_id` becomes effectively immutable once it has children** — changing it would violate every child's FK. **This is correct, not a limitation: assets do not move between tenants.** There is no product story in which they do, and if one ever arose it would need to be a deliberate, audited migration rather than an `UPDATE`. Recorded explicitly so a future reader meets it as a decision rather than as a puzzling constraint violation.
+  - **The rejection surfaces as `23503` (foreign key violation), not as an RLS error.** A cross-tenant `INSERT` blocked by `WITH CHECK` raises `42501`/"new row violates row-level security policy"; a tenant-mismatched child row raises `23503`. **Two mechanisms, two SQLSTATEs, and the tests assert them distinctly.** Conflating them into one "it is rejected" assertion would let either mechanism silently stop working while the other kept the test green — the same trap catalog assertion 9 exists to avoid on the grants-versus-policy axis, and the same one that made the step-5 RBAC gate un-testable until the two layers were given distinct error codes.
+  - Children still carry their own single-column `tenant_id` policy, so the generic isolation matrix covers them with no special case and no subquery anywhere.
+- **Alternatives considered:**
+  - **A trigger** (`BEFORE INSERT OR UPDATE`, deriving or verifying `tenant_id` from the parent) — works, and is the common answer. Rejected: it is procedural code executing inside the write path, it must be written `ALWAYS` to survive a session that disables triggers, it needs its own mutation coverage to prove it is reachable, and it can be dropped by one statement with nothing else complaining. A constraint has none of those failure modes.
+  - **A `CHECK` constraint** — cannot express this at all. `CHECK` may not reference another table, which is exactly what "agrees with its asset" requires.
+  - **Application-layer validation only** — rejected by `PROJECT_BRIEF.md` §7's defence-in-depth requirement and by the whole premise of ADR-004: the database is the boundary, not the application.
+  - **Shape (b), FK-derived tenancy with a subquery in the policy** — rejected above and in Context. Contradicts the brief and ADR-006, and reopens the exact policy-complexity class this project has been burned by three times.

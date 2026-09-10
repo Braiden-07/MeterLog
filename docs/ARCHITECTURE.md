@@ -132,6 +132,32 @@ Role comes from `RequestContext.role` — the active membership's role, re-read 
 | `PATCH /users/:id`  | ✓     | 403        | 403     |
 | `DELETE /users/:id` | ✓     | 403        | 403     |
 
+### 9.1 Domain endpoints (recorded at step 6 Phase 1; enforced at Phase 3)
+
+`PROJECT_BRIEF.md` gives the role intent in prose — §1 casts technicians as the people who "record readings/maintenance", and §7 requires that "an auditor is read-only" — but it contains no per-endpoint matrix for the domain tables. This is that matrix, decided and recorded **now**, at the step where the tables land, so Phase 3 implements a written decision rather than re-deriving one from prose.
+
+**The tables exist as of Phase 1; none of these endpoints do.** Enforcement arrives in Phase 3 via `@RequiresRole(...)`, resolved inside the interceptor at step (5) exactly as §9 above requires — never a `CanActivate` guard.
+
+| Endpoint                    | admin | technician | auditor |
+| --------------------------- | ----- | ---------- | ------- |
+| `GET /assets`               | ✓     | ✓          | ✓       |
+| `GET /assets/:id`           | ✓     | ✓          | ✓       |
+| `POST /assets`              | ✓     | ✓          | 403     |
+| `PATCH /assets/:id`         | ✓     | ✓          | 403     |
+| `DELETE /assets/:id` (soft) | ✓     | 403        | 403     |
+| `GET /assets/:id/events`    | ✓     | ✓          | ✓       |
+| `POST /assets/:id/events`   | ✓     | ✓          | 403     |
+| `GET /assets/:id/readings`  | ✓     | ✓          | ✓       |
+| `POST /assets/:id/readings` | ✓     | ✓          | 403     |
+
+**The one cell that was genuinely open, and how it was resolved.** `POST /assets` could defensibly have been admin-only. It is **admin _and_ technician**: registering an asset is field work — the technician installing a meter is the person who knows its serial number, type and location, and routing that through an admin invents a bottleneck the product has no reason to have. The destructive act is **decommissioning**, and that is where the admin-only line is drawn: `DELETE /assets/:id` is admin-only.
+
+**Auditor is read-only across every row of the table**, with no exceptions — the §7 requirement, applied without special cases.
+
+**Reads are open to all three roles and are deliberately not role-gated**, consistent with ADR-006 §3's treatment of the member list: gating a read on role means a role term in a read policy, which is the shape this project has repeatedly been burned by. Tenant isolation on reads is RLS's job and RLS's alone.
+
+**None of this is enforced in a policy.** Every domain policy is the canonical single-column tenant expression with no role term anywhere — role logic stays out of RLS (DECISION B), and these distinctions live entirely at the endpoint. The database's contribution is that a technician and an admin acting in tenant A can both only ever touch tenant A's rows.
+
 ## 10. Audit logging
 
 ## 11. API conventions

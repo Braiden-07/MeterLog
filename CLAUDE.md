@@ -38,10 +38,33 @@
 - REST: plural nouns, correct status codes, error envelope `{ error: { code, message, details? } }`, pagination + filtering + sorting on list endpoints.
 - Every tenant-scoped table has `tenant_id` + an RLS policy; tenant context is set per request. Never rely on app-layer filtering alone for isolation.
 - Every create/update/delete on core entities writes an `audit_log` row (actor, action, before/after).
-- UUID primary keys; `created_at`/`updated_at` on mutable tables; soft delete (`deleted_at`) on user-facing entities; append-only tables (asset_events, audit_log) are never updated or deleted.
+- UUID primary keys; `created_at`/`updated_at` on mutable tables; soft delete (`deleted_at`) on user-facing entities. Append-only tables are never updated or deleted — see the declaration below.
 - Validation at the boundary (DTOs server-side, Zod client-side). Reject unknown fields.
 - Secrets only via env/secret stores; `.env` stays in `.gitignore`; never commit credentials.
 - Conventional commits; small PRs; trunk-based with short-lived feature branches.
+
+## Append-only tables — a DECLARED property, never an inferred one
+
+**The list.** These tables are append-only: rows are inserted and read, never updated and never deleted. A correction is a **new row**, not an edit.
+
+| Table          | Declared since | Basis                                                              |
+| -------------- | -------------- | ------------------------------------------------------------------ |
+| `asset_events` | step 6 phase 1 | `PROJECT_BRIEF.md` §5 :137 — "**append-only**, no updates/deletes" |
+| `readings`     | step 6 phase 2 | `PROJECT_BRIEF.md` §5 :138 + :146 — implied by omission; see below |
+| `audit_log`    | step 7         | `PROJECT_BRIEF.md` §5 :140 — "**append-only**"                     |
+
+**Why this is written down instead of left to be noticed.** The brief marks `asset_events` (:137) and `audit_log` (:140) append-only in so many words. It never says it about `readings` (:138) — the property is there only **by omission**, because :146 says "append-only tables get `created_at` only" and `readings` is the one domain table with no `updated_at` and no `deleted_at`. That is a true inference and a **dangerous way to hold a security-relevant property.**
+
+Implicit-by-omission is the exact shape of this repo's worst bugs. `WITH CHECK` defaulting from `USING` on a `FOR ALL` policy was a write vector nobody wrote down (ADR-006 §0.1). An operator resolving through an implicit cast because `public` was off the pinned `search_path` was an account lockout nobody wrote down (ADR-004's operator amendment). In both cases the correct behaviour was inferable and the wrong behaviour was silent. A reader reconstructing "is `readings` append-only?" from which column is _absent_ is one refactor away from adding an `updated_at` "for consistency" and quietly ending the property.
+
+**So the property is declared, and the declaration is enforced:**
+
+- `APPEND_ONLY_TABLES` in `apps/api/test/db/helpers.ts` is this table's executable mirror. Keep the two in step — the constant is what CI reads.
+- **Catalog assertion 13** binds the declaration to the grants: a declared append-only table must hold **exactly `SELECT, INSERT`** for `meterlog_app`. A future `GRANT UPDATE ON public.asset_events TO meterlog_app` turns the suite **red** instead of silently widening the table's write surface.
+- The isolation matrix reads the same declaration through each fixture's `appWrites` capability, and asserts `permission denied` on UPDATE/DELETE where writes are not declared — so the property is proven behaviourally too, not only structurally.
+- **`appWrites` is read from the declaration, never from `has_table_privilege`.** Deriving it from the live grant would make the test assert whatever the grant happens to be, which catches nothing by construction — the tautology that made a mutated policy indistinguishable from a correct one until catalog assertion 4 was tightened to assert the pin's _content_.
+
+Adding a table here means adding it to `APPEND_ONLY_TABLES` and giving it a `SELECT, INSERT`-only grant. Removing one requires a reviewed edit in both places, which is the point.
 
 ## Test-suite invariants (do not "optimize" these away)
 

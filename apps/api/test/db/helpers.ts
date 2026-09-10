@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -122,9 +123,11 @@ export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = [
  * failure about grants, not isolation. Their policies are covered by the bespoke
  * suite, which asserts both denial layers separately.
  *
- * The generic matrix therefore still generates zero cases at step 4 Phase 1. It
- * activates on its own at step 6, when `assets`/`readings` land — those the app
- * role genuinely does write.
+ * The generic matrix generated ZERO cases from step 4 Phase 1 until step 6
+ * Phase 1, when `assets` and `asset_events` landed — the first tables the app
+ * role genuinely does write. It now generates real cases against both, and the
+ * list above is what keeps that fact honest: these three are absent from the
+ * matrix by declaration, not by omission.
  */
 export const ISOLATION_BESPOKE_TABLES: readonly string[] = ['memberships', 'users', 'tenants'];
 
@@ -152,17 +155,100 @@ export async function withContext<T>(
 }
 
 /**
+ * APPEND-ONLY TABLES — the executable mirror of the declaration in CLAUDE.md.
+ *
+ * Rows are inserted and read, never updated and never deleted; a correction is a
+ * new row. THE PROPERTY IS DECLARED HERE, NOT DERIVED FROM THE SCHEMA. It would
+ * be perfectly possible to infer it — an append-only table is the one with no
+ * `updated_at` and no `deleted_at` (PROJECT_BRIEF section 5 :146) — and that is
+ * exactly what must not happen. PROJECT_BRIEF states it outright for
+ * `asset_events` (:137) and `audit_log` (:140) but never for `readings` (:138),
+ * where it exists only by omission, and a property held by omission is one
+ * refactor away from ending: someone adds `updated_at` "for consistency" and
+ * nothing objects.
+ *
+ * That is the shape of this repo's two worst bugs — `WITH CHECK` defaulting from
+ * `USING` (ADR-006 section 0.1) and an operator resolving through an implicit
+ * cast (ADR-004's operator amendment). Both were inferable, both were silent.
+ *
+ * Two assertions bind this list to reality, in opposite directions:
+ *   * catalog assertion 13 — a table listed here holds EXACTLY `SELECT, INSERT`
+ *     for `meterlog_app`, so a stray `GRANT UPDATE` turns CI red;
+ *   * the fixture/declaration agreement check in isolation.spec.ts — a table
+ *     listed here must have a fixture declaring no update and no delete.
+ *
+ * `readings` joins at step 6 Phase 2, `audit_log` at step 7.
+ */
+export const APPEND_ONLY_TABLES: readonly string[] = ['asset_events'];
+
+/**
+ * What the app role may do to a table beyond `SELECT` and `INSERT`, DECLARED per
+ * fixture rather than read back from `has_table_privilege`.
+ *
+ * Deriving it from the live grant would make the matrix assert whatever the grant
+ * happens to be, which catches nothing by construction — the same tautology that
+ * made a mutated definer function indistinguishable from a correct one until
+ * catalog assertion 4 was tightened to assert the pin's CONTENT rather than its
+ * presence.
+ *
+ * Note this is NOT simply "is it append-only": `assets` is mutable and still
+ * declares `delete: false`, because assets are SOFT-deleted (PROJECT_BRIEF
+ * section 5 :147) and the app role is deliberately granted no `DELETE`. The
+ * append-only declaration implies both flags false; the converse does not hold.
+ */
+export interface AppWrites {
+  readonly update: boolean;
+  readonly delete: boolean;
+}
+
+/**
+ * Parent rows a fixture may build on, seeded by the MIGRATION role before the
+ * matrix runs — see `seedIsolationContext`.
+ *
+ * WHY THIS EXISTS (wrinkle 1). The matrix generates its tenant ids with
+ * `randomUUID()` and, until step 6, never created tenant rows to match. Nothing
+ * noticed, because the only table it had ever run against was a scratch table
+ * with no foreign keys. A real `tenant_id uuid REFERENCES public.tenants(id)`
+ * fails its very first seed with `23503`, and the fixture cannot fix that itself:
+ * the app role is `SELECT`-only on `tenants` (catalog assertion 9, DECISION B).
+ * So the privileged seeding happens once, up front, exactly as the bespoke
+ * membership suite has always done it.
+ */
+export interface IsolationSeedContext {
+  /** The tenant this row must belong to. */
+  readonly tenantId: string;
+  /** A real user, for `created_by`-style attribution FKs. Tenant-independent (ADR-006 section 2). */
+  readonly userId: string;
+  /** A real asset BELONGING TO `tenantId`, for child tables (ADR-007 composite FK). */
+  readonly assetId: string;
+}
+
+/**
  * Contract each tenant-scoped table must satisfy to be covered by the isolation
  * matrix. Factories are hand-written because foreign keys, enums and NOT NULL
  * columns make generic row construction impractical.
+ *
+ * `dependsOn` WAS RETIRED AT STEP 6 PHASE 1, deliberately and with the promise it
+ * came from restated rather than quietly dropped. ADR-004 said fixtures would
+ * "declare their FK dependencies so the harness can seed parents first (`tenants`
+ * -> `assets` -> `readings`)". Nothing ever read the field: the matrix is a
+ * `describe.each` over independent tables, so there is no point at which one
+ * fixture's output could be threaded into another's input. It was documentation
+ * shaped like code, which is worse than either.
+ *
+ * PARENT-FIRST SEEDING IS STILL PROVIDED — that part of the promise was real —
+ * but centrally, by `seedIsolationContext`, which creates the tenants, the user
+ * and one asset per tenant before any fixture runs. A child fixture reads its
+ * parent out of `IsolationSeedContext` instead of declaring a dependency it had
+ * no way to satisfy.
  */
 export interface IsolationFixture {
-  /** Tables whose rows must exist first, seeded in this order. */
-  readonly dependsOn?: readonly string[];
   /** Column carrying the tenant key. `tenants` keys on `id`; everything else on `tenant_id`. */
   readonly tenantColumn?: string;
-  /** Insert exactly one row belonging to `tenantId`. Returns its primary key. */
-  seed(client: PrismaClient, tenantId: string): Promise<string>;
+  /** Declared write capability. Must agree with `APPEND_ONLY_TABLES` (asserted). */
+  readonly appWrites: AppWrites;
+  /** Insert exactly one row belonging to `ctx.tenantId`, using the app role. */
+  seed(client: PrismaClient, ctx: IsolationSeedContext): Promise<void>;
 }
 
 /**
@@ -170,10 +256,101 @@ export interface IsolationFixture {
  * table set in BOTH directions, so a new table without a fixture fails the build
  * and a fixture for a dropped table does too.
  *
- * Empty at scaffold because no domain tables exist yet. Step 4 populates it as
- * tenants and users land — that is the gate, not a formality.
+ * EMPTY FROM SCAFFOLD UNTIL STEP 6 PHASE 1, which is when it stopped being a
+ * promise. `assets` and `asset_events` are the first two entries, and they are
+ * deliberately the two DIFFERENT WRITE SHAPES the domain contains — a mutable,
+ * soft-deleted table and an append-only one. A contract that had only ever met
+ * one shape would have been rewritten the moment the other arrived; v1.0 holds
+ * two more of each (`readings`, `audit_log`; `maintenance_records`).
  */
-export const ISOLATION_FIXTURES: Readonly<Record<string, IsolationFixture>> = {};
+export const ISOLATION_FIXTURES: Readonly<Record<string, IsolationFixture>> = {
+  assets: {
+    // Mutable, but NOT hard-deletable: soft delete is an UPDATE setting
+    // deleted_at, and the app role holds no DELETE grant at all. The matrix
+    // therefore proves the no-hard-delete property as a side effect.
+    appWrites: { update: true, delete: false },
+    async seed(client, ctx) {
+      await client.$executeRawUnsafe(
+        `INSERT INTO public.assets (tenant_id, serial_number, type, status)
+         VALUES ($1::uuid, $2, 'meter', 'installed')`,
+        ctx.tenantId,
+        `SN-${randomUUID()}`,
+      );
+    },
+  },
+
+  asset_events: {
+    // Append-only (PROJECT_BRIEF section 5 :137, declared in APPEND_ONLY_TABLES).
+    appWrites: { update: false, delete: false },
+    async seed(client, ctx) {
+      // asset_id and tenant_id are taken from the SAME context object, so this
+      // pair always agrees and the ADR-007 composite FK is satisfied. The
+      // deliberate MISMATCH — a valid asset from one tenant with another
+      // tenant's id — is a dedicated negative in isolation.spec.ts, asserted on
+      // 23503 and kept well away from the 42501 the RLS WITH CHECK raises.
+      await client.$executeRawUnsafe(
+        `INSERT INTO public.asset_events (tenant_id, asset_id, event_type, created_by)
+         VALUES ($1::uuid, $2::uuid, 'created', $3::uuid)`,
+        ctx.tenantId,
+        ctx.assetId,
+        ctx.userId,
+      );
+    },
+  },
+};
+
+/**
+ * Seeds the parent rows every FK-carrying fixture needs, AS THE MIGRATION ROLE,
+ * and returns a context per tenant. Closes wrinkle 1.
+ *
+ * Deletes the domain tables first so residue from a crashed run cannot survive
+ * into this one — and, more importantly, cannot leave `assets` rows pointing at
+ * tenants that a later suite tries to `DELETE FROM public.tenants`, which
+ * `ON DELETE RESTRICT` would refuse. Domain tables are exclusively this suite's
+ * at Phase 1; identity rows are removed by id in the caller's teardown.
+ */
+export async function seedIsolationContext(
+  migrator: PrismaClient,
+  tenantIds: readonly string[],
+  userId: string,
+): Promise<Record<string, IsolationSeedContext>> {
+  await execAll(migrator, ['DELETE FROM public.asset_events', 'DELETE FROM public.assets']);
+
+  const contexts: Record<string, IsolationSeedContext> = {};
+
+  for (const tenantId of tenantIds) {
+    await migrator.$executeRawUnsafe(
+      `INSERT INTO public.tenants (id, name) VALUES ($1::uuid, $2)
+       ON CONFLICT (id) DO NOTHING`,
+      tenantId,
+      `isolation-fixture-${tenantId.slice(0, 8)}`,
+    );
+
+    const rows = await migrator.$queryRawUnsafe<{ id: string }[]>(
+      `INSERT INTO public.assets (tenant_id, serial_number, type, status)
+       VALUES ($1::uuid, $2, 'meter', 'installed')
+       RETURNING id::text AS id`,
+      tenantId,
+      `PARENT-${tenantId.slice(0, 8)}`,
+    );
+    const assetId = rows[0]?.id;
+    if (!assetId) throw new Error(`failed to seed a parent asset for tenant ${tenantId}`);
+
+    contexts[tenantId] = { tenantId, userId, assetId };
+  }
+
+  return contexts;
+}
+
+/** Creates the attribution user the fixtures reference. Migration role: `users` is not app-writable. */
+export async function seedIsolationUser(migrator: PrismaClient, userId: string): Promise<void> {
+  await migrator.$executeRawUnsafe(
+    `INSERT INTO public.users (id, email, password_hash) VALUES ($1::uuid, $2, 'x')
+     ON CONFLICT (id) DO NOTHING`,
+    userId,
+    `isolation-${userId.slice(0, 8)}@example.test`,
+  );
+}
 
 /** Runs `body` with the request-scoped tenant context set, as the API does at runtime. */
 export async function withTenant<T>(
@@ -190,4 +367,46 @@ export async function withTenant<T>(
     }
     return body(tx as unknown as PrismaClient);
   });
+}
+
+/**
+ * The SQLSTATE and message Postgres actually raised, pulled out of the Prisma
+ * wrapper so a negative can assert the MECHANISM rather than a phrase.
+ *
+ * WHY BOTH HALVES ARE RETURNED, AND WHY ASSERTING ONE IS NOT ENOUGH. Measured
+ * against the live database at step 6 Phase 1:
+ *
+ *   RLS WITH CHECK rejection   -> 42501  "new row violates row-level security policy"
+ *   missing table privilege    -> 42501  "permission denied for table ..."
+ *   composite-FK mismatch      -> 23503  "violates foreign key constraint ..."
+ *
+ * THE FIRST TWO SHARE A SQLSTATE. `42501` is insufficient_privilege, and Postgres
+ * uses it for both "a policy refused this row" and "the role was never granted
+ * this command" — two entirely different mechanisms, one code. A negative
+ * asserting only `42501` therefore passes when the OTHER layer did the refusing,
+ * which is precisely the failure that made the step-5 RBAC gate untestable until
+ * the guard and the function body were given distinct error codes.
+ *
+ * So callers assert the pair. The SQLSTATE separates FK violations from
+ * privilege failures; the message separates policy from grant.
+ *
+ * Prisma surfaces raw-query failures as P2010 with the driver's code and message
+ * in `meta`, which is where both halves come from.
+ */
+export interface PgFailure {
+  readonly sqlstate: string;
+  readonly message: string;
+}
+
+export async function capturePgFailure(promise: Promise<unknown>): Promise<PgFailure> {
+  try {
+    await promise;
+  } catch (error) {
+    const meta = (error as { meta?: { code?: unknown; message?: unknown } }).meta;
+    return {
+      sqlstate: String(meta?.code ?? ''),
+      message: String(meta?.message ?? (error as { message?: unknown }).message ?? ''),
+    };
+  }
+  throw new Error('expected the statement to be rejected, but it succeeded');
 }

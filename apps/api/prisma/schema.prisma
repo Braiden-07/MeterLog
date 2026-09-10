@@ -24,6 +24,26 @@ enum MembershipRole {
   @@map("membership_role")
 }
 
+enum AssetStatus {
+  installed
+  active
+  maintenance
+  decommissioned
+
+  @@map("asset_status")
+}
+
+enum AssetEventType {
+  created
+  installed
+  activated
+  maintenance_started
+  maintenance_completed
+  decommissioned
+
+  @@map("asset_event_type")
+}
+
 model Tenant {
   id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   name      String
@@ -32,6 +52,8 @@ model Tenant {
   deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
 
   memberships Membership[]
+  assets      Asset[]
+  assetEvents AssetEvent[]
 
   @@map("tenants")
 }
@@ -46,6 +68,7 @@ model User {
   deletedAt    DateTime? @map("deleted_at") @db.Timestamptz(6)
 
   memberships Membership[]
+  assetEvents AssetEvent[]
 
   @@map("users")
 }
@@ -65,4 +88,51 @@ model Membership {
 
   @@index([tenantId], map: "memberships_tenant_id_idx")
   @@map("memberships")
+}
+
+/// First domain table (step 6). Mutable, soft-deleted.
+model Asset {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String      @map("tenant_id") @db.Uuid
+  serialNumber String      @map("serial_number")
+  type         String
+  status       AssetStatus @default(installed)
+  location     String?
+  installedAt  DateTime?   @map("installed_at") @db.Timestamptz(6)
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime    @default(now()) @map("updated_at") @db.Timestamptz(6)
+  deletedAt    DateTime?   @map("deleted_at") @db.Timestamptz(6)
+
+  tenant Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  events AssetEvent[]
+
+  /// The parent half of every child's composite FK (ADR-007). `id` is already
+  /// unique alone; this exists solely so a child can reference (id, tenant_id).
+  @@unique([id, tenantId], map: "assets_id_tenant_key")
+  @@index([tenantId], map: "assets_tenant_id_idx")
+  @@index([serialNumber], map: "assets_serial_number_idx")
+  @@map("assets")
+}
+
+/// APPEND-ONLY (declared in CLAUDE.md, mirrored by APPEND_ONLY_TABLES). No
+/// updated_at, no deleted_at, and the app role holds only SELECT, INSERT.
+model AssetEvent {
+  id        String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String         @map("tenant_id") @db.Uuid
+  assetId   String         @map("asset_id") @db.Uuid
+  eventType AssetEventType @map("event_type")
+  payload   Json           @default("{}")
+  createdBy String         @map("created_by") @db.Uuid
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  author User   @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+
+  /// ADR-007 composite FK: a child row whose tenant disagrees with its asset is
+  /// unrepresentable. Rejected as 23503, distinct from the RLS 42501.
+  asset Asset @relation(fields: [assetId, tenantId], references: [id, tenantId], onDelete: Restrict, map: "asset_events_asset_tenant_fkey")
+
+  @@index([tenantId], map: "asset_events_tenant_id_idx")
+  @@index([assetId, createdAt], map: "asset_events_asset_id_created_at_idx")
+  @@map("asset_events")
 }

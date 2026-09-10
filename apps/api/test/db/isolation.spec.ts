@@ -4,12 +4,17 @@ import type { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  APPEND_ONLY_TABLES,
   ISOLATION_BESPOKE_TABLES,
   ISOLATION_FIXTURES,
+  type IsolationSeedContext,
   RLS_EXEMPT_TABLES,
   appClient,
+  capturePgFailure,
   execAll,
   migratorClient,
+  seedIsolationContext,
+  seedIsolationUser,
   withTenant,
 } from './helpers';
 
@@ -32,16 +37,42 @@ import {
  */
 const PROBE_SCHEMA = 'iso_probe';
 
+// ONE tenant pair for the whole matrix, generated at module scope so the
+// privileged seeding below can create real rows for them before any fixture runs.
+// Sharing them across tables is safe — each fixture writes a different table.
+const TENANT_A = randomUUID();
+const TENANT_B = randomUUID();
+const FIXTURE_USER = randomUUID();
+
 describe('catalog-driven tenant isolation', () => {
   let app: PrismaClient;
   let migrator: PrismaClient;
+  let contexts: Record<string, IsolationSeedContext>;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     app = appClient();
     migrator = migratorClient();
+
+    // WRINKLE 1, CLOSED. Until step 6 the matrix invented tenant UUIDs and never
+    // created rows for them, which went unnoticed only because the sole table it
+    // had ever run against was a scratch table with no foreign keys. `assets`
+    // references `public.tenants`, and the app role is SELECT-only there, so the
+    // parents must be seeded by the MIGRATION role before anything else happens.
+    await seedIsolationUser(migrator, FIXTURE_USER);
+    contexts = await seedIsolationContext(migrator, [TENANT_A, TENANT_B], FIXTURE_USER);
   });
 
   afterAll(async () => {
+    // Domain rows first: `assets.tenant_id` is ON DELETE RESTRICT, so a leftover
+    // asset would make a later suite's `DELETE FROM public.tenants` fail with
+    // 23503 rather than a legible error about this suite.
+    await execAll(migrator, [
+      'DELETE FROM public.asset_events',
+      'DELETE FROM public.assets',
+      `DELETE FROM public.users WHERE id = '${FIXTURE_USER}'`,
+      `DELETE FROM public.tenants WHERE id = '${TENANT_A}'`,
+      `DELETE FROM public.tenants WHERE id = '${TENANT_B}'`,
+    ]);
     await app.$disconnect();
     await migrator.$disconnect();
   });
@@ -84,51 +115,139 @@ describe('catalog-driven tenant isolation', () => {
         `tables both exempted for bespoke handling and registered in the generic matrix: ${contradictory.join(', ')}`,
       ).toEqual([]);
     });
+
+    it('every fixture declares write capabilities consistent with APPEND_ONLY_TABLES', async () => {
+      // Binds the two DECLARATIONS to each other. Catalog assertion 13 binds
+      // APPEND_ONLY_TABLES to the actual grants; this binds it to what the matrix
+      // will assert. Without this pair, declaring a table append-only in one
+      // place and mutable in the other produces a suite that tests the wrong
+      // thing while staying green.
+      //
+      // The implication runs ONE WAY, deliberately: append-only means neither
+      // flag may be set, but the converse does not hold — `assets` is a mutable
+      // table that still declares `delete: false`, because it is soft-deleted and
+      // holds no DELETE grant.
+      const violations = Object.entries(ISOLATION_FIXTURES)
+        .filter(([table]) => APPEND_ONLY_TABLES.includes(table))
+        .filter(([, fixture]) => fixture.appWrites.update || fixture.appWrites.delete)
+        .map(([table]) => table);
+
+      expect(
+        violations,
+        `declared append-only but the fixture claims update/delete: ${violations.join(', ')}`,
+      ).toEqual([]);
+    });
+
+    it('every append-only table actually exists in the catalog', async () => {
+      // Stops APPEND_ONLY_TABLES rotting into a list of names that no longer mean
+      // anything — the same both-directions discipline the fixture registry has.
+      const rows = await app.$queryRawUnsafe<{ table_name: string }[]>(`
+        SELECT c.relname AS table_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'r'
+      `);
+      const present = rows.map((r) => r.table_name);
+      const phantom = APPEND_ONLY_TABLES.filter((t) => !present.includes(t));
+
+      expect(phantom, `declared append-only but no such table: ${phantom.join(', ')}`).toEqual([]);
+    });
   });
 
   /**
-   * The matrix, applied to every registered fixture. Generates nothing at
-   * scaffold — which is exactly why the self-test below exists.
+   * The matrix, applied to every registered fixture.
+   *
+   * FROM SCAFFOLD UNTIL STEP 6 PHASE 1 THIS GENERATED NOTHING — which is what the
+   * scratch-table self-test below exists to compensate for. It now generates
+   * against `assets` and `asset_events`: the two different WRITE SHAPES the
+   * domain contains, so the contract meets both before it is trusted.
    */
   describe.each(Object.entries(ISOLATION_FIXTURES))('%s', (tableName, fixture) => {
-    const tenantA = randomUUID();
-    const tenantB = randomUUID();
     const column = fixture.tenantColumn ?? 'tenant_id';
+    const ctxA = (): IsolationSeedContext => contexts[TENANT_A]!;
+    const ctxB = (): IsolationSeedContext => contexts[TENANT_B]!;
 
     it('a tenant cannot read another tenant rows', async () => {
-      await withTenant(app, tenantA, (tx) => fixture.seed(tx, tenantA));
-      await withTenant(app, tenantB, (tx) => fixture.seed(tx, tenantB));
+      await withTenant(app, TENANT_A, (tx) => fixture.seed(tx, ctxA()));
+      await withTenant(app, TENANT_B, (tx) => fixture.seed(tx, ctxB()));
 
-      const visible = await withTenant(app, tenantA, (tx) =>
+      const visible = await withTenant(app, TENANT_A, (tx) =>
         tx.$queryRawUnsafe<{ n: number }[]>(
           `SELECT count(*)::int AS n FROM public.${tableName} WHERE ${column} = $1::uuid`,
-          tenantB,
+          TENANT_B,
         ),
       );
       expect(visible[0]?.n).toBe(0);
     });
 
-    it('cross-tenant UPDATE and DELETE affect zero rows', async () => {
-      const updated = await withTenant(app, tenantA, (tx) =>
-        tx.$executeRawUnsafe(
-          `UPDATE public.${tableName} SET ${column} = ${column} WHERE ${column} = $1::uuid`,
-          tenantB,
-        ),
-      );
-      expect(updated).toBe(0);
+    // WRINKLE 3, CLOSED. The write cases branch on the fixture's DECLARED
+    // capability, never on `has_table_privilege` — reading the live grant would
+    // make the assertion agree with whatever the grant happens to be, which
+    // catches nothing. Where a write is declared, a cross-tenant attempt must
+    // report ZERO ROWS (the policy filtered it); where it is not, the statement
+    // must be REFUSED OUTRIGHT (the grant was never made).
+    it(
+      fixture.appWrites.update
+        ? 'cross-tenant UPDATE affects zero rows'
+        : 'UPDATE is refused outright — no such grant',
+      async () => {
+        const attempt = (): Promise<number> =>
+          withTenant(app, TENANT_A, (tx) =>
+            tx.$executeRawUnsafe(
+              `UPDATE public.${tableName} SET ${column} = ${column} WHERE ${column} = $1::uuid`,
+              TENANT_B,
+            ),
+          );
 
-      const deleted = await withTenant(app, tenantA, (tx) =>
-        tx.$executeRawUnsafe(`DELETE FROM public.${tableName} WHERE ${column} = $1::uuid`, tenantB),
-      );
-      expect(deleted).toBe(0);
-    });
+        if (fixture.appWrites.update) {
+          expect(await attempt()).toBe(0);
+        } else {
+          const failure = await capturePgFailure(attempt());
+          expect(failure.sqlstate).toBe('42501');
+          expect(failure.message).toMatch(/permission denied/i);
+        }
+      },
+    );
 
-    it('INSERT for a foreign tenant is rejected by WITH CHECK', async () => {
+    it(
+      fixture.appWrites.delete
+        ? 'cross-tenant DELETE affects zero rows'
+        : 'DELETE is refused outright — no such grant',
+      async () => {
+        const attempt = (): Promise<number> =>
+          withTenant(app, TENANT_A, (tx) =>
+            tx.$executeRawUnsafe(
+              `DELETE FROM public.${tableName} WHERE ${column} = $1::uuid`,
+              TENANT_B,
+            ),
+          );
+
+        if (fixture.appWrites.delete) {
+          expect(await attempt()).toBe(0);
+        } else {
+          const failure = await capturePgFailure(attempt());
+          expect(failure.sqlstate).toBe('42501');
+          expect(failure.message).toMatch(/permission denied/i);
+        }
+      },
+    );
+
+    it('INSERT for a foreign tenant is rejected by WITH CHECK (42501, policy)', async () => {
       // Catches a policy written with USING but no WITH CHECK — reads isolated,
       // writes not.
-      await expect(withTenant(app, tenantA, (tx) => fixture.seed(tx, tenantB))).rejects.toThrow(
-        /row-level security/i,
+      //
+      // ASSERTED ON SQLSTATE **AND** MESSAGE, and that is not belt-and-braces.
+      // Postgres raises 42501 both for "a policy refused this row" and for "this
+      // role holds no such privilege". A negative asserting the code alone would
+      // stay green if the policy vanished and a missing grant did the refusing
+      // instead — proving nothing about isolation. The message is what separates
+      // the two mechanisms.
+      const failure = await capturePgFailure(
+        withTenant(app, TENANT_A, (tx) => fixture.seed(tx, ctxB())),
       );
+      expect(failure.sqlstate).toBe('42501');
+      expect(failure.message).toMatch(/row-level security/i);
+      expect(failure.message).not.toMatch(/permission denied/i);
     });
 
     it('with no tenant context set, nothing is visible', async () => {
@@ -136,6 +255,88 @@ describe('catalog-driven tenant isolation', () => {
         tx.$queryRawUnsafe<{ n: number }[]>(`SELECT count(*)::int AS n FROM public.${tableName}`),
       );
       expect(visible[0]?.n).toBe(0);
+    });
+  });
+
+  /**
+   * The ADR-007 composite-FK consistency proof.
+   *
+   * Bespoke rather than generated, because it is a property of a CHILD table and
+   * the matrix has no notion of parentage — the fixture contract deliberately
+   * hands children a pre-built parent instead of modelling the relationship.
+   *
+   * The mechanism under test: `asset_events.tenant_id` is denormalized so its RLS
+   * policy can be the canonical single-column expression with no subquery. That
+   * denormalization is exactly what allows the two halves to disagree, and RLS
+   * CANNOT SEE THE DISAGREEMENT — the policy compares `tenant_id` to the GUC and
+   * that half is correct. The row would be perfectly isolated and attached to the
+   * wrong tenant's asset.
+   */
+  describe('composite FK (ADR-007) — a child cannot disagree with its parent', () => {
+    it('rejects a child row whose tenant differs from its asset (23503, not RLS)', async () => {
+      // Constructed so ONLY the FK can fire: acting in B, writing tenant_id = B,
+      // so the WITH CHECK is satisfied — but pointing at an asset owned by A.
+      // If this raised 42501 it would mean RLS stopped it and the FK went
+      // untested, which is why the SQLSTATE is asserted rather than "it threw".
+      const failure = await capturePgFailure(
+        withTenant(app, TENANT_B, (tx) =>
+          tx.$executeRawUnsafe(
+            `INSERT INTO public.asset_events (tenant_id, asset_id, event_type, created_by)
+             VALUES ($1::uuid, $2::uuid, 'created', $3::uuid)`,
+            TENANT_B,
+            contexts[TENANT_A]!.assetId,
+            FIXTURE_USER,
+          ),
+        ),
+      );
+
+      expect(failure.sqlstate).toBe('23503');
+      expect(failure.message).toMatch(/asset_events_asset_tenant_fkey/);
+      // Distinctly NOT the RLS rejection — two mechanisms, two assertions.
+      expect(failure.message).not.toMatch(/row-level security/i);
+    });
+
+    it('accepts a child row whose tenant agrees with its asset', async () => {
+      // The non-vacuous half. Without it, a constraint that rejected EVERYTHING
+      // would satisfy the negative above and nobody would notice.
+      const before = await withTenant(app, TENANT_A, (tx) =>
+        tx.$queryRawUnsafe<{ n: number }[]>(`SELECT count(*)::int AS n FROM public.asset_events`),
+      );
+
+      await withTenant(app, TENANT_A, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO public.asset_events (tenant_id, asset_id, event_type, created_by)
+           VALUES ($1::uuid, $2::uuid, 'created', $3::uuid)`,
+          TENANT_A,
+          contexts[TENANT_A]!.assetId,
+          FIXTURE_USER,
+        ),
+      );
+
+      const after = await withTenant(app, TENANT_A, (tx) =>
+        tx.$queryRawUnsafe<{ n: number }[]>(`SELECT count(*)::int AS n FROM public.asset_events`),
+      );
+      expect(after[0]!.n).toBe(before[0]!.n + 1);
+    });
+
+    it('the migration role cannot write a mismatched child either', async () => {
+      // The property ADR-007 chose a constraint FOR. RLS protects nothing here —
+      // the migration role is not subject to these policies at all — so if this
+      // were enforced in a policy, or in application code, or in a trigger that
+      // someone disabled, a privileged path would write the inconsistent row.
+      // A constraint holds against every role and every connection.
+      const failure = await capturePgFailure(
+        migrator.$executeRawUnsafe(
+          `INSERT INTO public.asset_events (tenant_id, asset_id, event_type, created_by)
+           VALUES ($1::uuid, $2::uuid, 'created', $3::uuid)`,
+          TENANT_B,
+          contexts[TENANT_A]!.assetId,
+          FIXTURE_USER,
+        ),
+      );
+
+      expect(failure.sqlstate).toBe('23503');
+      expect(failure.message).toMatch(/asset_events_asset_tenant_fkey/);
     });
   });
 

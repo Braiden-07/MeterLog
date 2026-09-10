@@ -6,13 +6,84 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). **Step 5 (RBAC + membership management) COMPLETE across all three phases, pending final gate review** — the definer write functions with §7 body-level authorization (PR #2), the RBAC gate and role-gated endpoints (PR #3), and the cross-layer mutation sweep plus revocation-on-next-request driven by a real revoke (this PR). **Step 6 (domain entities — assets/readings) is next**, and is where the catalog-driven isolation matrix stops generating zero cases.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phase 1 complete: `assets` + `asset_events`, and the catalog-driven isolation matrix now generates REAL cases (0 -> 10).** Phase 2 is `readings`; Phase 3 the API surface and event wiring; Phase 4 / 6b `maintenance_records` (slippable).
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-10 — Step 6 Phase 1: assets + asset_events, and the isolation harness made real (§11 step 6)
+
+**Scope decided before building.** All four brief domain tables are in v1.0 (`assets`, `asset_events`, `readings`, `maintenance_records`). Phase 1 deliberately lands the **two different write shapes at once** — `assets` mutable, `asset_events` append-only — because a fixture contract that had only ever met one shape would need rework the moment the other arrived, and v1.0 holds two more of each.
+
+**THE HEADLINE — the generic matrix went from zero cases to ten.**
+
+Built at step 4 and self-tested against a scratch table ever since, the catalog-driven matrix had generated **zero cases against real tables** for two whole build steps: `tenants`, `users` and `memberships` are all registered bespoke, because the app role cannot write any of them. `assets` and `asset_events` are the first tables it genuinely can.
+
+|                           | before | after                                     |
+| ------------------------- | ------ | ----------------------------------------- |
+| generated matrix cases    | **0**  | **10** (5 × `assets`, 5 × `asset_events`) |
+| `isolation.spec.ts` total | 6      | 21                                        |
+| suite total               | 150    | **166**                                   |
+
+**Three records, made before any code (all decisions were the author's; none were filled silently).**
+
+- **ADR-007 — child-table tenant consistency by composite FK.** `assets` carries `UNIQUE (id, tenant_id)`; children carry `FOREIGN KEY (asset_id, tenant_id) REFERENCES assets (id, tenant_id)`. Declarative and always-on: it holds against the app role, the migration role, any future definer function and psql. A trigger is procedural code in the write path needing its own reachability proof; a `CHECK` cannot reference another table. **Consequence recorded explicitly:** an asset's `tenant_id` is effectively immutable once it has children — correct, because assets do not move between tenants.
+- **ARCHITECTURE §9.1 — the domain RBAC matrix.** Create and update at admin **and** technician; soft-delete admin-only; reads for all three roles; auditor read-only throughout. The one genuinely open cell resolved: `POST /assets` is admin **and** technician, because registering an asset being installed is field work, and the destructive act is decommissioning. **Recorded now, enforced at Phase 3** — and enforced at the endpoint, never in a policy: no domain policy carries a role term (DECISION B).
+- **CLAUDE.md — the append-only declaration.** `asset_events` is its first explicit member, cross-referenced to the brief. The brief states the property outright for `asset_events` (:137) and `audit_log` (:140) but **never for `readings` (:138)**, where it exists only by omission via :146. Implicit-by-omission is the shape of this repo's two worst bugs, so the property is now declared per-table and enforced in three places rather than inferred from which column is absent.
+
+**The migration.** `assets` (brief §5 fields, soft delete, canonical policy with `WITH CHECK` written out in full, grants `SELECT, INSERT, UPDATE` and **no `DELETE`** so a hard delete is impossible for the runtime role, brief indexes, plus `UNIQUE (id, tenant_id)`); `asset_events` (append-only, grants `SELECT, INSERT` only, canonical policy, and the ADR-007 composite FK). No `TO meterlog_definer` policy on either — assertion 5 allowlists the three identity tables only.
+
+**The harness — all three wrinkles closed, and each proven closed by a mutation.**
+
+1. **Migrator-seeded tenant hook (wrinkle 1).** The matrix generated tenant ids with `randomUUID()` and never created rows for them. That went unnoticed for two steps only because the sole table it ran against was a scratch table with no foreign keys; `assets.tenant_id REFERENCES tenants(id)` fails its first seed with `23503`, and the fixture cannot fix it (the app role is `SELECT`-only on `tenants`). `seedIsolationContext` now seeds tenants, a user and one parent asset per tenant as the migration role. **M7 proves it is load-bearing:** remove the hook and the entire file aborts in `beforeAll` with `23503` on `assets_tenant_id_fkey`, 21 tests skipped.
+2. **`dependsOn` RETIRED, explicitly.** ADR-004 promised fixtures would "declare their FK dependencies so the harness can seed parents first". **Nothing ever read the field** — the matrix is a `describe.each` over independent tables, so there was no point at which one fixture's output could become another's input. It was documentation shaped like code. The _parent-first seeding_ half of that promise was real and is now delivered centrally by `seedIsolationContext`; children read their parent out of `IsolationSeedContext` instead of declaring a dependency nothing could satisfy.
+3. **`appWrites` — declared, never derived.** Read from an explicit per-fixture declaration, not `has_table_privilege`, which would make the assertion agree with whatever the grant happens to be and catch nothing. Matrix case 2 asserts zero-rows-affected where a write is declared and outright refusal where it is not. **Note it is not simply "is it append-only":** `assets` is mutable and still declares `delete: false`, because it is soft-deleted and holds no `DELETE` grant — so the matrix proves the no-hard-delete property as a side effect. **Catalog assertion 13** binds the declaration to the grant: an append-only table must hold **exactly** `SELECT, INSERT`.
+
+**A finding that changed the assertions: RLS rejection and missing-grant rejection SHARE SQLSTATE `42501`.** Measured live, not assumed:
+
+| rejection               | SQLSTATE | message                                                          |
+| ----------------------- | -------- | ---------------------------------------------------------------- |
+| RLS `WITH CHECK`        | `42501`  | `new row violates row-level security policy`                     |
+| missing table privilege | `42501`  | `permission denied for table ...`                                |
+| composite-FK mismatch   | `23503`  | `violates foreign key constraint asset_events_asset_tenant_fkey` |
+
+Postgres uses `insufficient_privilege` for both "a policy refused this row" and "this role was never granted this command" — two mechanisms, one code. A negative asserting only `42501` stays green when the _other_ layer does the refusing, which is the same trap that made the step-5 RBAC gate untestable until the guard and the function body were given distinct codes. So `capturePgFailure` returns **both halves** and every negative asserts the pair; the FK negative additionally asserts it is **not** the RLS message.
+
+**The mutation sweep — 7 mutations, 6 caught, 1 declared equivalent with reasoning.**
+
+| #   | mutation                                                      | result                                                                                             |
+| --- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| M1  | `assets` policy `WITH CHECK (true)`                           | **caught** — 1 test (foreign-tenant INSERT no longer rejected)                                     |
+| M1b | `WITH CHECK` omitted entirely from the `FOR ALL` policy       | **GREEN — equivalent mutant, declared** (see below)                                                |
+| M2  | `NULLIF` dropped from the `assets` policy                     | **caught twice** — catalog assertion 8 (structural) _and_ a behavioural `22P02` in the matrix      |
+| M3  | `assets` policy keyed on `true`                               | **caught** — 4 tests (read isolation, cross-tenant UPDATE, INSERT rejection, fail-closed baseline) |
+| M4  | composite FK dropped                                          | **caught** — both ADR-007 negatives (app role and migration role)                                  |
+| M5  | `GRANT UPDATE ON asset_events` — the one-line silent widening | **caught twice** — catalog assertion 13 _and_ the matrix's append-only case                        |
+| M6  | append-only declaration flipped (`appWrites.update = true`)   | **caught** — the fixture/declaration agreement check _and_ the matrix UPDATE case                  |
+| M7  | migrator tenant-seeding hook removed                          | **caught** — whole file aborts, `23503`, wrinkle 1 reproduced exactly                              |
+
+**M1b is an honest equivalent mutant, not an escaper waved through.** Omitting `WITH CHECK` from a `FOR ALL` policy is genuinely equivalent, because Postgres defaults it to the `USING` expression — the behaviour ADR-004 documents. No test can distinguish them, and none should. **The clause is still written out in full**, for the reason ADR-004 gives: the implicit coupling means any future narrowing of `USING` would silently narrow write permission too. The mutation that removes real protection is `WITH CHECK (true)`, which is M1, and M1 is caught.
+
+All mutations reverted; policies, grants and the constraint byte-verified against the catalog afterwards (both policy clauses carrying the canonical `NULLIF` expression, `assets` at `SELECT, INSERT, UPDATE`, `asset_events` at `SELECT, INSERT`, the composite FK present).
+
+**166 tests green, twice in a row** (the second run confirms teardown is idempotent — domain rows are removed before the identity rows they reference, so a later suite's blanket `DELETE FROM public.tenants` cannot hit `ON DELETE RESTRICT`). Lint, typecheck, build and format clean.
+
+**Deliberate gaps, surfaced rather than filled silently**
+
+- **`assets.serial_number` is a PLAIN index, not unique.** The brief says "index" (:148) and never says unique, nor what uniqueness would be scoped to. Making it unique-per-tenant here would decide something the author has not. Left for the Phase 3 API review.
+- **`asset_event_type` enum values are not in the brief**, which says only `event_type (enum)` (:137). The six values are _derived_ from the specified status enum — one per transition into a specified status, plus `created` — rather than invented wholesale. Flagged for review in case the author wants a different vocabulary before Phase 3 wires emissions.
+- **`created_by` is not indexed** on `asset_events`, a deliberate deviation from the brief's "index foreign keys": no query filters on it, and there is no endpoint for "events by user". Add it when one exists.
+
+**Not in Phase 1 (boundary held):** no `readings`, no API or event-emission wiring, no `maintenance_records`, and **no refresh of `ISOLATION.md` / `README.md` / `PORTFOLIO.md`** — retiring their "domain isolation is step 6" caveats is a later turn against a merged step 6, not this phase's work. Those three documents still describe the fixture registry as empty, which is now **stale, and knowingly so**.
+
+**Next**
+
+- Phase 2 — `readings`, reusing the now-proven composite-FK and append-only patterns. `readings` joins `APPEND_ONLY_TABLES` and the consistency proof extends to a second child.
+
+---
 
 ### 2026-09-09 — Step 5 Phase 3: the cross-layer sweep, the real-revoke proof, and Step 5 closeout (§11 step 5)
 
