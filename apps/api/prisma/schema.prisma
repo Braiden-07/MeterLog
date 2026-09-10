@@ -54,6 +54,7 @@ model Tenant {
   memberships Membership[]
   assets      Asset[]
   assetEvents AssetEvent[]
+  readings    Reading[]
 
   @@map("tenants")
 }
@@ -69,6 +70,7 @@ model User {
 
   memberships Membership[]
   assetEvents AssetEvent[]
+  readings    Reading[]
 
   @@map("users")
 }
@@ -110,8 +112,9 @@ model Asset {
   updatedAt    DateTime    @default(now()) @map("updated_at") @db.Timestamptz(6)
   deletedAt    DateTime?   @map("deleted_at") @db.Timestamptz(6)
 
-  tenant Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  events AssetEvent[]
+  tenant   Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  events   AssetEvent[]
+  readings Reading[]
 
   /// The parent half of every child's composite FK (ADR-007). `id` is already
   /// unique alone; this exists solely so a child can reference (id, tenant_id).
@@ -141,4 +144,35 @@ model AssetEvent {
   @@index([tenantId], map: "asset_events_tenant_id_idx")
   @@index([assetId, createdAt], map: "asset_events_asset_id_created_at_idx")
   @@map("asset_events")
+}
+
+/// APPEND-ONLY, and the dangerous kind: PROJECT_BRIEF never SAYS so (:138) — the
+/// property follows only from :146 plus the absence of updated_at/deleted_at. Its
+/// authority is the declaration in CLAUDE.md, mirrored by APPEND_ONLY_TABLES and
+/// bound to the grant by catalog assertion 13. Do NOT add updated_at.
+///
+/// A LEAF: no `@@unique([id, tenantId])`. That composite exists on Asset only as
+/// the parent half of a child's FK, and nothing is a child of a reading.
+model Reading {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  assetId   String   @map("asset_id") @db.Uuid
+  value     Decimal  @db.Decimal
+  unit      String
+  /// Domain time — when the reading was taken. Caller-supplied, no default.
+  readAt    DateTime @map("read_at") @db.Timestamptz(6)
+  createdBy String   @map("created_by") @db.Uuid
+  /// Server time — when the row was inserted. Deliberately distinct from readAt.
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  author User   @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+
+  /// ADR-007 composite FK, second child. A reading whose tenant disagrees with its
+  /// asset is unrepresentable. Rejected as 23503, distinct from the RLS 42501.
+  asset Asset @relation(fields: [assetId, tenantId], references: [id, tenantId], onDelete: Restrict, map: "readings_asset_tenant_fkey")
+
+  @@index([tenantId], map: "readings_tenant_id_idx")
+  @@index([assetId, readAt], map: "readings_asset_id_read_at_idx")
+  @@map("readings")
 }
