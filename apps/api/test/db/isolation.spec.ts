@@ -341,6 +341,153 @@ describe('catalog-driven tenant isolation', () => {
   });
 
   /**
+   * `assets_tenant_serial_live_key` — serial numbers are unique PER TENANT and
+   * only AMONG LIVE ROWS (decided at the Phase 1 gate).
+   *
+   * Directly follows the `memberships_user_tenant_live_key` precedent (ADR-006
+   * §2): the partial `WHERE deleted_at IS NULL` is what stops a decommissioned
+   * serial from reserving itself forever, exactly as a revoked membership must not
+   * block re-invitation.
+   *
+   * All three properties are proven, because each one fails differently: drop the
+   * uniqueness and duplicates appear; drop the `tenant_id` column from the key and
+   * tenants collide with each other; drop the `WHERE` and re-registration breaks.
+   * A single test could not distinguish those.
+   */
+  describe('serial numbers — unique per tenant, among live rows', () => {
+    const insertAsset = (tenantId: string, serial: string): Promise<number> =>
+      withTenant(app, tenantId, (tx) =>
+        tx.$executeRawUnsafe(
+          `INSERT INTO public.assets (tenant_id, serial_number, type, status)
+           VALUES ($1::uuid, $2, 'meter', 'installed')`,
+          tenantId,
+          serial,
+        ),
+      );
+
+    it('pins the index by name, columns and partial predicate', async () => {
+      // WHY THIS EXISTS, and it is a real limitation rather than belt-and-braces.
+      //
+      // The other negatives in this file assert SQLSTATE **and** message, because
+      // the message is what separates two mechanisms sharing a code. That is not
+      // available for unique violations: PRISMA NORMALISES THEM AND DISCARDS THE
+      // CONSTRAINT NAME. Measured on this database:
+      //
+      //   app role (Prisma engine)  23505  "Unique constraint failed: "   <- empty
+      //   migration role            23505  "Key (tenant_id, serial_number)=(...)"
+      //
+      // So `assets_tenant_serial_live_key` cannot be asserted from the app-role
+      // error at all. Rather than weaken the negative below to a bare code — which
+      // ANY unique constraint on the table would satisfy, including the
+      // `(id, tenant_id)` key that exists for an entirely different reason — the
+      // name and shape are pinned structurally here, and the negative asserts the
+      // mechanism. Together they are what the message match would have given.
+      const rows = await app.$queryRawUnsafe<{ indexdef: string }[]>(
+        `SELECT indexdef FROM pg_indexes
+          WHERE schemaname = 'public' AND tablename = 'assets'
+            AND indexname = 'assets_tenant_serial_live_key'`,
+      );
+
+      expect(rows, 'assets_tenant_serial_live_key is missing').toHaveLength(1);
+      expect(rows[0]!.indexdef).toMatch(/UNIQUE/);
+      expect(rows[0]!.indexdef).toMatch(/\(tenant_id, serial_number\)/);
+      // The partial predicate is the load-bearing half — without it, re-registering
+      // a decommissioned serial breaks. Pinned so removing it cannot pass silently.
+      expect(rows[0]!.indexdef).toMatch(/WHERE \(deleted_at IS NULL\)/);
+    });
+
+    it('rejects a duplicate live serial in the same tenant (23505, not RLS)', async () => {
+      const serial = `DUP-${randomUUID()}`;
+      await insertAsset(TENANT_A, serial);
+
+      const failure = await capturePgFailure(insertAsset(TENANT_A, serial));
+
+      // 23505 is unique_violation, and is kept distinct from the other two
+      // mechanisms this suite exercises: 23503 (the ADR-007 composite FK) and
+      // 42501 (RLS policy / missing privilege). The `.not` guards are what stop
+      // this passing because some unrelated layer refused the row.
+      expect(failure.sqlstate).toBe('23505');
+      expect(failure.message).not.toMatch(/row-level security/i);
+      expect(failure.message).not.toMatch(/permission denied/i);
+    });
+
+    it('names the violated columns when raised outside the Prisma normaliser', async () => {
+      // The other half of the name-pinning problem. The migration role reaches the
+      // same constraint without the query engine rewriting the error, so the
+      // COLUMN PAIR is recoverable there even though the index name is not
+      // recoverable anywhere. This is what proves the duplicate above was refused
+      // by the (tenant_id, serial_number) key specifically and not by the
+      // (id, tenant_id) key or the primary key.
+      const serial = `DUPRAW-${randomUUID()}`;
+      await insertAsset(TENANT_A, serial);
+
+      const failure = await capturePgFailure(
+        migrator.$executeRawUnsafe(
+          `INSERT INTO public.assets (tenant_id, serial_number, type, status)
+           VALUES ($1::uuid, $2, 'meter', 'installed')`,
+          TENANT_A,
+          serial,
+        ),
+      );
+
+      expect(failure.sqlstate).toBe('23505');
+      expect(failure.message).toMatch(/tenant_id, serial_number/);
+    });
+
+    it('accepts the same serial in a DIFFERENT tenant', async () => {
+      // The uniqueness is per tenant, not global. Without `tenant_id` in the key,
+      // one tenant registering a meter would block another tenant from
+      // registering its own — a cross-tenant interference channel that leaks the
+      // existence of another tenant's data through an error message, which is a
+      // worse failure than the inconvenience.
+      const serial = `SHARED-${randomUUID()}`;
+      await insertAsset(TENANT_A, serial);
+      await insertAsset(TENANT_B, serial);
+
+      const inB = await withTenant(app, TENANT_B, (tx) =>
+        tx.$queryRawUnsafe<{ n: number }[]>(
+          `SELECT count(*)::int AS n FROM public.assets WHERE serial_number = $1`,
+          serial,
+        ),
+      );
+      expect(inB[0]!.n).toBe(1);
+    });
+
+    it('accepts re-registering the serial of a SOFT-DELETED asset', async () => {
+      // The property the partial WHERE exists for. Decommissioning an asset must
+      // not permanently consume its serial number.
+      const serial = `REREG-${randomUUID()}`;
+      await insertAsset(TENANT_A, serial);
+
+      const softDeleted = await withTenant(app, TENANT_A, (tx) =>
+        tx.$executeRawUnsafe(
+          `UPDATE public.assets SET deleted_at = now()
+            WHERE tenant_id = $1::uuid AND serial_number = $2`,
+          TENANT_A,
+          serial,
+        ),
+      );
+      expect(softDeleted).toBe(1);
+
+      // The re-registration itself. With a PLAIN unique index this raises 23505.
+      await insertAsset(TENANT_A, serial);
+
+      const rows = await withTenant(app, TENANT_A, (tx) =>
+        tx.$queryRawUnsafe<{ live: number; total: number }[]>(
+          `SELECT count(*) FILTER (WHERE deleted_at IS NULL)::int AS live,
+                  count(*)::int AS total
+             FROM public.assets WHERE serial_number = $1`,
+          serial,
+        ),
+      );
+      // Exactly one LIVE row, and the decommissioned one still on record — the
+      // history is kept, which is the entire point of soft delete here.
+      expect(rows[0]!.live).toBe(1);
+      expect(rows[0]!.total).toBe(2);
+    });
+  });
+
+  /**
    * Self-test of the matrix logic against a scratch tenant-scoped table.
    *
    * Without this the matrix would ship as unexercised code that first runs in

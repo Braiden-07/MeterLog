@@ -38,14 +38,22 @@ CREATE TYPE public.asset_status AS ENUM (
 
 -- NOT specified by the brief, which says only `event_type (enum)` (:137). These
 -- values are derived from the status enum above rather than invented: each names
--- a transition INTO one of the four specified statuses, plus 'created' for the
--- asset's first appearance. Phase 3 wires status transitions to emit these
--- atomically; Phase 1 only creates the table.
+-- a transition INTO one of the four specified statuses, plus 'created' for row
+-- genesis. Phase 3 wires the emissions; Phase 1 only creates the table.
 --   installed             -> status 'installed'
 --   activated             -> status 'active'
 --   maintenance_started   -> status 'maintenance'
 --   maintenance_completed -> status 'active'
 --   decommissioned        -> status 'decommissioned'
+--
+-- THE EMISSION CONTRACT IS RECORDED IN ARCHITECTURE §9.2 — read it before wiring
+-- anything. Two points that are not inferable from the values above:
+--   * registering an asset emits BOTH 'created' AND 'installed', because every
+--     status an asset has held must have an event that put it there, or the log
+--     cannot be replayed to reconstruct status at a past time;
+--   * the enum encodes TRANSITIONS, not STATES — 'activated' and
+--     'maintenance_completed' both land on status 'active', so event_type is NOT
+--     a function of the resulting status and a lookup table keyed on it is wrong.
 CREATE TYPE public.asset_event_type AS ENUM (
   'created',
   'installed',
@@ -91,16 +99,45 @@ ALTER TABLE public.assets
 
 -- Every RLS-filtered read compares tenant_id; assets_id_tenant_key leads with
 -- `id` and so does not serve that. Also the brief's "index foreign keys" (:148).
+--
+-- NOT made redundant by assets_tenant_serial_live_key below, which also leads with
+-- tenant_id: that one is PARTIAL (`WHERE deleted_at IS NULL`), so it cannot serve
+-- a query that must see soft-deleted rows — including the RLS policy check on the
+-- UPDATE that PERFORMS a soft delete, and any admin view of decommissioned assets.
+-- This index covers tenant_id across ALL rows; keep both.
 CREATE INDEX assets_tenant_id_idx ON public.assets (tenant_id);
 
--- PROJECT_BRIEF §5 (:148) — "index assets.serial_number".
+-- PROJECT_BRIEF §5 (:148) — "index assets.serial_number", decided at the Phase 1
+-- gate as UNIQUE PER TENANT AMONG LIVE ROWS.
 --
--- Deliberately a PLAIN index, not a unique one. The brief says index; it does not
--- say unique, and it does not say what serial-number uniqueness would even be
--- scoped to. Making it unique-per-tenant here would be filling a gap the author
--- has not decided, and the citext lockout (ADR-004's operator amendment) is what
--- an unreviewed uniqueness constraint can cost. Left for the Phase 3 API review.
-CREATE INDEX assets_serial_number_idx ON public.assets (serial_number);
+-- Directly follows the `memberships_user_tenant_live_key` precedent (ADR-006 §2),
+-- because the case is the precise analogue: a serial number that has been
+-- decommissioned must not permanently reserve itself, exactly as a revoked
+-- membership must not block re-invitation. Partial on `deleted_at IS NULL` is what
+-- makes re-registration after decommissioning possible.
+--
+-- THIS INDEX ALSO SERVES EVERY SERIAL LOOKUP, so there is deliberately no separate
+-- plain index on `serial_number`. Every lookup is tenant-scoped in practice — RLS
+-- guarantees a query can only ever see one tenant's rows — so `(tenant_id,
+-- serial_number)` is hit on its leading column by the tenant predicate and on both
+-- by a serial search. A second index would be write cost for nothing, the same
+-- reasoning that rejected a `memberships(user_id)` index in ADR-006 §2.
+--
+-- HONEST LIMITATION: `WHERE deleted_at IS NULL` means this index does NOT serve
+-- lookups of DECOMMISSIONED assets by serial. That matches the brief's default
+-- query shape — "queries filter out soft-deleted rows by default" (:147) — so the
+-- common path is covered. If "what happened to serial X" across decommissioned
+-- assets ever becomes a real journey, that is a separate index decision, not a
+-- reason to widen this one and lose the re-registration property.
+--
+-- WHY NOW RATHER THAN LATER, which is the whole reason this was worth deciding at
+-- the gate: a unique index can only be created if the existing data already
+-- satisfies it. Today the table is empty and the statement cannot fail. After
+-- step 10 the same change is a reconcile-live-duplicates migration that can fail
+-- against production data at an inconvenient hour. The cost is flat now and rises
+-- monotonically from here.
+CREATE UNIQUE INDEX assets_tenant_serial_live_key
+  ON public.assets (tenant_id, serial_number) WHERE deleted_at IS NULL;
 
 ALTER TABLE public.assets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.assets FORCE  ROW LEVEL SECURITY;
@@ -144,6 +181,11 @@ CREATE TABLE public.asset_events (
   asset_id   uuid NOT NULL,
   event_type public.asset_event_type NOT NULL,
   payload    jsonb NOT NULL DEFAULT '{}'::jsonb,
+  -- Deliberately NOT indexed, a departure from the brief's "index foreign keys"
+  -- (:148): nothing queries events by actor, and the unindexed-FK penalty falls on
+  -- PARENT DELETES, which cannot happen here — the reference is ON DELETE RESTRICT
+  -- and identity rows are soft-deleted, never removed. Same judgment as the
+  -- rejected memberships(user_id) index (ADR-006 §2); write cost for nothing.
   created_by uuid NOT NULL REFERENCES public.users(id) ON DELETE RESTRICT,
   created_at timestamptz NOT NULL DEFAULT now(),
 

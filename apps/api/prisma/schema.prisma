@@ -91,6 +91,13 @@ model Membership {
 }
 
 /// First domain table (step 6). Mutable, soft-deleted.
+///
+/// `serial_number` is UNIQUE PER TENANT AMONG LIVE ROWS, enforced by
+/// `assets_tenant_serial_live_key` — a PARTIAL unique index that lives only in
+/// migration SQL. Prisma cannot express a `WHERE` clause on an index, so it is
+/// absent here exactly as `memberships_user_tenant_live_key` is absent from the
+/// Membership model. Do not "restore" it as a plain `@@unique`: that would make
+/// a decommissioned serial permanently unusable.
 model Asset {
   id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenantId     String      @map("tenant_id") @db.Uuid
@@ -110,7 +117,6 @@ model Asset {
   /// unique alone; this exists solely so a child can reference (id, tenant_id).
   @@unique([id, tenantId], map: "assets_id_tenant_key")
   @@index([tenantId], map: "assets_tenant_id_idx")
-  @@index([serialNumber], map: "assets_serial_number_idx")
   @@map("assets")
 }
 

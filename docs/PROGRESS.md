@@ -52,30 +52,42 @@ Built at step 4 and self-tested against a scratch table ever since, the catalog-
 
 Postgres uses `insufficient_privilege` for both "a policy refused this row" and "this role was never granted this command" — two mechanisms, one code. A negative asserting only `42501` stays green when the _other_ layer does the refusing, which is the same trap that made the step-5 RBAC gate untestable until the guard and the function body were given distinct codes. So `capturePgFailure` returns **both halves** and every negative asserts the pair; the FK negative additionally asserts it is **not** the RLS message.
 
-**The mutation sweep — 7 mutations, 6 caught, 1 declared equivalent with reasoning.**
+**The mutation sweep — 8 mutations, 7 caught, 1 declared equivalent with reasoning.**
 
-| #   | mutation                                                      | result                                                                                             |
-| --- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| M1  | `assets` policy `WITH CHECK (true)`                           | **caught** — 1 test (foreign-tenant INSERT no longer rejected)                                     |
-| M1b | `WITH CHECK` omitted entirely from the `FOR ALL` policy       | **GREEN — equivalent mutant, declared** (see below)                                                |
-| M2  | `NULLIF` dropped from the `assets` policy                     | **caught twice** — catalog assertion 8 (structural) _and_ a behavioural `22P02` in the matrix      |
-| M3  | `assets` policy keyed on `true`                               | **caught** — 4 tests (read isolation, cross-tenant UPDATE, INSERT rejection, fail-closed baseline) |
-| M4  | composite FK dropped                                          | **caught** — both ADR-007 negatives (app role and migration role)                                  |
-| M5  | `GRANT UPDATE ON asset_events` — the one-line silent widening | **caught twice** — catalog assertion 13 _and_ the matrix's append-only case                        |
-| M6  | append-only declaration flipped (`appWrites.update = true`)   | **caught** — the fixture/declaration agreement check _and_ the matrix UPDATE case                  |
-| M7  | migrator tenant-seeding hook removed                          | **caught** — whole file aborts, `23503`, wrinkle 1 reproduced exactly                              |
+| #   | mutation                                                         | result                                                                                             |
+| --- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| M1  | `assets` policy `WITH CHECK (true)`                              | **caught** — 1 test (foreign-tenant INSERT no longer rejected)                                     |
+| M1b | `WITH CHECK` omitted entirely from the `FOR ALL` policy          | **GREEN — equivalent mutant, declared** (see below)                                                |
+| M2  | `NULLIF` dropped from the `assets` policy                        | **caught twice** — catalog assertion 8 (structural) _and_ a behavioural `22P02` in the matrix      |
+| M3  | `assets` policy keyed on `true`                                  | **caught** — 4 tests (read isolation, cross-tenant UPDATE, INSERT rejection, fail-closed baseline) |
+| M4  | composite FK dropped                                             | **caught** — both ADR-007 negatives (app role and migration role)                                  |
+| M5  | `GRANT UPDATE ON asset_events` — the one-line silent widening    | **caught twice** — catalog assertion 13 _and_ the matrix's append-only case                        |
+| M6  | append-only declaration flipped (`appWrites.update = true`)      | **caught** — the fixture/declaration agreement check _and_ the matrix UPDATE case                  |
+| M7  | migrator tenant-seeding hook removed                             | **caught** — whole file aborts, `23503`, wrinkle 1 reproduced exactly                              |
+| M8  | partial `WHERE deleted_at IS NULL` dropped from the serial index | **caught twice** — the structural index pin _and_ the re-registration positive (`23505`)           |
 
 **M1b is an honest equivalent mutant, not an escaper waved through.** Omitting `WITH CHECK` from a `FOR ALL` policy is genuinely equivalent, because Postgres defaults it to the `USING` expression — the behaviour ADR-004 documents. No test can distinguish them, and none should. **The clause is still written out in full**, for the reason ADR-004 gives: the implicit coupling means any future narrowing of `USING` would silently narrow write permission too. The mutation that removes real protection is `WITH CHECK (true)`, which is M1, and M1 is caught.
 
 All mutations reverted; policies, grants and the constraint byte-verified against the catalog afterwards (both policy clauses carrying the canonical `NULLIF` expression, `assets` at `SELECT, INSERT, UPDATE`, `asset_events` at `SELECT, INSERT`, the composite FK present).
 
-**166 tests green, twice in a row** (the second run confirms teardown is idempotent — domain rows are removed before the identity rows they reference, so a later suite's blanket `DELETE FROM public.tenants` cannot hit `ON DELETE RESTRICT`). Lint, typecheck, build and format clean.
+**171 tests green, twice in a row** (the second run confirms teardown is idempotent — domain rows are removed before the identity rows they reference, so a later suite's blanket `DELETE FROM public.tenants` cannot hit `ON DELETE RESTRICT`). Lint, typecheck, build and format clean.
 
-**Deliberate gaps, surfaced rather than filled silently**
+**The three surfaced gaps, all closed at the gate (author decisions)**
 
-- **`assets.serial_number` is a PLAIN index, not unique.** The brief says "index" (:148) and never says unique, nor what uniqueness would be scoped to. Making it unique-per-tenant here would decide something the author has not. Left for the Phase 3 API review.
-- **`asset_event_type` enum values are not in the brief**, which says only `event_type (enum)` (:137). The six values are _derived_ from the specified status enum — one per transition into a specified status, plus `created` — rather than invented wholesale. Flagged for review in case the author wants a different vocabulary before Phase 3 wires emissions.
-- **`created_by` is not indexed** on `asset_events`, a deliberate deviation from the brief's "index foreign keys": no query filters on it, and there is no endpoint for "events by user". Add it when one exists.
+- **`assets.serial_number` is now UNIQUE PER TENANT, AMONG LIVE ROWS** — `assets_tenant_serial_live_key`, partial on `deleted_at IS NULL`, replacing the plain index rather than stacking on it. Follows the `memberships_user_tenant_live_key` precedent (ADR-006 §2) exactly: re-registering a decommissioned serial is the analogue of re-inviting a revoked member. `assets_tenant_id_idx` is kept deliberately — the partial index cannot serve queries that must see soft-deleted rows, including the RLS check on the UPDATE that _performs_ the soft delete. No separate plain `serial_number` index: every lookup is tenant-scoped under RLS, so the composite serves them all, and a second would be write cost for nothing (the rejected `memberships(user_id)` reasoning again). **Timing was the argument for deciding now:** a unique index can only be created if existing data satisfies it — today the table is empty and it cannot fail; after step 10 the same change is a reconcile-live-duplicates migration that can fail against production data.
+- **`asset_event_type`: the six values stay, and the EMISSION CONTRACT is now recorded** in ARCHITECTURE §9.2, cross-referenced from the migration. The two points that are not inferable from the values: registration emits **both** `created` and `installed` (every status an asset has held must have an event that put it there, or the log cannot be replayed); and the enum encodes **transitions, not states** — `activated` and `maintenance_completed` both land on `active`, so a lookup table keyed on the resulting status is wrong by construction. `created` is kept rather than collapsing to five values so that a future bulk import of already-active assets emits `created` + `activated` with no special case.
+- **`created_by` stays unindexed, and the judgment is now recorded** in the migration rather than left to read as an oversight: nothing queries events by actor, and the unindexed-FK penalty falls on parent deletes, which cannot happen (ON DELETE RESTRICT plus soft-deleted identity rows). Second instance of the same judgment as ADR-006 §2, which is worth being visible as a pattern.
+
+**A second measured finding — Prisma DISCARDS the constraint name on unique violations.** The serial negative was specified to assert the index name, and that turned out not to be available. Measured:
+
+| path                           | `meta.code` | `meta.message`                                                 |
+| ------------------------------ | ----------- | -------------------------------------------------------------- |
+| app role (Prisma query engine) | `23505`     | `Unique constraint failed: ` — **name stripped, target empty** |
+| migration role                 | `23505`     | `Key (tenant_id, serial_number)=(...) already exists.`         |
+
+So `assets_tenant_serial_live_key` cannot be asserted from the app-role error at all. Weakening the negative to a bare `23505` was not acceptable — **any** unique constraint on the table satisfies that, including `assets_id_tenant_key`, which exists for a completely different reason. Closed with two assertions that together give what the message match would have: a **structural pin** on the index (name, columns, and the `WHERE (deleted_at IS NULL)` predicate, read from `pg_indexes`), and a **migration-role sibling** that recovers the violated column pair from the un-normalised error. The app-role negative keeps its `.not` guards against `/row-level security/` and `/permission denied/`, so it still cannot pass because some other layer refused the row.
+
+**ADR-004's dangling promise closed (`DECISIONS.md`).** The fixture-registry bullet still said factories "declare their FK dependencies so the harness can seed parents first" — the `dependsOn` mechanism retired in this phase because nothing ever read it. Amended in place with the same restated-not-deleted framing used for the superseded `users` line: the declaration half never worked, the parent-first seeding half was real and is now delivered by `seedIsolationContext`. The source-of-truth ADR and the code now agree, which is what makes wrinkle 2's retirement actually explicit rather than merely true in a code comment.
 
 **Not in Phase 1 (boundary held):** no `readings`, no API or event-emission wiring, no `maintenance_records`, and **no refresh of `ISOLATION.md` / `README.md` / `PORTFOLIO.md`** — retiring their "domain isolation is step 6" caveats is a later turn against a merged step 6, not this phase's work. Those three documents still describe the fixture registry as empty, which is now **stale, and knowingly so**.
 
