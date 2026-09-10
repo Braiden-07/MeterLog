@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { AppModule } from '../../src/app.module';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
-import { execAll, loadEnv, migratorClient } from '../db/helpers';
+import { execAll, loadEnv, migratorClient, resetDatabase } from '../db/helpers';
 
 /**
  * Step 5, Phase 3 — revocation takes effect on the next request, driven by a
@@ -76,11 +76,9 @@ describe('revocation over HTTP, driven by a real revoke (step-5 phase 3)', () =>
   beforeEach(wipe);
 
   async function wipe(): Promise<void> {
-    await execAll(migrator, [
-      `DELETE FROM public.memberships`,
-      `DELETE FROM public.users`,
-      `DELETE FROM public.tenants`,
-    ]);
+    // Shared catalog-derived teardown: TRUNCATE ... CASCADE lets Postgres resolve
+    // the FK order, so this no longer breaks when a new domain table lands.
+    await resetDatabase(migrator);
   }
 
   async function appRolePids(): Promise<Set<number>> {

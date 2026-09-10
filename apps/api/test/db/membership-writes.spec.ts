@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { ARGON2_OPTIONS } from '../../src/auth/auth.service';
 
-import { appClient, execAll, loadEnv, migratorClient } from './helpers';
+import { appClient, execAll, loadEnv, migratorClient, resetDatabase } from './helpers';
 
 /**
  * Step 5 Phase 1 — the membership-write definer functions and their §7
@@ -177,11 +177,8 @@ describe('membership write functions — §7 body-level authorization', () => {
   });
 
   afterAll(async () => {
-    await execAll(migrator, [
-      `DELETE FROM public.memberships`,
-      `DELETE FROM public.users`,
-      `DELETE FROM public.tenants`,
-    ]);
+    // Shared catalog-derived teardown (TRUNCATE ... CASCADE); see helpers.ts.
+    await resetDatabase(migrator);
     await app.$disconnect();
     await migrator.$disconnect();
   });
@@ -190,10 +187,9 @@ describe('membership write functions — §7 body-level authorization', () => {
     // Full re-seed rather than incremental cleanup: several tests deliberately
     // mutate roles and revoke rows, and a half-reset fixture is how a "passing"
     // authorization test ends up asserting against the wrong world.
+    // Reset first (shared catalog-derived TRUNCATE ... CASCADE), then seed.
+    await resetDatabase(migrator);
     await execAll(migrator, [
-      `DELETE FROM public.memberships`,
-      `DELETE FROM public.users`,
-      `DELETE FROM public.tenants`,
       `INSERT INTO public.tenants (id, name) VALUES
          ('${tenantA}', 'Tenant A'), ('${tenantB}', 'Tenant B')`,
       `INSERT INTO public.users (id, email, password_hash) VALUES

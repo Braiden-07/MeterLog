@@ -15,7 +15,7 @@ import {
 } from '../../src/common/request-context/request-context';
 import { SESSION_COOKIE, SessionService } from '../../src/common/session/session.service';
 import { TenantContextInterceptor } from '../../src/common/tenant-context/tenant-context.interceptor';
-import { execAll, loadEnv, migratorClient } from './helpers';
+import { execAll, loadEnv, migratorClient, resetDatabase } from './helpers';
 
 /**
  * Step 4, Phase 3 — the two-GUC interceptor, verify-before-set, and per-request
@@ -69,21 +69,17 @@ describe('tenant-context interceptor (Phase 3)', () => {
   });
 
   afterAll(async () => {
-    await execAll(migrator, [
-      `DELETE FROM public.memberships`,
-      `DELETE FROM public.users`,
-      `DELETE FROM public.tenants`,
-    ]);
+    // Shared catalog-derived teardown (TRUNCATE ... CASCADE); see helpers.ts.
+    await resetDatabase(migrator);
     await prisma.$disconnect();
     await migrator.$disconnect();
     await sessions.disconnect();
   });
 
   beforeEach(async () => {
+    // Reset first (shared catalog-derived TRUNCATE ... CASCADE), then seed.
+    await resetDatabase(migrator);
     await execAll(migrator, [
-      `DELETE FROM public.memberships`,
-      `DELETE FROM public.users`,
-      `DELETE FROM public.tenants`,
       `INSERT INTO public.tenants (id, name) VALUES
          ('${tenantA}', 'Tenant A'), ('${tenantB}', 'Tenant B')`,
       `INSERT INTO public.users (id, email, password_hash) VALUES

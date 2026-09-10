@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { appClient, execAll, migratorClient, withContext } from './helpers';
+import { appClient, execAll, migratorClient, resetDatabase, withContext } from './helpers';
 
 /**
  * The membership-model isolation proof (ADR-006 §8.2).
@@ -53,10 +53,9 @@ describe('membership model — dual-axis isolation', () => {
     app = appClient();
     migrator = migratorClient();
 
+    // Reset first (shared catalog-derived TRUNCATE ... CASCADE), then seed.
+    await resetDatabase(migrator);
     await execAll(migrator, [
-      `DELETE FROM public.memberships`,
-      `DELETE FROM public.users`,
-      `DELETE FROM public.tenants`,
       `INSERT INTO public.tenants (id, name) VALUES
          ('${tenantA}', 'Tenant A'), ('${tenantB}', 'Tenant B'),
          ('${tenantC}', 'Tenant C'), ('${tenantD}', 'Tenant D')`,
@@ -81,11 +80,8 @@ describe('membership model — dual-axis isolation', () => {
   });
 
   afterAll(async () => {
-    await execAll(migrator, [
-      `DELETE FROM public.memberships`,
-      `DELETE FROM public.users`,
-      `DELETE FROM public.tenants`,
-    ]);
+    // Shared catalog-derived teardown (TRUNCATE ... CASCADE); see helpers.ts.
+    await resetDatabase(migrator);
     await app.$disconnect();
     await migrator.$disconnect();
   });
