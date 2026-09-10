@@ -1,4 +1,9 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+  UnprocessableEntityException,
+} from '@nestjs/common';
 
 import {
   DEFAULT_LIMIT,
@@ -8,12 +13,20 @@ import {
   toPage,
 } from '../common/pagination/cursor';
 import { requireRequestContext } from '../common/request-context/request-context';
+import {
+  type AssetStatus,
+  DECOMMISSION_FROM,
+  POSTABLE_TRANSITIONS,
+  SYSTEM_ONLY_EVENTS,
+  transitionPayload,
+} from './lifecycle';
 import type {
   CreateAssetDto,
   CreateReadingDto,
   ListAssetsQuery,
   ListEventsQuery,
   ListReadingsQuery,
+  PostEventDto,
   UpdateAssetDto,
 } from './dto/assets.dto';
 
@@ -424,6 +437,142 @@ export class AssetsService {
     );
 
     return toReading(firstRow(rows, 'readings INSERT ... RETURNING'));
+  }
+
+  /**
+   * **The single lifecycle transition path.** Applies a client-named transition:
+   * derives the target status from the graph, validates the edge against the
+   * asset's current status, then writes the status change and its event atomically.
+   *
+   * ONE CHOKE POINT, ONE ENTRY POINT. `status` is a projection of the event log, so
+   * there is deliberately no other way to change it: `PATCH /assets/:id` rejects
+   * `status` (3b), and `DELETE /assets/:id` handles the one remaining transition
+   * because it must also set `deleted_at`. Every status an asset holds therefore
+   * has an event that put it there — §9.2's invariant, which the replay
+   * reconciliation asserts.
+   *
+   * The CLIENT NAMES THE TRANSITION rather than the target status, which is what
+   * makes the event type unambiguous: `activated` and `maintenance_completed` both
+   * land on `active`, so a status-keyed lookup would have two answers for one key.
+   * See `lifecycle.ts`.
+   */
+  async applyTransition(assetId: string, dto: PostEventDto): Promise<AssetEvent> {
+    const { tx, userId } = requireRequestContext();
+    const asset = await this.findOne(assetId);
+    const eventType = dto.eventType;
+
+    // 422, not 400: the value is a legitimate member of the enum, it is simply not
+    // POSTABLE here. The distinction is the point — the error names the path that
+    // does own it rather than saying "invalid".
+    const systemOnly = SYSTEM_ONLY_EVENTS[eventType];
+    if (systemOnly) {
+      throw new UnprocessableEntityException({
+        error: { code: systemOnly.code, message: systemOnly.message },
+      });
+    }
+
+    const transition = POSTABLE_TRANSITIONS[eventType];
+    if (!transition) {
+      // Unreachable while the DTO enum and the graph agree. Thrown rather than
+      // assumed away: a silently-skipped transition would be worse than a 422.
+      throw new UnprocessableEntityException({
+        error: { code: 'ASSET_EVENT_NOT_POSTABLE', message: `${eventType} cannot be posted.` },
+      });
+    }
+
+    const from = asset.status as AssetStatus;
+    if (!transition.from.includes(from)) {
+      // 409, not 422: the request is well-formed AND semantically meaningful — it
+      // conflicts with the CURRENT STATE of the resource. That includes every
+      // attempt on a decommissioned asset, which is terminal.
+      throw new ConflictException({
+        error: {
+          code: 'ASSET_TRANSITION_ILLEGAL',
+          message: `An asset in status "${from}" cannot undergo "${eventType}".`,
+          details: { from, to: transition.to, eventType, legalFrom: transition.from },
+        },
+      });
+    }
+
+    // Status change and event insert in the interceptor's transaction — the 3b
+    // pattern, unchanged. Either both land or neither does.
+    await tx.$executeRawUnsafe(
+      `UPDATE public.assets SET status = $1::public.asset_status, updated_at = now()
+        WHERE id = $2::uuid`,
+      transition.to,
+      assetId,
+    );
+
+    const rows = await tx.$queryRawUnsafe<RawRow[]>(
+      `INSERT INTO public.asset_events (tenant_id, asset_id, event_type, payload, created_by)
+       VALUES (NULLIF(current_setting('app.current_tenant', true), '')::uuid,
+               $1::uuid, $2::public.asset_event_type, $3::jsonb, $4::uuid)
+       RETURNING id::text AS id, asset_id::text AS asset_id, event_type::text AS event_type,
+                 payload, created_by::text AS created_by, created_at`,
+      assetId,
+      eventType,
+      transitionPayload(from, transition.to),
+      userId,
+    );
+
+    return toEvent(firstRow(rows, 'asset_events INSERT ... RETURNING'));
+  }
+
+  /**
+   * Decommission — `DELETE /assets/:id`. **Admin only**, and the destructive act
+   * §9.1 draws the admin-only line at.
+   *
+   * One transaction: read the prior status, set `status = 'decommissioned'` AND
+   * `deleted_at`, emit `decommissioned` carrying the prior status.
+   *
+   * **The two columns move together because they must**, and that is enforced
+   * below this code rather than by it: `assets_decommissioned_iff_deleted` (3b)
+   * makes setting one without the other unrepresentable. This method satisfies the
+   * constraint by construction; the constraint is what guarantees no other path
+   * ever will not.
+   *
+   * Why decommission is a DELETE rather than a transition posted to `/events`: it
+   * is the only transition that also retires the row, and `deleted_at` is what
+   * frees the serial for re-registration under
+   * `assets_tenant_serial_live_key ... WHERE deleted_at IS NULL`. Routing it
+   * through `/events` would mean that endpoint sometimes wrote `deleted_at`, which
+   * is exactly the kind of special case that makes a choke point stop being one.
+   */
+  async decommission(assetId: string): Promise<void> {
+    const { tx, userId } = requireRequestContext();
+    const asset = await this.findOne(assetId);
+    const from = asset.status as AssetStatus;
+
+    if (!DECOMMISSION_FROM.includes(from)) {
+      // Already decommissioned: terminal state, so a second DELETE is a conflict
+      // with current state rather than an idempotent no-op. Said explicitly
+      // because "DELETE is idempotent" is the reflex — here the row still exists
+      // and its lifecycle has ended, and silently emitting a second
+      // `decommissioned` event would corrupt the log.
+      throw new ConflictException({
+        error: {
+          code: 'ASSET_TRANSITION_ILLEGAL',
+          message: 'This asset is already decommissioned.',
+          details: { from, to: 'decommissioned' },
+        },
+      });
+    }
+
+    await tx.$executeRawUnsafe(
+      `UPDATE public.assets
+          SET status = 'decommissioned', deleted_at = now(), updated_at = now()
+        WHERE id = $1::uuid`,
+      assetId,
+    );
+
+    await tx.$executeRawUnsafe(
+      `INSERT INTO public.asset_events (tenant_id, asset_id, event_type, payload, created_by)
+       VALUES (NULLIF(current_setting('app.current_tenant', true), '')::uuid,
+               $1::uuid, 'decommissioned', $2::jsonb, $3::uuid)`,
+      assetId,
+      transitionPayload(from, 'decommissioned'),
+      userId,
+    );
   }
 }
 

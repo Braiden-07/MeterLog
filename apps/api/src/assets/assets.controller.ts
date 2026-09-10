@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
@@ -22,6 +23,7 @@ import {
   ListAssetsQuery,
   ListEventsQuery,
   ListReadingsQuery,
+  PostEventDto,
   UpdateAssetDto,
 } from './dto/assets.dto';
 
@@ -50,9 +52,18 @@ import {
  * with 403 rather than erroring — there is no workspace in which they hold the
  * required role, so "denied" is the correct answer, not "broken".
  *
- * Lifecycle transitions (`POST /assets/:id/events`, `DELETE /assets/:id`) are
- * phase 3c. The route-inventory guard that asserts no endpoint can mutate an
- * append-only row arrives with them, once every append-only route is registered.
+ * **Every §9.1 cell is enforced as of phase 3c.** Reads un-gated;
+ * create/update/reading at admin + technician; and the two 3c cells below —
+ * transitions at admin + technician, decommission **admin only**, because §9.1
+ * draws the admin-only line at the destructive act.
+ *
+ * **No route here mutates an append-only resource**, and that is asserted rather
+ * than observed: `test/api/route-inventory.spec.ts` enumerates the registered
+ * routes and fails if any PATCH/PUT/DELETE targets `events` or `readings`. The
+ * database already refuses such a write (catalog assertion 13 pins the
+ * `SELECT, INSERT`-only grant); the guard stops an endpoint from *offering* it.
+ * `DELETE /assets/:id` is deliberately not caught — `assets` is soft-deleted, not
+ * append-only.
  */
 @ApiTags('assets')
 @Controller('assets')
@@ -129,5 +140,34 @@ export class AssetsController {
     @Body() dto: CreateReadingDto,
   ): Promise<Reading> {
     return this.assets.createReading(id, dto);
+  }
+
+  @Post(':id/events')
+  @RequiresRole('admin', 'technician')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary:
+      'Apply a lifecycle transition. The client names the TRANSITION; the target status is derived from the graph.',
+    description:
+      'Postable: activated, maintenance_started, maintenance_completed. 422 for created/installed (use POST /assets) and decommissioned (use DELETE /assets/:id); 409 when the transition is illegal from the current status.',
+  })
+  async postEvent(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: PostEventDto,
+  ): Promise<AssetEvent> {
+    return this.assets.applyTransition(id, dto);
+  }
+
+  @Delete(':id')
+  @RequiresRole('admin')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary:
+      'Decommission an asset (soft delete). Sets status + deleted_at and emits the decommissioned event, atomically.',
+    description:
+      'Admin only — the destructive act (ARCHITECTURE §9.1). 409 if already decommissioned: the state is terminal, so this is not an idempotent no-op.',
+  })
+  async remove(@Param('id', ParseUUIDPipe) id: string): Promise<void> {
+    await this.assets.decommission(id);
   }
 }

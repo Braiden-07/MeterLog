@@ -6,13 +6,68 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phases 1 and 2 merged (`assets`, `asset_events`, `readings`; matrix 0 -> 15). Phases 3a and 3b complete: the READ surface with cursor pagination, then the basic WRITE surface with the RBAC matrix and the genesis emission.** Phase 3c is the transition engine; 3d the §8.3 capstone. Phase 4 / 6b `maintenance_records` (slippable within step 6, but essential v1.0 scope — needed before step 8's frontend).
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phases 1 and 2 merged (`assets`, `asset_events`, `readings`; matrix 0 -> 15). Phases 3a, 3b and 3c complete: the READ surface with cursor pagination, the basic WRITE surface with the genesis emission, and the lifecycle TRANSITION ENGINE — all nine §9.1 RBAC cells now enforced and proven live.** Phase 3d is the §8.3 capstone and the deferred doc refresh. Phase 4 / 6b `maintenance_records` (slippable within step 6, but essential v1.0 scope — needed before step 8's frontend).
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-11 — Step 6 Phase 3c: the transition engine (§11 step 6)
+
+The novel core of Phase 3. Everything before it was CRUD onto proven machinery; this is where the (from -> to) lifecycle logic lives, and where §9.2's "transition not state" trap is made **unrepresentable** rather than merely avoided.
+
+**The graph is the only place the mapping exists (`src/assets/lifecycle.ts`).** `POSTABLE_TRANSITIONS` is keyed on the **event type**, with its legal source statuses declared alongside and the target status derived from it. Confirmed by grep: the only two occurrences of `statusToEventType` in the codebase are the comments warning against it, and every lookup in the service is event-type-keyed. **There is nowhere to put a status-keyed map**, because no code path ever starts from "the new status".
+
+`ASSET_STATUSES` / `ASSET_EVENT_TYPES` were also consolidated here — phase 3a had declared them in the DTO file, before a graph existed, and leaving both would have let the DTO and the graph disagree about what an event type is.
+
+**Two endpoints.** `POST /assets/:id/events` is the single transition driver (admin + technician): the client names the transition, the service derives the target status, validates the edge against current status, then writes the status change and its event atomically in the interceptor's transaction — the 3b pattern unchanged. `DELETE /assets/:id` is decommission (**admin only** — §9.1 draws the line at the destructive act): one transaction setting `status` **and** `deleted_at` plus the `decommissioned` event carrying the prior status.
+
+**The graph, with the two edge cases decided.** `installed -> maintenance` **disallowed** (maintenance means withdrawn from service; an uncommissioned asset already is). `installed -> decommissioned` **allowed** (assets get scrapped before commissioning; refusing it would strand them with no legal exit). `decommissioned` **terminal** — which phase 1's `assets_tenant_serial_live_key ... WHERE deleted_at IS NULL` already presupposed, and the re-registration test now closes that loop: decommission frees the serial, and the returning asset is a new row.
+
+**The full-enum DTO is deliberate, and carries the reasoning.** `PostEventDto` accepts all six event types and the **service** decides postability. Narrowing it to the three postable values would make `ValidationPipe` reject `decommissioned` with a generic 400 — indistinguishable from a typo — and the 422 naming `DELETE /assets/:id` would become unreachable code, telling a caller their perfectly valid input does not exist. Same shape as the argon2-sentinel lesson: a later "tidy-up" removes a diagnostic while every test checking only "rejected" stays green.
+
+**Three codes, three causes:** 400 = not an event type at all; **422** = a real event type not postable here, naming the path that owns it (`ASSET_EVENT_GENESIS_ONLY`, `ASSET_EVENT_USE_DELETE`); **409 `ASSET_TRANSITION_ILLEGAL`** = postable but illegal from the current status, with `from`/`to` in `details`. Asserted distinct, per the step-5 byte-identical-403 lesson.
+
+**THE LOAD-BEARING TEST, and the sweep proved it earns the label.** One journey — register, then `activated` -> `maintenance_started` -> `maintenance_completed` — asserting the log reads `created, installed, activated, maintenance_started, maintenance_completed`. Under a status-keyed map the fifth event would be `activated`, because `activated` and `maintenance_completed` both land on `active`.
+
+The sweep's Q1 applied exactly that naive map. **It reddened exactly one test — this one.** Every other assertion stayed green: the statuses were still correct, the replay reconciliation still passed, the event count was right, the payloads still plausible, the API still returned 201. That is the claim in the test's own comment, confirmed experimentally rather than asserted.
+
+**The replay reconciliation, with its two preconditions stated on the test.** For every asset, `status` must equal the `to` of its latest status-bearing event. Both guards are necessary or it false-positives: derive only from events whose payload has a `to` (`created` carries `{}` and shares the genesis `created_at`, so including it makes "latest" ambiguous), and run against **API-created assets only** (`seedIsolationContext` inserts assets with no events by design, so a replay over scaffolding would flag status-with-no-event). Five assets across five different lifecycles, with a non-vacuity check that each replayed to something.
+
+**The route-inventory guard — derived, not listed.** Enumerates registered routes and asserts no PATCH/PUT/DELETE targets an append-only resource. The resource set comes from `APPEND_ONLY_TABLES` via one commented `TABLE_TO_SEGMENT` convention, asserted equal in both directions — so `audit_log` joining at step 7 extends it by one entry and fails until it does, rather than silently stopping covering a table (the teardown-PR lesson). It is the API-layer echo of assertion 13: the database refuses the write, and now no route can offer it without a reviewed edit.
+
+**Built on Nest metadata, not Express internals — the first attempt was wrong.** Reading `app.router` throws in Express 4 (deprecated getter) and `_router` is private and has already changed shape once. **A guard that silently stops finding routes passes**, so it now walks `ModulesContainer` and the `PATH_METADATA`/`METHOD_METADATA` decorators, which also means a new controller is covered with no edit. It carries a non-vacuity check that it found routes at all.
+
+**Mutation sweep — 10 mutations, 10 caught.**
+
+| #   | mutation                                       | caught by                                   |
+| --- | ---------------------------------------------- | ------------------------------------------- |
+| Q1  | **the naive status-keyed map**                 | **exactly one test — the load-bearing one** |
+| Q2  | narrow the DTO enum to three values            | 4 tests — all the 422-code assertions       |
+| Q3  | allow `installed -> maintenance`               | the disallowed-edge test                    |
+| Q4  | make `decommissioned` non-terminal             | the terminal-state test                     |
+| Q5  | `DELETE` sets status without `deleted_at`      | 9 tests — the CHECK refuses the row         |
+| Q6  | `DELETE` gated admin+technician                | the admin-only test                         |
+| Q7  | a transition updates status but emits no event | 3, incl. the replay reconciliation          |
+| Q8  | drop `readings` from the guard convention      | the both-directions convention check        |
+| Q9  | expose `PATCH /assets/:id/events`              | the no-mutating-route check                 |
+| Q10 | illegal edge returns 422 instead of 409        | 5 tests — the code-distinctness assertions  |
+
+**Q5 is worth noting:** breaking `DELETE` so it sets only `status` reddened **nine** tests, because the 3b biconditional CHECK refuses the row outright. The floor built last phase is load-bearing for this one, exactly as intended — and the floor is also proven independently, by a migrator-role `UPDATE status='decommissioned'` leaving `deleted_at` null raising `23514` with the constraint named. The 422 on `POST /events` is the friendly error; the CHECK is the guarantee.
+
+**All nine §9.1 cells are now enforced and proven live.** 3c adds the two 3b could not reach: transitions at admin ✓ / technician ✓ / auditor 403, and decommission at **admin only** (technician 403, auditor 403, with the asset verified still `installed` and not deleted after both attempts). Plus 401 distinct from 403, and the null-role case 403-never-500 on both new endpoints.
+
+**§8.3 write axis completed for 3c's endpoints.** M, an **admin** of both tenants and active in A, gets **404 — not 403** — on B's asset for both `POST /events` and `DELETE`; B's asset verified still `installed`, not deleted, with a genesis-only log. Being an admin of B makes the point sharper: the refusal is not about permissions at all.
+
+**256 tests green** (was 225; +31). Lint, typecheck, build and format verified by exit code.
+
+**Next**
+
+- Phase 3d — the §8.3 full-matrix capstone and consolidated acceptance, plus the deferred refresh of `ISOLATION.md` / `README.md` / `PORTFOLIO.md`, which have described the fixture registry as empty since step 4 and are now three phases stale.
+
+---
 
 ### 2026-09-10 — Step 6 Phase 3b: the write surface, RBAC, and the genesis emission (§11 step 6)
 
