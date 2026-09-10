@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { AppModule } from '../../src/app.module';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
-import { execAll, loadEnv, migratorClient, resetDatabase } from '../db/helpers';
+import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
 
 /**
  * Step 5, Phase 3 — revocation takes effect on the next request, driven by a

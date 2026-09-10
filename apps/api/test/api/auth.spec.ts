@@ -11,7 +11,7 @@ import Redis from 'ioredis';
 import { AppModule } from '../../src/app.module';
 import { ARGON2_OPTIONS, dummyVerifyTarget } from '../../src/auth/auth.service';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
-import { execAll, loadEnv, migratorClient, resetDatabase } from '../db/helpers';
+import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
 
 /**
  * Step 4, Phase 4 — the API acceptance suite. This is the step-4 definition of
