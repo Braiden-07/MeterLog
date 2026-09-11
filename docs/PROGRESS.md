@@ -6,13 +6,65 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** across three phases (PRs #2, #3, #4). **Step 6 (domain entities) IN PROGRESS — Phases 1 and 2 merged (`assets`, `asset_events`, `readings`; matrix 0 -> 15). Phases 3a, 3b and 3c complete: the READ surface with cursor pagination, the basic WRITE surface with the genesis emission, and the lifecycle TRANSITION ENGINE — all nine §9.1 RBAC cells now enforced and proven live.** Phase 3d is the §8.3 capstone and the deferred doc refresh. Phase 4 / 6b `maintenance_records` (slippable within step 6, but essential v1.0 scope — needed before step 8's frontend).
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** (PRs #2, #3, #4). **Step 6 (domain entities) — phases 1, 2, 3a, 3b, 3c merged; phase 3d complete: the §8.3 capstone, consolidated acceptance, and the doc refresh. The domain-isolation proof for `assets` / `asset_events` / `readings` is CLOSED.** The remaining v1.0 child, `maintenance_records`, carries to **phase 4 / 6b** on OPEN-8.
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-11 — Step 6 Phase 3d: the §8.3 capstone, consolidated acceptance, and the doc refresh (§11 step 6)
+
+The close of step 6's domain-isolation proof. No new endpoints, no new mechanisms, no schema change — consolidation, genuine acceptance gap-fill, and the documentation that had been deferred since step 4.
+
+**Part 1 — the §8.3 capstone.** The isolation axes were each proven where they were built (SELECT at 3a, INSERT/UPDATE at 3b, DELETE and transitions at 3c). They are now one scenario in one session over real HTTP, which is the artifact `ISOLATION.md` cites by name: [step6-acceptance.spec.ts:126-228](../apps/api/test/api/step6-acceptance.spec.ts#L126-L228).
+
+M is an **admin of both tenants**, active in A. Across the full matrix — list, by id, both child collections, `POST /assets`, `POST /readings`, `POST /events`, `PATCH`, `DELETE` — M reaches only A. B's asset returns **404 on every verb**, and B's row is then read back **as the migration role** and asserted unchanged: location unmodified, status still `active`, `deleted_at` null, exactly one reading, exactly three events.
+
+**The 404 is the property, and M being an admin of B is what makes it legible** — stated in the test's own comment. A 403 would mean "you lack permission", which is false, and would confirm the row exists. The 404 says the row is not in the request's universe. Two companions close the gap: M cannot activate a tenant they hold no live membership in (403, against a real tenant owned by someone else), and switching to the tenant M _does_ hold flips the whole surface **on the same cookie**, after which M may decommission B's asset — which is what proves the earlier 404s were never about permission.
+
+**Non-vacuity checked before documenting it:** mutating the `assets` policy to `USING (true) WITH CHECK (true)` reddens all three §8.3 tests.
+
+**Part 2 — acceptance, gap-fill only.** Audited first rather than assumed, and the audit is the reportable part:
+
+| item                                               | verdict                                                                                                                                                                                                                                                                                                                        |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| OpenAPI document renders the domain endpoints      | **genuinely missing** — no coverage existed; added, with a non-vacuity check first (the route-guard lesson: a Swagger check that enumerates nothing passes) and a second test asserting the query parameters, since a documented path a client cannot call correctly is not documentation                                      |
+| Error-envelope **shape** across the domain surface | **genuinely missing** — 36 per-endpoint `error.code` assertions existed, but nothing asserted the shape uniformly. One cross-cutting test over nine error paths: `{ error: { code, message } }`, never a 5xx, and no stack / filesystem path / SQL in the body, with a non-vacuity check that ≥5 distinct codes were traversed |
+| Empty collection → `items: []`, `nextCursor: null` | **genuinely missing** — added                                                                                                                                                                                                                                                                                                  |
+| Single full page ends `nextCursor: null`           | **genuinely missing** — added (a cursor to nowhere costs every client one pointless request per list)                                                                                                                                                                                                                          |
+| `limit` **accepted** at 1 and 100                  | **genuinely missing** — 3a proves 0 and 1000 are rejected; the accepted edge is the other half of an off-by-one                                                                                                                                                                                                                |
+| Cursor past the end → empty page, not an error     | **genuinely missing** — added                                                                                                                                                                                                                                                                                                  |
+| `limit=0` / `limit=1000` **rejected**              | **already covered** at [assets-read.spec.ts:531-532](../apps/api/test/api/assets-read.spec.ts#L531-L532) — deliberately not duplicated                                                                                                                                                                                         |
+| Malformed cursor → 400                             | **already covered** at 3a — deliberately not duplicated                                                                                                                                                                                                                                                                        |
+
+The suite header states the non-duplication explicitly, so the omissions read as decisions rather than gaps.
+
+**Part 3 — the doc refresh, and the honesty work is the substance of it.**
+
+`ISOLATION.md` §9 previously said isolation was proven "for the identity and tenancy tables only" and that the matrix generated "zero cases against real tables". Both were **false** as of phase 1. Two new findings sections replace them in the existing mechanism → trap → evidence idiom:
+
+- **§7e Finding 7 — the cursor that lost rows.** Promoted to the document's headline defect table (now seven, not six) because it is the sharpest illustration of the thesis: it shipped at 3a _with a seven-mutation sweep green_, and surfaced only when 3b created rows with real `now()`. The lesson recorded is about the sweep, not the cursor — a mutation sweep attacks the assertions; it cannot tell you the fixtures were unrepresentative.
+- **§7f Finding 8 — the domain surface.** Four properties, each with its negative: the matrix going **0 → 15 generated cases** (plus the two harness defects that had to be fixed first, including `dependsOn` being documentation shaped like code); composite-FK child tenancy with the **`23503`** negatives for _both_ children quoted verbatim and proven against a privileged connection RLS cannot filter; append-only bound to the grant with the **`permission denied`** negative and the live grant table quoted; the §8.3 capstone; and the naive-map trap — the one finding closed by a **design choice** rather than a test, where the mutation reddened exactly one test out of 266.
+
+**§9 now keeps only what is genuinely unproven, aligned row-for-row with the OPEN register:** `maintenance_records` not built (OPEN-8, with the reason it is a real open question — the first _mutable_ table in an all-soft-delete/append-only schema, so its `DELETE` grant would be the project's first hard delete); no audit trail, **and the lifecycle log is not one** (OPEN-6, now seven mutation types, with the `PATCH` case named as the one for which `audit_log` would be the only record); invited users cannot log in (OPEN-7); the API proven by acceptance tests rather than by use; nothing deployed.
+
+`README.md`: status line (step 5 of 11 → step 6 phases 1-3, 266 tests), line 9 rewritten from the direct contradiction into the domain proof **plus** the honest remainder, the three strongest step-6 findings added with their `ISOLATION.md` links, and the "where to look" table extended with the three domain migrations, the lifecycle graph, the capstone, the matrix, and `PERF.md`.
+
+`PORTFOLIO.md`: seven-times lede, three new findings at reviewer altitude (§8.3-over-HTTP with permission ruled out; unrepresentable-beats-tested; denormalise-then-make-inconsistency-impossible), and the not-proven list rewritten to name `maintenance_records` and the audit gap rather than the retired limitation.
+
+**Citation discipline, verified mechanically rather than by eye.** A script walked all **124** `file:line` links in `ISOLATION.md`, checked each resolves to a real file and an in-range line, and then I spot-checked the new ones against their targets — **32 anchors were retargeted** because they landed on explanatory comment lines rather than the declarations they cited (`APPEND_ONLY_TABLES`, `ISOLATION_FIXTURES`, `ISOLATION_BESPOKE_TABLES`, `encodeCursor`, `POSTABLE_TRANSITIONS`, the capstone `it(...)`, the genesis INSERT, and several test ranges). Every negative quoted in the new sections is **real captured output**, not paraphrase.
+
+**266 tests green** (was 256; +10). Lint, typecheck, build and format verified by exit code.
+
+**Step 6's domain-isolation proof is closed.** What remains of step 6 is `maintenance_records` (OPEN-8), which is deferred rather than dropped and must land before step 8's frontend needs it.
+
+**Next**
+
+- Phase 4 / 6b — `maintenance_records`, starting with OPEN-8's question: `SELECT, INSERT, UPDATE` (a shape no existing table has) or the project's first genuine hard `DELETE`. The grant is what makes the property real, so it is decided before the migration is written.
+
+---
 
 ### 2026-09-11 — Step 6 Phase 3c: the transition engine (§11 step 6)
 
