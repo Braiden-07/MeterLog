@@ -187,6 +187,30 @@ export async function withContext<T>(
 export const APPEND_ONLY_TABLES: readonly string[] = ['asset_events', 'readings'];
 
 /**
+ * SOFT-DELETE-ONLY TABLES — tables the app role may UPDATE but never DELETE.
+ *
+ * The companion to `APPEND_ONLY_TABLES`, and a genuinely different profile: an
+ * append-only table refuses UPDATE *and* DELETE, while these accept a general
+ * UPDATE (field edits, and the `deleted_at` write that performs the soft delete)
+ * and refuse only DELETE.
+ *
+ * **This is how ADR-008's decision is enforced rather than merely recorded.**
+ * "Soft delete for v1.0" is true exactly as long as the `DELETE` privilege is
+ * absent, so catalog assertion 14 asserts the grant set as an EQUALITY —
+ * `SELECT, INSERT, UPDATE` and nothing more. A stray
+ * `GRANT DELETE ON public.maintenance_records TO meterlog_app` would make v1.0
+ * destructive in one line, two build steps before `audit_log` exists to record
+ * what was destroyed (OPEN-9). That line turns CI red.
+ *
+ * `assets` is deliberately NOT here. Its `DELETE` endpoint is the decommission
+ * transition — an UPDATE — and it holds no DELETE grant either, but its delete
+ * semantics are governed by the lifecycle graph and the
+ * `assets_decommissioned_iff_deleted` CHECK rather than by this list. Adding it
+ * would conflate two different properties that happen to share a grant shape.
+ */
+export const SOFT_DELETE_ONLY_TABLES: readonly string[] = ['maintenance_records'];
+
+/**
  * What the app role may do to a table beyond `SELECT` and `INSERT`, DECLARED per
  * fixture rather than read back from `has_table_privilege`.
  *
@@ -297,6 +321,25 @@ export const ISOLATION_FIXTURES: Readonly<Record<string, IsolationFixture>> = {
       await client.$executeRawUnsafe(
         `INSERT INTO public.readings (tenant_id, asset_id, value, unit, read_at, created_by)
          VALUES ($1::uuid, $2::uuid, 42.5, 'kWh', now(), $3::uuid)`,
+        ctx.tenantId,
+        ctx.assetId,
+        ctx.userId,
+      );
+    },
+  },
+
+  maintenance_records: {
+    // THE ONLY DOMAIN TABLE WITH A GENERAL UPDATE (ADR-008). `delete: false` is
+    // not an append-only declaration — it is the soft-delete decision: the app
+    // role holds UPDATE (field edits AND the deleted_at write) and deliberately no
+    // DELETE, so the matrix's DELETE case asserts `permission denied`, which is
+    // how "soft delete only" is proven rather than asserted.
+    appWrites: { update: true, delete: false },
+    async seed(client, ctx) {
+      await client.$executeRawUnsafe(
+        `INSERT INTO public.maintenance_records
+           (tenant_id, asset_id, description, performed_at, created_by)
+         VALUES ($1::uuid, $2::uuid, 'annual service', now(), $3::uuid)`,
         ctx.tenantId,
         ctx.assetId,
         ctx.userId,

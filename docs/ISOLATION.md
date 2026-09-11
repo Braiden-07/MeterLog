@@ -4,7 +4,7 @@
 >
 > **Every technical claim below carries a `file:line` citation into this repository, and every security property is backed by a negative — a rejected write, a zero-row read, a refused request — executed against a live PostgreSQL 16 instance.** Click any of them. A document that invites that check should read differently from one that asserts.
 >
-> **Status:** build-order steps 4 (auth + tenancy), 5 (RBAC + membership management) and 6 phases 1-3 (the domain surface: `assets`, `asset_events`, `readings`) complete. §9 states plainly what is _not_ yet proven — and step 6 made that section more important, not less, because it is the first step whose headline claim is broad enough to be misread.
+> **Status:** build-order steps 4 (auth + tenancy), 5 (RBAC + membership management) and **6 complete** — the v1.0 domain surface is `assets` plus its three children `asset_events`, `readings` and `maintenance_records`. §9 states plainly what is _not_ yet proven — and step 6 made that section more important, not less, because it is the first step whose headline claim is broad enough to be misread.
 
 ---
 
@@ -555,6 +555,86 @@ And one more floor, because decommissioning moves two columns that must agree: `
 
 ---
 
+## 7g. Finding 9 — the mutable table, and a decision encoded as a missing privilege
+
+`maintenance_records` is the fourth and final v1.0 child of `assets`, and **the first table in this schema whose shape is not a copy of an existing one** — which is why it carries its own ADR ([ADR-008](DECISIONS.md)).
+
+### The mechanism
+
+Every other domain table fits a profile already proven. The grant profile, read from the live catalog, is the clearest statement of the difference:
+
+```
+     table_name      |       privileges
+---------------------+------------------------
+ asset_events        | INSERT, SELECT
+ assets              | INSERT, SELECT, UPDATE
+ maintenance_records | INSERT, SELECT, UPDATE
+ readings            | INSERT, SELECT
+```
+
+`maintenance_records` shares `assets`' privileges and **not its semantics.** On `assets`, `PATCH` edits metadata and `status` changes only through the transition engine — there is no general field edit, and `DELETE` is decommissioning (an `UPDATE`). On `maintenance_records` a technician corrects a description or a date and nothing about the asset's lifecycle changed. **This is the first domain table where `UPDATE` means "edit a field" rather than "advance a state machine"** ([the GRANT, migration.sql:154](../apps/api/prisma/migrations/20260913000000_domain_maintenance_records/migration.sql#L154), [the policy, :141-145](../apps/api/prisma/migrations/20260913000000_domain_maintenance_records/migration.sql#L141-L145), [service](../apps/api/src/maintenance/maintenance.service.ts)).
+
+### The trap
+
+Two traps, and they pull in opposite directions.
+
+**First: a general `UPDATE` can rewrite the tenant key.** The append-only children have no `UPDATE` path at all, so their policy's `WITH CHECK` only ever governs `INSERT` — it has never had to stop a row _moving_. Here it does, and nothing about the policy's text changes to signal that its job grew.
+
+**Second: the obvious way to write the soft delete reintroduces the OPEN-5 deadlock.** Soft delete is an `UPDATE ... SET deleted_at`, and it is tempting to put `deleted_at IS NULL` in the policy so the read path is consistent by construction. That breaks it: Postgres applies a `SELECT`-applicable policy **to the new row of an `UPDATE ... WHERE`**, so the statement that sets `deleted_at` would be unable to see the row it just wrote. This is the defect recorded on `memberships`, and it would have arrived here by being _tidy_.
+
+### The evidence
+
+**Tenant immutability — the property a general-`UPDATE` table needs and the append-only children never did.** Acting in A, moving a row to B:
+
+```
+ERROR:  new row violates row-level security policy for table "maintenance_records"
+```
+
+Asserted on `42501` **and** the row-security message, and explicitly **not** on `permission denied` — `UPDATE` _is_ granted here, so a privilege-shaped refusal would mean the grant was wrong rather than the policy working ([isolation.spec.ts](../apps/api/test/db/isolation.spec.ts)). Its non-vacuous partner asserts that an ordinary field edit **succeeds**, because "cannot change tenant" is trivially satisfied by a table nobody can update at all.
+
+**The OPEN-5 deadlock, proven avoided rather than assumed.** `deleted_at` appears in no policy predicate, so the soft-delete write succeeds:
+
+```
+UPDATE 1
+```
+
+and the row remains visible to the policy afterwards — liveness is an application-layer `WHERE deleted_at IS NULL`, so the history stays reachable. Adding the predicate back reddens five tests, the dedicated OPEN-5 one among them.
+
+**Composite-FK tenant consistency, on ADR-007's third child:**
+
+```
+ERROR:  insert or update on table "maintenance_records" violates foreign key constraint "maintenance_records_asset_tenant_fkey"
+DETAIL:  Key (asset_id, tenant_id)=(dddddddd-...-0004, bbbbbbbb-...-0002) is not present in table "assets".
+```
+
+`23503`, asserted with the constraint name and explicitly not the RLS message.
+
+**The general-`UPDATE` isolation 404, over real HTTP.** The capstone now covers all four tables in one scenario: M, an **admin of both tenants** and active in A, `PATCH`es B's maintenance record and gets **404, not 403** — and B's row is read back as the migration role with its description unchanged and `deleted_at` still null ([step6-acceptance.spec.ts:133](../apps/api/test/api/step6-acceptance.spec.ts#L133)). The sharpness is the same as the asset capstone's: a 403 would claim M lacks permission, which is false, and would confirm the row exists.
+
+### **Soft delete is encoded as a missing privilege, not as a promise**
+
+This is the strongest single line of the phase. ADR-008 decides soft-delete-only for v1.0, and that decision is **true exactly as long as the `DELETE` privilege is absent.** So the absence is demonstrated, as the runtime role:
+
+```
+ERROR:  permission denied for table maintenance_records
+```
+
+Asserted on `42501` **and** `permission denied for table maintenance_records`, explicitly not the row-security message — the policy would happily permit deleting an own-tenant row, so a policy-shaped refusal would mean the grant was wrong. **Catalog assertion 14** pins the grant set as an _equality_ (`SELECT, INSERT, UPDATE` and nothing more), and **assertion 15** refuses to let a table be declared both append-only and soft-delete-only, since those profiles demand contradictory grants ([catalog-rls.spec.ts:486](../apps/api/test/db/catalog-rls.spec.ts#L486), declared at [helpers.ts:211](../apps/api/test/db/helpers.ts#L211)).
+
+`GRANT DELETE ON public.maintenance_records TO meterlog_app` is one line, and it would make v1.0 destructive **two build steps before `audit_log` exists** — a purged record leaving no trace of itself, of who removed it, or of what it said. That line reddens three tests. **Hard delete is deferred, not refused** (OPEN-9): when it lands, it lands behind audit.
+
+### And the matrix extended itself
+
+The isolation matrix generates **20 cases across four tables**, up from 15 at phase 3d and from zero before step 6 — five per table, automatically, because the registry's key set is asserted equal to the catalog's in both directions ([isolation.spec.ts](../apps/api/test/db/isolation.spec.ts), registry at [helpers.ts](../apps/api/test/db/helpers.ts)). The fourth table required no new harness mechanism, which is the point of having built the contract for two write shapes at phase 1.
+
+### A postscript worth more than the table it came from
+
+Finding 7's lesson was applied here from day one: the list endpoint's cursor carries the sort column's raw **text** and an `id` tiebreaker, and the index is three columns rather than two. Then the sweep restored the truncating cursor as a mutation and **nothing reddened.**
+
+The new tests had been written with whole-millisecond fixtures — rows created by separate HTTP requests, timestamps like `2026-03-03T00:00:00.000Z` — where truncating microseconds is exactly lossless. **That is the same blind spot that let Finding 7 through phase 3a's seven-mutation sweep.** Writing a test "for the lesson" does not test the lesson if its fixtures cannot express the failure. The fix was a case whose two rows are inserted in one statement and therefore genuinely share a microsecond; it carries a non-vacuity assertion that they do. The mutation now reddens it.
+
+---
+
 ## 8. Method — why the evidence is shaped the way it is
 
 The findings above share a cause: **a test that passes is not the same as a test that covers.** Several practices exist specifically to close that gap.
@@ -583,12 +663,15 @@ The strength of everything above is that each claim is scoped and backed by a li
 
 This list is kept aligned with the enumerated **Open items register** in [`DECISIONS.md`](DECISIONS.md), so a debt cannot be described one way here and another way there.
 
-- **The domain surface is THREE tables, not the brief's five.** Step 6 proved isolation for `assets`, `asset_events` and `readings` (§7f). **`maintenance_records` is not built** — it is the remaining v1.0 child of `assets`, tracked as **OPEN-8**, and it is deferred rather than dropped: the brief lists "record maintenance" as an essential frontend journey, so it must land before step 8 needs it. It is held back on a real open question rather than for time — every table in the schema today is either soft-deleted or append-only, and a maintenance record is **mutable**, which matches no existing shape; whether it gets a `DELETE` grant at all would be the project's first hard delete against an otherwise all-`RESTRICT` codebase, and the grant is what makes the property real. `audit_log` does not exist either (next bullet). **So "the domain is isolated" is true of the three tables named and of nothing else.**
+- **The domain surface is FOUR tables. The brief's fifth is `audit_log`, and it is not a domain table.** Step 6 proved isolation for `assets` and its three children `asset_events`, `readings` and `maintenance_records` (§7f, §7g) — **4 of 4 v1.0 domain tables built and isolation-proven.** `PROJECT_BRIEF` §5 lists five tables in total; the fifth is `audit_log`, which belongs to step 7 and to the next bullet rather than to this surface. **So "the domain is isolated" is now true of the domain — and says nothing about the audit trail, which does not exist.**
+- **`maintenance_records` is SOFT-DELETE ONLY, and hard delete is deferred (OPEN-9).** v1.0 has no way to destroy a maintenance record: the app role holds no `DELETE` privilege, proven by the `permission denied` negative in §7g and pinned by catalog assertion 14. The deferral is deliberate rather than unfinished — **a destructive operation must not predate the audit trail that makes it accountable**, because a purged row with no `audit_log` entry leaves no trace of itself, of who removed it, or of what it said. When hard delete lands it lands behind audit, and it inherits the question of what a purge writes there ([ADR-008](DECISIONS.md)).
 - **A green generic matrix is still not evidence for a table registered as bespoke.** `users`, `tenants` and `memberships` are excluded by declaration, and the exclusion is accounted for by the registry-equality check so it cannot be mistaken for an oversight ([helpers.ts:132](../apps/api/test/db/helpers.ts#L132)). Their coverage is the bespoke dual-axis suite (§3), not the 15 generated cases.
 - **Invited users cannot log in yet (OPEN-7).** `invite_member` creates an identity whose password hash is a sentinel that matches nothing, so an invited person can neither sign in nor register their own organisation (the email is taken). This is a **known, scheduled, temporary** state, not a hidden one: the set-password / invite-token flow is the first slice of step 8, with a hard deadline of step 10 (before deploy, the only people it can lock out are test fixtures), and it is enforced by a Definition-of-Done checkbox rather than by a comment ([PROJECT_BRIEF.md:266](PROJECT_BRIEF.md#L266)) because markers drift and checklists block. Reasoning in [DECISIONS.md:269](DECISIONS.md#L269).
 - **Audit logging does not exist, and the lifecycle log is NOT the audit trail.** This is the step-6 claim most open to being misread, so it is stated flatly: `asset_events` records what happened to a physical **asset**; `audit_log` records who changed which **record**, with before/after. Neither derives from the other — a bulk import produces lifecycle events with no user-facing mutation, and correcting a typo in `location` produces an audit row with **no lifecycle event at all**. That `PATCH` case is the one Phase 3 mutation for which `audit_log` would be the only record, and it is invisible in the event log today.
 
-  `audit_log` lands at step 7, which means **seven** mutation types now need retrofitting rather than wiring: the three step-5 membership writes plus asset creation, metadata update, reading creation, status transitions and decommission. Tracked as **OPEN-6**, with **OPEN-4** (whether to record role-at-time-of-action) answered there. Recorded as a known retrofit, and it grew when step 6 landed rather than being discovered at step 7.
+  `audit_log` lands at step 7, which means **ten** mutation types now need retrofitting rather than wiring: the three step-5 membership writes, plus asset creation, asset metadata update, reading creation, status transitions and decommission, plus maintenance creation, maintenance editing and maintenance soft-delete. Tracked as **OPEN-6**, with **OPEN-4** (whether to record role-at-time-of-action) answered there. Recorded as a known retrofit, and it grew twice during step 6 rather than being discovered at step 7.
+
+  **`maintenance_records` is where this gap is sharpest.** A maintenance edit emits **no lifecycle event at all** — correcting a description is not something that happened to the physical asset — so for that mutation the event log is silent and `audit_log` would be the _only_ record. Of the domain's mutations it is the one a retrofit driven from `asset_events` would most certainly miss, because there is nothing in `asset_events` to drive from.
 
 - **The API surface is proven by acceptance tests, not by use.** Every claim in §7f is an automated test against a local or CI Postgres. No frontend consumes these endpoints (step 8), no load test has run against them (§13's k6 is outstanding), and the `EXPLAIN ANALYZE` numbers in [`PERF.md`](PERF.md) are local warm-cache plan comparisons — useful for plan **shape**, not quotable as production latency.
 - **Nothing here is proven against production.** All evidence is local and CI, both of which run the migration role as a cluster **superuser**. Render's is not, and a superuser satisfies `pg_has_role` unconditionally and bypasses RLS — so a class of privilege defect is invisible in both environments where the tests run. That gap is enumerated as a pre-deploy checklist ([ARCHITECTURE.md §16.1](ARCHITECTURE.md)), including the `Secure` cookie flag, which is gated on `NODE_ENV` and therefore **unverifiable by CI by construction**.
@@ -602,34 +685,36 @@ This list is kept aligned with the enumerated **Open items register** in [`DECIS
 cp .env.example .env      # then set SESSION_SECRET
 docker compose up -d      # Postgres 16 + Redis 7
 npm install && npm run db:migrate
-npm run test              # 266 tests
+npm run test              # 299 tests
 ```
 
-**Local evidence, `feat/step6-phase3d-capstone`, verbatim:**
+**Local evidence, `feat/step6-phase4-maintenance`, verbatim:**
 
 ```
- ✓ test/db/membership-writes.spec.ts (31 tests) 1677ms
- ✓ test/api/assets-write.spec.ts (23 tests) 3572ms
- ✓ test/db/isolation.spec.ts (32 tests) 359ms
- ✓ test/api/auth.spec.ts (23 tests) 2289ms
- ✓ test/api/assets-transitions.spec.ts (26 tests) 4383ms
- ✓ test/api/assets-read.spec.ts (21 tests) 2953ms
- ✓ test/db/interceptor.spec.ts (15 tests) 806ms
- ✓ test/db/catalog-rls.spec.ts (13 tests) 81ms
- ✓ test/api/memberships.spec.ts (19 tests) 2861ms
- ✓ test/api/step6-acceptance.spec.ts (10 tests) 1702ms
- ✓ test/db/membership-isolation.spec.ts (23 tests) 275ms
- ✓ test/db/auth-definer.spec.ts (12 tests) 775ms
- ✓ test/api/revocation.spec.ts (3 tests) 754ms
- ✓ test/db/definer-probe.spec.ts (5 tests) 170ms
- ✓ test/api/route-inventory.spec.ts (5 tests) 220ms
- ✓ test/db/teardown.spec.ts (4 tests) 303ms
+ ✓ test/db/membership-writes.spec.ts (31 tests)
+ ✓ test/api/assets-transitions.spec.ts (26 tests)
+ ✓ test/api/assets-write.spec.ts (23 tests)
+ ✓ test/api/auth.spec.ts (23 tests)
+ ✓ test/api/maintenance.spec.ts (22 tests)
+ ✓ test/api/assets-read.spec.ts (21 tests)
+ ✓ test/db/isolation.spec.ts (42 tests)
+ ✓ test/db/membership-isolation.spec.ts (23 tests)
+ ✓ test/api/memberships.spec.ts (19 tests)
+ ✓ test/db/catalog-rls.spec.ts (15 tests)
+ ✓ test/db/interceptor.spec.ts (15 tests)
+ ✓ test/db/auth-definer.spec.ts (12 tests)
+ ✓ test/api/step6-acceptance.spec.ts (10 tests)
+ ✓ test/db/definer-probe.spec.ts (5 tests)
+ ✓ test/api/route-inventory.spec.ts (5 tests)
+ ✓ test/db/teardown.spec.ts (4 tests)
+ ✓ test/api/revocation.spec.ts (3 tests)
+ ✓ src/health/health.controller.spec.ts (1 test)
 
- Test Files  17 passed (17)
-      Tests  266 passed (266)
+ Test Files  18 passed (18)
+      Tests  299 passed (299)
 ```
 
-`membership-writes.spec.ts` is the §7a backstop suite — the one that calls the definer functions directly, with no HTTP anywhere in the process. `step6-acceptance.spec.ts` is the §8.3 capstone. Of `isolation.spec.ts`'s 32 tests, **15 are generated** by the catalog-driven matrix across the three domain tables (§7f); it ran 6 before step 6.
+`membership-writes.spec.ts` is the §7a backstop suite — the one that calls the definer functions directly, with no HTTP anywhere in the process. `step6-acceptance.spec.ts` is the §8.3 capstone, now covering all four domain tables in one scenario. Of `isolation.spec.ts`'s tests, **20 are generated** by the catalog-driven matrix across the four domain tables (§7f, §7g); it ran 6 before step 6 and 15 at phase 3d.
 
 Each run builds the schema from migrations on a **fresh** database, so the policies under test are the ones the migrations produce, not ones a developer's database happened to accumulate. The suites connect as `meterlog_app` — the same restricted role the API uses at runtime — which is load-bearing: connecting as anything else would let every structural assertion pass while isolation was gone ([catalog-rls.spec.ts:230](../apps/api/test/db/catalog-rls.spec.ts#L230)).
 

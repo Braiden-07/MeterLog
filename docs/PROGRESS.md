@@ -6,13 +6,80 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** (PRs #2, #3, #4). **Step 6 (domain entities) — phases 1, 2, 3a, 3b, 3c merged; phase 3d complete: the §8.3 capstone, consolidated acceptance, and the doc refresh. The domain-isolation proof for `assets` / `asset_events` / `readings` is CLOSED.** The remaining v1.0 child, `maintenance_records`, carries to **phase 4 / 6b** on OPEN-8.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** (PRs #2, #3, #4). **Step 6 (domain entities) COMPLETE — phases 1, 2, 3a-3d merged; phase 4 closes it with `maintenance_records`. The v1.0 domain surface is four tables: `assets` plus `asset_events`, `readings` and `maintenance_records`, all isolation-proven.** Next: step 7 (audit module), which owns OPEN-6 (ten mutation types to retrofit), OPEN-4, and unblocks OPEN-9 (hard delete).
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-11 — Step 6 Phase 4 (6b): `maintenance_records`, the mutable table (§11 step 6)
+
+The fourth and final v1.0 domain child, and **the close of step 6**. The first table whose shape is not a copy of an existing one — which is why it led with an ADR.
+
+**ADR-008, recorded before any code.** Soft delete for v1.0: the app role gets `SELECT, INSERT, UPDATE` and **no `DELETE`**. Hard delete / purge is **deferred to after step 7, not refused** — a destructive operation must not predate the audit trail that makes it accountable, because a purged row with no `audit_log` entry leaves no trace of itself, of who removed it, or of what it said. Recorded as **OPEN-9**; **OPEN-8 retired** in the register with the answer and a pointer to it.
+
+The ADR also records the distinction that made this worth deciding: `maintenance_records` shares `assets`' grant profile and **not its semantics**. On `assets`, `PATCH` edits metadata and `status` moves only through the transition engine — there is no general field edit. Here there is. **It is the first domain table where `UPDATE` means "edit a field" rather than "advance a state machine",** and therefore the first where the policy's `WITH CHECK` has to stop a row _moving_ rather than merely stop a bad insert.
+
+**Columns: faithful to the brief, with one flagged addition.** `PROJECT_BRIEF` §5 (:139) specifies `description`, `performed_at`, `created_by`, `created_at`, `updated_at` — those are the columns. **`cost` and a `type`/`category` were deliberately NOT added**: both are plausible, neither is in the brief, and the same discipline was applied to `readings`. `deleted_at` **is** an addition, recorded as such in the ADR — §5 gives this table no `deleted_at` and :147 names only `tenants`/`users`/`assets`, so taken literally a record created in error could never be removed at all. One nullable column that keeps every row is the smaller deviation than a destructive capability the brief also does not grant.
+
+**The grant-profile difference, stated plainly and bound to an assertion:**
+
+| table                      | app-role grant               | meaning                                                                |
+| -------------------------- | ---------------------------- | ---------------------------------------------------------------------- |
+| `asset_events`, `readings` | `SELECT, INSERT`             | append-only                                                            |
+| `assets`                   | `SELECT, INSERT, UPDATE`     | metadata + lifecycle transitions; `DELETE` is decommission (an UPDATE) |
+| **`maintenance_records`**  | **`SELECT, INSERT, UPDATE`** | **general field edit + the `deleted_at` write. No `DELETE`.**          |
+
+**Catalog assertion 14** pins that set as an _equality_ via a new `SOFT_DELETE_ONLY_TABLES` declaration; **assertion 15** refuses to let a table be declared both append-only and soft-delete-only, since those profiles demand contradictory grants.
+
+**The matrix extended itself: 15 → 20 cases across four tables**, five per table, with no new harness mechanism — the payoff of having built the fixture contract for two write shapes back at phase 1.
+
+**The five new DB-layer negatives, each quoted verbatim in `ISOLATION.md` §7g:**
+
+- **Hard `DELETE` as the runtime role** → `ERROR: permission denied for table maintenance_records`. **This is how ADR-008 is proven rather than asserted** — the decision is true exactly as long as the privilege is absent, so the absence is demonstrated. Asserted on `42501` **and** the `permission denied` text, explicitly not the row-security message: the policy would happily permit deleting an own-tenant row, so a policy-shaped refusal would mean the grant was wrong.
+- **Tenant immutability under `UPDATE`** → `ERROR: new row violates row-level security policy for table "maintenance_records"`. The property a general-`UPDATE` table needs and the append-only children never did. Asserted `42501` + the RLS message and **not** `permission denied` — `UPDATE` _is_ granted here. Its non-vacuous partner asserts an ordinary field edit succeeds.
+- **Composite FK, ADR-007's third child** → `23503` + `maintenance_records_asset_tenant_fkey`, against a privileged connection RLS cannot filter.
+- **Soft delete without the OPEN-5 deadlock** → `UPDATE 1`, and the row stays visible to the policy afterwards. `deleted_at` appears in no policy predicate; liveness is an application `WHERE`. Adding the predicate back reddens five tests.
+- **General `UPDATE` isolation over HTTP** → `PATCH` on B's record as an **admin of both tenants** returns **404, not 403**, with B's row read back as the migration role: description unchanged, `deleted_at` still null.
+
+**Endpoints:** `GET /maintenance-records` (cursor-paginated), `GET /:id`, `POST`, `PATCH`, `DELETE` (soft). Reads un-gated; writes at admin + technician. **`DELETE` is deliberately NOT admin-only here**, unlike `assets`: decommissioning a physical unit is irreversible in practice and admin-only per §9.1, whereas retracting a record of work is recoverable (the row persists) and the technician who filed it should be able to withdraw it. Treating them as the same operation because they share a verb would be the mistake. A second `DELETE` is **idempotent**, also unlike `assets` — no event, no state machine, nothing observable changes.
+
+**§8.3 capstone extended to all four tables in the one scenario**, with the admin-of-B sharpness preserved and the mirror half strengthened: after switching, M may now edit _and_ retract B's record, which is what proves the earlier 404s were never about permission. Mutating the new policy to `USING (true) WITH CHECK (true)` reddens the capstone plus five DB tests.
+
+**Acceptance extensions — missing vs already-covered, stated as decisions.** The envelope test gained two maintenance error paths; the OpenAPI enumeration went from nine operations to **fourteen**, with its non-vacuity check intact. Pagination boundaries shipped **with** the endpoint rather than later, per the Finding 7 instruction: empty, single-full-page `nextCursor: null`, `limit` accepted at 1 and 100 _and_ rejected at 0 and 101, cursor-past-end, malformed cursor. Nothing from 3a–3d was duplicated.
+
+**Mutation sweep — 10 mutations, 10 caught, one after diagnosis.**
+
+| #   | mutation                                             | caught by                                       |
+| --- | ---------------------------------------------------- | ----------------------------------------------- |
+| S1  | policy keyed on `true`                               | the capstone + 5 DB tests                       |
+| S2  | `GRANT DELETE` on the table                          | assertion 14 + both DELETE negatives            |
+| S3  | add `assetId` to the update DTO                      | the not-reparentable test                       |
+| S4  | remove the list liveness filter                      | the soft-delete list test                       |
+| S5  | `findOne` filters soft-deleted rows                  | 2 tests                                         |
+| S6  | remove `@RequiresRole` ×3                            | auditor-403 + null-role                         |
+| S7  | drop the `id` tiebreaker                             | the tied-`performed_at` test                    |
+| S8  | **restore Finding 7's truncating cursor**            | **escaped, then caught** — see below            |
+| S9  | declare the table append-only instead                | assertions 13, 15 + the fixture-agreement check |
+| S10 | add `deleted_at` to the policy (OPEN-5 reintroduced) | 5 tests, the dedicated OPEN-5 one included      |
+
+**S8 is the finding of this phase, and it is uncomfortable in the useful way.** Finding 7's lesson was applied from day one — raw-text cursor key, `id` tiebreaker, three-column index. Restoring the bug as a mutation reddened **nothing**. Diagnosis: the new tests' fixtures were whole-millisecond — rows created by separate HTTP requests, timestamps like `2026-03-03T00:00:00.000Z` — and truncating microseconds from those is exactly lossless. **That is the same blind spot that let Finding 7 through phase 3a's seven-mutation sweep.** Writing a test "for the lesson" does not test the lesson if its fixtures cannot express the failure. Fixed with a case whose two rows are inserted in **one statement** and therefore genuinely share a microsecond, carrying a non-vacuity assertion that they do. S8 now reddens it.
+
+**The doc refresh.** `ISOLATION.md` §7g added in the existing mechanism → trap → evidence idiom, with all five negatives quoted as real output and the grant table read from the live catalog. **§9 realigned:** the domain surface is **4 of 4 v1.0 tables built and isolation-proven** — and the brief's fifth table is `audit_log`, which is step 7's, not the domain's, so the count is stated that way rather than as "complete". OPEN-8's bullet replaced by the soft-delete-only + OPEN-9 deferral; the audit bullet sharpened from seven to **ten** mutation types, naming maintenance editing as the case where `audit_log` would be the **only** record because it emits no lifecycle event — the one a retrofit driven from `asset_events` would certainly miss. README status, line 9, two new findings and two where-to-look rows; PORTFOLIO gains finding 10 ("a policy decision is only real if it is encoded in something that refuses") and a not-proven bullet naming hard delete as a capability deliberately absent.
+
+**Citations: 135 in `ISOLATION.md`, all resolving, re-validated after formatting.** New §7g links are mostly **file-level by choice** — the direct response to 3d, where 32 line anchors had drifted onto explanatory comments. The three claims where precision earns its keep carry line anchors, each verified to land on a declaration: the `GRANT` (`:154`), the policy (`:141-145`), assertion 14 (`:486`), the `SOFT_DELETE_ONLY_TABLES` declaration (`:211`) and the capstone `it(...)` (`:133`).
+
+**300 tests green** (was 266; +34). Lint, typecheck, build and format verified by exit code.
+
+**Step 6 is complete.** The v1.0 domain surface is four tables, all isolation-proven. Hard delete (OPEN-9) and the audit trail (OPEN-6, ten mutation types; OPEN-4) carry to step 7.
+
+**Next**
+
+- Step 7 — the audit module. It owns OPEN-6's retrofit across all ten mutation types, answers OPEN-4 (role-at-time-of-action), and is the gate that unblocks OPEN-9.
+
+---
 
 ### 2026-09-11 — Step 6 Phase 3d: the §8.3 capstone, consolidated acceptance, and the doc refresh (§11 step 6)
 

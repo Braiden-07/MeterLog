@@ -372,6 +372,187 @@ describe('catalog-driven tenant isolation', () => {
   });
 
   /**
+   * `maintenance_records` — the MUTABLE child (ADR-008).
+   *
+   * Three properties here that none of the other domain tables needed, because it
+   * is the first table with a general `UPDATE`:
+   *
+   *   1. **Tenant immutability under UPDATE.** The append-only children have no
+   *      UPDATE path at all, so their `WITH CHECK` governs only INSERT. A general
+   *      UPDATE could rewrite `tenant_id` and walk a row into another tenant.
+   *   2. **Soft delete without the OPEN-5 deadlock.** The soft-delete write is an
+   *      `UPDATE ... SET deleted_at`, and Postgres applies the SELECT policy to the
+   *      NEW ROW of an `UPDATE ... WHERE` — so a liveness predicate in the policy
+   *      would block the very statement it was meant to guard.
+   *   3. **Hard DELETE refused by a missing grant**, which is how ADR-008's
+   *      soft-delete-only decision is proven rather than asserted.
+   */
+  describe('maintenance_records — the mutable child (ADR-008)', () => {
+    const seedRecord = (tenantId: string, assetId: string, description = 'annual service') =>
+      withTenant(app, tenantId, (tx) =>
+        tx.$queryRawUnsafe<{ id: string }[]>(
+          `INSERT INTO public.maintenance_records
+             (tenant_id, asset_id, description, performed_at, created_by)
+           VALUES ($1::uuid, $2::uuid, $3, now(), $4::uuid)
+           RETURNING id::text AS id`,
+          tenantId,
+          assetId,
+          description,
+          FIXTURE_USER,
+        ),
+      );
+
+    it('rejects a record pointing at an asset in another tenant (23503, not RLS)', async () => {
+      // ADR-007's composite FK on its THIRD child. Constructed so only the FK can
+      // fire: acting in B with tenant_id = B, so the WITH CHECK is satisfied, but
+      // pointing at an asset owned by A.
+      const failure = await capturePgFailure(
+        withTenant(app, TENANT_B, (tx) =>
+          tx.$executeRawUnsafe(
+            `INSERT INTO public.maintenance_records
+               (tenant_id, asset_id, description, performed_at, created_by)
+             VALUES ($1::uuid, $2::uuid, 'x', now(), $3::uuid)`,
+            TENANT_B,
+            contexts[TENANT_A]!.assetId,
+            FIXTURE_USER,
+          ),
+        ),
+      );
+
+      expect(failure.sqlstate).toBe('23503');
+      expect(failure.message).toMatch(/maintenance_records_asset_tenant_fkey/);
+      expect(failure.message).not.toMatch(/row-level security/i);
+    });
+
+    it('TENANT IMMUTABILITY — an UPDATE cannot move a row to another tenant (42501)', async () => {
+      // THE PROPERTY A GENERAL-UPDATE TABLE NEEDS AND THE APPEND-ONLY CHILDREN
+      // NEVER DID. Their WITH CHECK only ever governs INSERT because they have no
+      // UPDATE path; here it is what refuses a row walking between tenants.
+      const rows = await seedRecord(TENANT_A, contexts[TENANT_A]!.assetId);
+      const id = rows[0]!.id;
+
+      const failure = await capturePgFailure(
+        withTenant(app, TENANT_A, (tx) =>
+          tx.$executeRawUnsafe(
+            `UPDATE public.maintenance_records SET tenant_id = $1::uuid WHERE id = $2::uuid`,
+            TENANT_B,
+            id,
+          ),
+        ),
+      );
+
+      expect(failure.sqlstate).toBe('42501');
+      expect(failure.message).toMatch(/row-level security/i);
+      // Distinctly NOT a privilege failure: UPDATE *is* granted on this table, so a
+      // "permission denied" here would mean the grant was wrong rather than the
+      // policy doing its job.
+      expect(failure.message).not.toMatch(/permission denied/i);
+
+      // The row stayed in A.
+      const where = await migrator.$queryRawUnsafe<{ tenant_id: string }[]>(
+        `SELECT tenant_id::text AS tenant_id FROM public.maintenance_records WHERE id = $1::uuid`,
+        id,
+      );
+      expect(where[0]!.tenant_id).toBe(TENANT_A);
+    });
+
+    it('the general field UPDATE works — the grant and policy permit real edits', async () => {
+      // Pairs with the negative above the way assertion 10 pairs with 9. "Cannot
+      // move tenants" is trivially satisfied by a table nobody can update at all,
+      // which would be fail-closed and broken: this is the only domain table where
+      // editing a field is a legitimate operation.
+      const rows = await seedRecord(TENANT_A, contexts[TENANT_A]!.assetId, 'before');
+      const id = rows[0]!.id;
+
+      const affected = await withTenant(app, TENANT_A, (tx) =>
+        tx.$executeRawUnsafe(
+          `UPDATE public.maintenance_records SET description = 'after', updated_at = now()
+            WHERE id = $1::uuid`,
+          id,
+        ),
+      );
+      expect(affected).toBe(1);
+
+      const after = await migrator.$queryRawUnsafe<{ description: string }[]>(
+        `SELECT description FROM public.maintenance_records WHERE id = $1::uuid`,
+        id,
+      );
+      expect(after[0]!.description).toBe('after');
+    });
+
+    it('SOFT DELETE does not deadlock against its own SELECT policy (OPEN-5 reused)', async () => {
+      // THE OPEN-5 TRAP, PROVEN AVOIDED RATHER THAN ASSUMED.
+      //
+      // Postgres applies a table's SELECT-applicable policy to the NEW ROW of an
+      // `UPDATE ... WHERE`. So a policy predicate of `deleted_at IS NULL` would make
+      // the revoking UPDATE — the one that sets `deleted_at` — fail to see the row
+      // it just wrote, which is the deadlock recorded on `memberships`.
+      //
+      // This table's policy carries no `deleted_at` term, so the soft-delete write
+      // succeeds and reports one row affected. If someone adds liveness to the
+      // policy "to be consistent with the read path", this is what reddens.
+      const rows = await seedRecord(TENANT_A, contexts[TENANT_A]!.assetId);
+      const id = rows[0]!.id;
+
+      const affected = await withTenant(app, TENANT_A, (tx) =>
+        tx.$executeRawUnsafe(
+          `UPDATE public.maintenance_records SET deleted_at = now() WHERE id = $1::uuid`,
+          id,
+        ),
+      );
+      expect(affected).toBe(1);
+
+      // The row persists — soft, not hard.
+      const after = await migrator.$queryRawUnsafe<{ deleted_at: Date | null }[]>(
+        `SELECT deleted_at FROM public.maintenance_records WHERE id = $1::uuid`,
+        id,
+      );
+      expect(after).toHaveLength(1);
+      expect(after[0]!.deleted_at).not.toBeNull();
+
+      // And a soft-deleted row is still VISIBLE to the policy — liveness is an
+      // application concern. If it were filtered here, the soft delete would be
+      // indistinguishable from a hard one and the history would be unreachable.
+      const stillVisible = await withTenant(app, TENANT_A, (tx) =>
+        tx.$queryRawUnsafe<{ n: number }[]>(
+          `SELECT count(*)::int AS n FROM public.maintenance_records WHERE id = $1::uuid`,
+          id,
+        ),
+      );
+      expect(stillVisible[0]!.n).toBe(1);
+    });
+
+    it('HARD DELETE is refused by a missing grant — ADR-008 proven, not asserted', async () => {
+      // THE CENTERPIECE OF PHASE 4. "Soft delete for v1.0" is true exactly as long
+      // as the DELETE privilege is absent, and this is the demonstration.
+      //
+      // Asserted on SQLSTATE **and** message: 42501 alone cannot distinguish "a
+      // policy refused this row" from "this role holds no such privilege", and here
+      // it must be the latter — the policy would happily permit deleting an own-
+      // tenant row, so a policy-shaped refusal would mean the grant was wrong.
+      const rows = await seedRecord(TENANT_A, contexts[TENANT_A]!.assetId);
+      const id = rows[0]!.id;
+
+      const failure = await capturePgFailure(
+        withTenant(app, TENANT_A, (tx) =>
+          tx.$executeRawUnsafe(`DELETE FROM public.maintenance_records WHERE id = $1::uuid`, id),
+        ),
+      );
+
+      expect(failure.sqlstate).toBe('42501');
+      expect(failure.message).toMatch(/permission denied for table maintenance_records/);
+      expect(failure.message).not.toMatch(/row-level security/i);
+
+      // The row is untouched — the refusal happened before anything was removed.
+      const survived = await migrator.$queryRawUnsafe<{ n: number }[]>(
+        `SELECT count(*)::int AS n FROM public.maintenance_records WHERE id = $1::uuid`,
+        id,
+      );
+      expect(survived[0]!.n).toBe(1);
+    });
+  });
+
+  /**
    * `assets_tenant_serial_live_key` — serial numbers are unique PER TENANT and
    * only AMONG LIVE ROWS (decided at the Phase 1 gate).
    *
