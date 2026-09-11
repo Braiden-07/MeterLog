@@ -17,10 +17,11 @@ import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
  * Two jobs, and deliberately not a third:
  *
  *  1. **The capstone.** The isolation axes were each proven where they were built —
- *     SELECT at 3a, INSERT/UPDATE at 3b, DELETE and transitions at 3c. This asserts
- *     them as ONE scenario in ONE session, which is the artifact `ISOLATION.md`
- *     cites for the ADR-006 §8.3 claim. A reviewer should be able to read one test
- *     and see the whole property.
+ *     SELECT at 3a, INSERT/UPDATE at 3b, DELETE and transitions at 3c, and the
+ *     general field edit at phase 4. This asserts them as ONE scenario in ONE
+ *     session across **all four domain tables**, which is the artifact
+ *     `ISOLATION.md` cites for the ADR-006 §8.3 claim. A reviewer should be able to
+ *     read one test and see the whole property.
  *
  *  2. **Cross-cutting conventions**, asserted once across the domain surface rather
  *     than per endpoint: the error envelope, the OpenAPI document, and the
@@ -99,6 +100,12 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
       .set('Cookie', cookie)
       .send({ value: '100.5', unit: 'kWh', readAt });
 
+  const addMaintenance = (cookie: string, assetId: string, description = 'annual service') =>
+    http()
+      .post('/api/v1/maintenance-records')
+      .set('Cookie', cookie)
+      .send({ assetId, description, performedAt: '2026-04-01T09:00:00.000Z' });
+
   // =========================================================== PART 1: §8.3
   describe('ADR-006 §8.3 — the money test, consolidated', () => {
     /**
@@ -133,7 +140,7 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
         .send({ email: 'm@acme.test', role: 'admin' })
         .expect(201);
 
-      // B's data, created by B's owner.
+      // B's data, created by B's owner — all four tables.
       const assetB = await register(b.cookie, 'B-0001');
       await addReading(b.cookie, assetB).expect(201);
       await http()
@@ -141,10 +148,12 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
         .set('Cookie', b.cookie)
         .send({ eventType: 'activated' })
         .expect(201);
+      const maintB = (await addMaintenance(b.cookie, assetB, 'B service').expect(201)).body.id;
 
       // A's data, created by M. Registration left A active for M's session.
       const assetA = await register(a.cookie, 'A-0001');
       await addReading(a.cookie, assetA).expect(201);
+      await addMaintenance(a.cookie, assetA, 'A service').expect(201);
 
       // ---------- SELECT ----------
       const list = await http().get('/api/v1/assets').set('Cookie', a.cookie).expect(200);
@@ -156,6 +165,17 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
       await http().get(`/api/v1/assets/${assetB}`).set('Cookie', a.cookie).expect(404);
       await http().get(`/api/v1/assets/${assetB}/events`).set('Cookie', a.cookie).expect(404);
       await http().get(`/api/v1/assets/${assetB}/readings`).set('Cookie', a.cookie).expect(404);
+
+      // The fourth table. B's maintenance record is invisible by id, and A's list
+      // contains only A's own.
+      await http().get(`/api/v1/maintenance-records/${maintB}`).set('Cookie', a.cookie).expect(404);
+      const maintList = await http()
+        .get('/api/v1/maintenance-records?includeDeleted=true&limit=100')
+        .set('Cookie', a.cookie)
+        .expect(200);
+      expect(maintList.body.items).toHaveLength(1);
+      expect(maintList.body.items[0].description).toBe('A service');
+      expect(maintList.body.items.map((x: { id: string }) => x.id)).not.toContain(maintB);
 
       // B's asset is not reachable through the list either, with soft-deleted rows
       // included — so it is not merely filtered, it is absent.
@@ -183,6 +203,10 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
         .send({ eventType: 'maintenance_started' })
         .expect(404);
 
+      // Creating maintenance against B's asset is refused the same way — the parent
+      // does not exist for this request, so there is nothing to attach work to.
+      await addMaintenance(a.cookie, assetB).expect(404);
+
       // ---------- UPDATE ----------
       await http()
         .patch(`/api/v1/assets/${assetB}`)
@@ -190,8 +214,24 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
         .send({ location: 'hijacked' })
         .expect(404);
 
+      // THE GENERAL FIELD EDIT — new at phase 4, and the reason the UPDATE axis now
+      // means something it did not before. `PATCH /assets/:id` edits metadata and
+      // cannot touch status; this rewrites an arbitrary field on a row in another
+      // tenant, which is the first time tenant isolation has had to hold against a
+      // plain value edit.
+      await http()
+        .patch(`/api/v1/maintenance-records/${maintB}`)
+        .set('Cookie', a.cookie)
+        .send({ description: 'hijacked' })
+        .expect(404);
+
       // ---------- DELETE ----------
       await http().delete(`/api/v1/assets/${assetB}`).set('Cookie', a.cookie).expect(404);
+      // Soft-delete isolation: 404, and B's record is NOT soft-deleted either.
+      await http()
+        .delete(`/api/v1/maintenance-records/${maintB}`)
+        .set('Cookie', a.cookie)
+        .expect(404);
 
       // ---------- B is verifiably untouched ----------
       // Read as the migration role, which RLS does not filter, so this is the state
@@ -216,6 +256,22 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
       expect(bAfter[0]!.deleted_at).toBeNull();
       expect(bAfter[0]!.readings).toBe(1); // B's one reading, no extra from A
       expect(bAfter[0]!.events).toBe(3); // created, installed, activated — nothing more
+
+      // B's maintenance record: description untouched by the PATCH, and deleted_at
+      // still null despite the DELETE. Soft delete makes this checkable in a way a
+      // hard delete would not — the row is there to inspect.
+      const maintAfter = await migrator.$queryRawUnsafe<
+        { description: string; deleted_at: Date | null; n: number }[]
+      >(
+        `SELECT description, deleted_at,
+                (SELECT count(*)::int FROM public.maintenance_records) AS n
+           FROM public.maintenance_records WHERE id = $1::uuid`,
+        maintB,
+      );
+      expect(maintAfter[0]!.description).toBe('B service');
+      expect(maintAfter[0]!.deleted_at).toBeNull();
+      // Two records total — B's and A's. A's attempts created nothing in B.
+      expect(maintAfter[0]!.n).toBe(2);
 
       // ---------- and A's own tenant is intact ----------
       const aAssets = await http()
@@ -258,6 +314,7 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
 
       const assetA = await register(a.cookie, 'A-0001');
       const assetB = await register(b.cookie, 'B-0001');
+      const maintB = (await addMaintenance(b.cookie, assetB, 'B service').expect(201)).body.id;
 
       await http()
         .post('/api/v1/auth/switch')
@@ -269,8 +326,18 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
       await http().get(`/api/v1/assets/${assetB}`).set('Cookie', a.cookie).expect(200);
       await http().get(`/api/v1/assets/${assetA}`).set('Cookie', a.cookie).expect(404);
 
-      // And as an admin of B, M may now decommission B's asset — proving the earlier
-      // 404s were never about permission.
+      // And as an admin of B, M may now edit and retract B's maintenance record, and
+      // decommission B's asset — which is what proves the earlier 404s were never
+      // about permission.
+      await http()
+        .patch(`/api/v1/maintenance-records/${maintB}`)
+        .set('Cookie', a.cookie)
+        .send({ description: 'now permitted' })
+        .expect(200);
+      await http()
+        .delete(`/api/v1/maintenance-records/${maintB}`)
+        .set('Cookie', a.cookie)
+        .expect(204);
       await http().delete(`/api/v1/assets/${assetB}`).set('Cookie', a.cookie).expect(204);
       await http().delete(`/api/v1/assets/${assetA}`).set('Cookie', a.cookie).expect(404);
     });
@@ -338,6 +405,17 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
             .get(`/api/v1/assets/${asset}/readings?cursor=!!!`)
             .set('Cookie', a.cookie),
         },
+        {
+          label: '404 unknown maintenance record',
+          res: await http().get(`/api/v1/maintenance-records/${ghost}`).set('Cookie', a.cookie),
+        },
+        {
+          label: '404 maintenance against an unknown asset',
+          res: await http()
+            .post('/api/v1/maintenance-records')
+            .set('Cookie', a.cookie)
+            .send({ assetId: ghost, description: 'x', performedAt: '2026-04-01T09:00:00.000Z' }),
+        },
       ];
 
       for (const { label, res } of cases) {
@@ -367,7 +445,7 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
 
   // ================================================ PART 2: the OpenAPI document
   describe('OpenAPI — every domain endpoint is documented (PROJECT_BRIEF §6)', () => {
-    it('renders all nine domain operations, and found a non-empty document', () => {
+    it('renders all fourteen domain operations, and found a non-empty document', () => {
       // The brief requires OpenAPI docs for the API. Nothing asserted that before
       // 3d, so this is a genuine gap rather than a restatement.
       const document = SwaggerModule.createDocument(
@@ -398,6 +476,12 @@ describe('step 6 acceptance — the §8.3 capstone and cross-cutting conventions
         'POST /api/v1/assets/{id}/events',
         'GET /api/v1/assets/{id}/readings',
         'POST /api/v1/assets/{id}/readings',
+        // Phase 4 — the fourth table, the only full CRUD-with-soft-delete surface.
+        'GET /api/v1/maintenance-records',
+        'POST /api/v1/maintenance-records',
+        'GET /api/v1/maintenance-records/{id}',
+        'PATCH /api/v1/maintenance-records/{id}',
+        'DELETE /api/v1/maintenance-records/{id}',
       ];
 
       const missing = expected.filter((op) => !operations.has(op));

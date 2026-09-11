@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   APPEND_ONLY_TABLES,
+  SOFT_DELETE_ONLY_TABLES,
   DEFINER_ACCESSIBLE_TABLES,
   EXPECTED_DEFINER_FUNCTIONS,
   RLS_EXEMPT_TABLES,
@@ -480,5 +481,67 @@ describe('RLS catalog coverage', () => {
       actual,
       'an append-only table must hold exactly SELECT, INSERT for the app role — a stray GRANT reopens it to mutation',
     ).toEqual(expected);
+  });
+
+  it('14. every soft-delete-only table grants exactly SELECT, INSERT, UPDATE — never DELETE', async () => {
+    // BINDS ADR-008's DECISION TO THE GRANT (step 6 phase 4).
+    //
+    // `maintenance_records` is soft-delete for v1.0. That is true exactly as long
+    // as the DELETE privilege is absent, so this asserts the grant set rather than
+    // trusting the service to only ever issue an UPDATE.
+    //
+    // The failure this closes is one line and completely silent:
+    //
+    //     GRANT DELETE ON public.maintenance_records TO meterlog_app;
+    //
+    // v1.0 would become destructive **two build steps before `audit_log` exists**,
+    // so a purged maintenance record would leave no trace of itself, of who removed
+    // it, or of what it said (OPEN-9). Nothing else in the suite would notice:
+    // assertion 13 covers only append-only tables, and the isolation matrix's
+    // DELETE case branches on the fixture's DECLARED capability, so it would keep
+    // asserting "refused" and keep passing — because the missing POLICY, not the
+    // missing grant, would still refuse a cross-tenant statement.
+    //
+    // Asserted as an EQUALITY, not a subset. "Holds no DELETE" is satisfied by a
+    // table the app role cannot read or write at all — fail-closed but broken, the
+    // same trap assertion 10 exists to close for assertion 9.
+    const rows = await db.$queryRawUnsafe<{ table_name: string; privileges: string }[]>(
+      `
+      SELECT c.relname AS table_name,
+             coalesce(string_agg(priv, ', ' ORDER BY priv), '') AS privileges
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES']) AS priv
+      WHERE n.nspname = 'public'
+        AND c.relkind = 'r'
+        AND c.relname = ANY ($1::text[])
+        AND has_table_privilege('meterlog_app', c.oid, priv)
+      GROUP BY 1
+      ORDER BY 1
+    `,
+      SOFT_DELETE_ONLY_TABLES as string[],
+    );
+
+    const actual = Object.fromEntries(rows.map((r) => [r.table_name, r.privileges]));
+    const expected = Object.fromEntries(
+      SOFT_DELETE_ONLY_TABLES.map((t) => [t, 'INSERT, SELECT, UPDATE']),
+    );
+
+    expect(
+      actual,
+      'a soft-delete-only table must hold exactly SELECT, INSERT, UPDATE — a DELETE grant makes v1.0 destructive before anything can audit it (ADR-008, OPEN-9)',
+    ).toEqual(expected);
+  });
+
+  it('15. no domain table is declared both append-only and soft-delete-only', async () => {
+    // The two profiles are mutually exclusive: append-only refuses UPDATE, and
+    // soft-delete-only requires it. A table in both lists would make assertions 13
+    // and 14 demand contradictory grant sets, and whichever ran second would be the
+    // one that "failed" — obscuring that the declaration itself was incoherent.
+    const overlap = APPEND_ONLY_TABLES.filter((t) => SOFT_DELETE_ONLY_TABLES.includes(t));
+    expect(
+      overlap,
+      `declared both append-only and soft-delete-only: ${overlap.join(', ')}`,
+    ).toEqual([]);
   });
 });

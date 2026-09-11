@@ -55,6 +55,7 @@ model Tenant {
   assets      Asset[]
   assetEvents AssetEvent[]
   readings    Reading[]
+  maintenance MaintenanceRecord[]
 
   @@map("tenants")
 }
@@ -71,6 +72,7 @@ model User {
   memberships Membership[]
   assetEvents AssetEvent[]
   readings    Reading[]
+  maintenance MaintenanceRecord[]
 
   @@map("users")
 }
@@ -112,9 +114,10 @@ model Asset {
   updatedAt    DateTime    @default(now()) @map("updated_at") @db.Timestamptz(6)
   deletedAt    DateTime?   @map("deleted_at") @db.Timestamptz(6)
 
-  tenant   Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-  events   AssetEvent[]
-  readings Reading[]
+  tenant      Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  events      AssetEvent[]
+  readings    Reading[]
+  maintenance MaintenanceRecord[]
 
   /// The parent half of every child's composite FK (ADR-007). `id` is already
   /// unique alone; this exists solely so a child can reference (id, tenant_id).
@@ -175,4 +178,38 @@ model Reading {
   @@index([tenantId], map: "readings_tenant_id_idx")
   @@index([assetId, readAt], map: "readings_asset_id_read_at_idx")
   @@map("readings")
+}
+
+/// The fourth and final v1.0 domain child, and the only MUTABLE one: UPDATE here
+/// means "edit a field", not "advance a state machine" (ADR-008).
+///
+/// SOFT DELETE ONLY for v1.0 — the app role holds SELECT, INSERT, UPDATE and no
+/// DELETE, asserted as an equality by catalog assertion 14. Hard delete is
+/// deferred until after the audit module (OPEN-9) so no destructive operation
+/// predates the trail that would make it accountable.
+///
+/// A LEAF: no `@@unique([id, tenantId])` — nothing is a child of a maintenance
+/// record.
+model MaintenanceRecord {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String    @map("tenant_id") @db.Uuid
+  assetId     String    @map("asset_id") @db.Uuid
+  description String
+  /// Domain time — when the work was performed. Caller-supplied, no default.
+  performedAt DateTime  @map("performed_at") @db.Timestamptz(6)
+  createdBy   String    @map("created_by") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+  /// Soft delete (ADR-008). Appears in NO policy predicate — OPEN-5.
+  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  author User   @relation(fields: [createdBy], references: [id], onDelete: Restrict)
+
+  /// ADR-007 composite FK, third child. Rejected as 23503, not the RLS 42501.
+  asset Asset @relation(fields: [assetId, tenantId], references: [id, tenantId], onDelete: Restrict, map: "maintenance_records_asset_tenant_fkey")
+
+  @@index([tenantId], map: "maintenance_records_tenant_id_idx")
+  @@index([assetId, performedAt, id], map: "maintenance_records_asset_id_performed_at_idx")
+  @@map("maintenance_records")
 }
