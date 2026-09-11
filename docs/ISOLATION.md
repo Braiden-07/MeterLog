@@ -4,7 +4,7 @@
 >
 > **Every technical claim below carries a `file:line` citation into this repository, and every security property is backed by a negative — a rejected write, a zero-row read, a refused request — executed against a live PostgreSQL 16 instance.** Click any of them. A document that invites that check should read differently from one that asserts.
 >
-> **Status:** build-order steps 4 (auth + tenancy) and 5 (RBAC + membership management) complete. §9 states plainly what is _not_ yet proven — and step 5 made that section more important, not less.
+> **Status:** build-order steps 4 (auth + tenancy), 5 (RBAC + membership management) and 6 phases 1-3 (the domain surface: `assets`, `asset_events`, `readings`) complete. §9 states plainly what is _not_ yet proven — and step 6 made that section more important, not less, because it is the first step whose headline claim is broad enough to be misread.
 
 ---
 
@@ -12,7 +12,7 @@
 
 MeterLog is a multi-tenant SaaS whose isolation guarantee is enforced by PostgreSQL Row-Level Security rather than by application `WHERE` clauses. That much is unremarkable. What this document is actually about is a narrower claim:
 
-**Six separate times, a defect survived design review, code review and a green test suite — and was caught only by running the thing against a real database.** Each one reviewed as correct. Each one would have shipped.
+**Seven separate times, a defect survived design review, code review and a green test suite — and was caught only by running the thing against a real database.** Each one reviewed as correct. Each one would have shipped.
 
 | #   | Step | Defect                                                                                                          | Why reading missed it                                                        |
 | --- | ---- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
@@ -22,8 +22,11 @@ MeterLog is a multi-tenant SaaS whose isolation guarantee is enforced by Postgre
 | 4   | 4    | An app-side predicate whose absence is masked by a policy one join away                                         | The obvious test for it passes either way                                    |
 | 5   | 5    | A lock-**order** bug invisible to the concurrency test written to catch the lock bug                            | The forced interleaving that proves one race structurally prevents the other |
 | 6   | 5    | The RBAC gate could be **deleted with the entire endpoint suite still green**                                   | A correctly-redundant layer is invisible to tests that only assert outcomes  |
+| 7   | 6    | A keyset cursor that **silently lost rows**, because a JS `Date` truncates a Postgres microsecond               | Tests seeded whole-second timestamps, where the truncation is lossless       |
 
 Findings 5 and 6 are not code defects — they are **proof** defects, which is the same class one level up. In both cases the security property held; what was broken was the evidence for it. That distinction is the subject of §8.
+
+Finding 7 is the sharpest illustration of the whole thesis, because it was found by the NEXT phase rather than by its own: the cursor shipped at phase 3a with a full mutation sweep green, and the defect surfaced only when phase 3b created rows with real `now()` timestamps. Every mutation had tested the code against fixtures the same author wrote. See §7e.
 
 ---
 
@@ -69,7 +72,7 @@ The self axis exists so a user can list their own workspaces at login, before an
 
 The project's generic isolation harness sets **only** `app.current_tenant` ([helpers.ts:179-193](../apps/api/test/db/helpers.ts#L179-L193)). Run against `memberships`, the self axis therefore never fires, the matrix sees A's rows and no B rows, and it **passes** — having exercised exactly half the policy surface. A green result there is evidence of nothing.
 
-That is why `memberships` is registered in an explicit exempt-with-bespoke-handler set rather than being quietly absent ([helpers.ts:129](../apps/api/test/db/helpers.ts#L129)), and why the fixture-coverage check asserts registry/catalog equality **in both directions** so a new table cannot arrive without a fixture ([isolation.spec.ts:50-86](../apps/api/test/db/isolation.spec.ts#L50-L86)).
+That is why `memberships` is registered in an explicit exempt-with-bespoke-handler set rather than being quietly absent ([helpers.ts:132](../apps/api/test/db/helpers.ts#L132)), and why the fixture-coverage check asserts registry/catalog equality **in both directions** so a new table cannot arrive without a fixture ([isolation.spec.ts:50-86](../apps/api/test/db/isolation.spec.ts#L50-L86)).
 
 ### The evidence
 
@@ -445,6 +448,113 @@ There is an operational payoff beyond the test: `NOT_ADMIN` reaching a client no
 
 ---
 
+## 7e. Finding 7 — the cursor that lost rows, found by the phase after the one that shipped it
+
+### The mechanism
+
+Keyset pagination needs a **total** order, so every cursor is the pair `(sort_value, id)` and every `ORDER BY` carries `id` ([cursor.ts:25-41](../apps/api/src/common/pagination/cursor.ts#L25-L41)). For `asset_events` the tie is not a rare collision but a certainty: registering an asset emits `created` **and** `installed` in one transaction, so every asset's genesis is two rows sharing a `created_at` to the microsecond ([assets.service.ts:343-352](../apps/api/src/assets/assets.service.ts#L343-L352)).
+
+### The trap
+
+The first implementation encoded the cursor from the value Prisma handed back — a JavaScript `Date`. **Postgres `timestamptz` is microsecond-precision; a JS `Date` is millisecond.** `toISOString()` therefore produced a cursor pointing at an instant _earlier_ than the row it came from, and the next page's predicate `(created_at, id) < (truncated, id)` excluded **that row and every row sharing its millisecond**. Pagination stopped early, having silently dropped rows — no error, correct-looking output, a plausible `nextCursor`.
+
+It passed phase 3a's entire suite **including a seven-mutation sweep**, because those tests seeded timestamps like `2026-01-01T00:00:00Z`, where truncation is lossless. It was caught at phase 3b by a test that paginated the genesis pair — the first data in the project created by `now()`.
+
+### The evidence
+
+The fix removes the lossy step rather than compensating for it: every paginated query re-selects its sort column as `::text`, that exact string travels in the cursor, and it returns to Postgres as `$n::timestamptz` ([assets.service.ts:85-92](../apps/api/src/assets/assets.service.ts#L85-L92)). `encodeCursor` now **refuses a `Date` in its signature**, so the mistake cannot recur silently ([cursor.ts:86-89](../apps/api/src/common/pagination/cursor.ts#L86-L89)).
+
+Restoring the old behaviour as a mutation reddens the genesis-pair walk ([assets-write.spec.ts:168-190](../apps/api/test/api/assets-write.spec.ts#L168-L190)), and a tied-`read_at` case was added at 3a for the same property on `readings` after a mutation proved the readings tiebreaker was **unreachable** — the events tie was covered, the readings tie had no test ([assets-read.spec.ts:378-410](../apps/api/test/api/assets-read.spec.ts#L378-L410)).
+
+**The lesson is about the sweep, not the cursor.** Seven mutations passed against code whose _data shape_ was the blind spot. A mutation sweep tests the assertions against the fixtures; it cannot tell you the fixtures were unrepresentative.
+
+---
+
+## 7f. Finding 8 — the domain surface, and the trap a design choice closed instead of a test
+
+Step 6 added `assets` and its two children. Four properties are now proven that §9 previously listed as unproven; each is stated with its negative.
+
+### The isolation matrix went from zero cases to fifteen
+
+The catalog-driven matrix has existed since step 4, asserting that every tenant-scoped table's policy is _correct_ rather than merely present. Until step 6 it generated **zero cases against real tables** — `tenants`, `users` and `memberships` are all registered bespoke, because the app role cannot write any of them.
+
+`assets`, `asset_events` and `readings` are the first tables it genuinely can. It now generates **15 cases across three tables** — five each: cross-tenant read invisibility, cross-tenant `UPDATE`, cross-tenant `DELETE`, a `WITH CHECK`-rejected foreign-tenant `INSERT`, and the zero-rows-with-no-context baseline ([isolation.spec.ts:169-263](../apps/api/test/db/isolation.spec.ts#L169-L263), generated from the registry at [helpers.ts:271](../apps/api/test/db/helpers.ts#L271)).
+
+The registry's key set is asserted **equal to the catalog's** in both directions, so a new tenant-scoped table cannot arrive without a fixture and a fixture cannot outlive its table ([isolation.spec.ts:85-120](../apps/api/test/db/isolation.spec.ts#L85-L120)).
+
+Two harness defects had to be fixed before it could run against a real table at all, and both are worth naming because the matrix had been "built and self-tested" for two whole steps while being unable to work: it invented tenant UUIDs and never created rows for them (invisible while the only table under test was a scratch table with no foreign keys), and `dependsOn` — ADR-004's promised FK-ordering mechanism — **was never read by anything**. It was documentation shaped like code. Parent-first seeding is now done centrally ([helpers.ts:312-345](../apps/api/test/db/helpers.ts#L312-L345)); ADR-004's bullet was amended rather than quietly dropped.
+
+### Child tenancy is enforced by a constraint, not by application care (ADR-007)
+
+Children carry their own `tenant_id` so their policy is the canonical single-column expression — **no subquery in a policy on a FORCE-RLS table**, which is the shape that produced the OPEN-5 deadlock and the `FOR ALL` write vectors. The cost of denormalizing is that the two halves can disagree, and **RLS cannot see that**: the policy compares `tenant_id` to the GUC, and in a mismatched row that half is correct. The row would be perfectly isolated and attached to another tenant's asset.
+
+A composite foreign key makes it unrepresentable — `FOREIGN KEY (asset_id, tenant_id) REFERENCES assets (id, tenant_id)` ([asset_events](../apps/api/prisma/migrations/20260910000000_domain_assets_asset_events/migration.sql#L172-L174), [readings](../apps/api/prisma/migrations/20260911000000_domain_readings/migration.sql#L108-L110)).
+
+**The negative, run as the migration role — a privileged connection RLS does not filter at all**, which is the property a constraint has and a policy does not:
+
+```
+ERROR:  insert or update on table "asset_events" violates foreign key constraint "asset_events_asset_tenant_fkey"
+DETAIL:  Key (asset_id, tenant_id)=(dddddddd-...-0004, bbbbbbbb-...-0002) is not present in table "assets".
+
+ERROR:  insert or update on table "readings" violates foreign key constraint "readings_asset_tenant_fkey"
+DETAIL:  Key (asset_id, tenant_id)=(dddddddd-...-0004, bbbbbbbb-...-0002) is not present in table "assets".
+```
+
+Asserted on SQLSTATE **`23503`** and the constraint name, and explicitly **not** on the RLS message — two mechanisms, two assertions, because a single "it was rejected" check would let either stop working while staying green ([isolation.spec.ts:279-360](../apps/api/test/db/isolation.spec.ts#L279-L360)).
+
+A trigger was rejected for a concrete reason rather than a stylistic one: it would need `created_by` from `app.current_user`, every migrator-seeded fixture has no such GUC, and the required "skip when unset" fallback **is** the silent skip the trigger existed to prevent — fail-open by default ([ADR-007](DECISIONS.md), [assets.service.ts:262-282](../apps/api/src/assets/assets.service.ts#L262-L282)).
+
+### Append-only is a declared property bound to a grant
+
+`asset_events` and `readings` are append-only. The brief says so for `asset_events` but **never for `readings`** — there it follows only from an absence of `updated_at`/`deleted_at`, which is exactly the implicit-by-omission shape that produced findings 2 and 4. So the property is **declared** (`APPEND_ONLY_TABLES`, [helpers.ts:187](../apps/api/test/db/helpers.ts#L187)) and **bound to the grant** by catalog assertion 13, which asserts an equality rather than a subset — "holds no UPDATE" would be satisfied by a table nobody can read either ([catalog-rls.spec.ts:435-470](../apps/api/test/db/catalog-rls.spec.ts#L435-L470)).
+
+The grant set, from the live catalog — note `assets` has `UPDATE` (soft delete is an update) and **no `DELETE` anywhere**:
+
+```
+  table_name  |       privileges
+--------------+------------------------
+ asset_events | INSERT, SELECT
+ assets       | INSERT, SELECT, UPDATE
+ readings     | INSERT, SELECT
+```
+
+**The negative, as `meterlog_app` — the role the API actually runs as:**
+
+```
+ERROR:  permission denied for table asset_events
+ERROR:  permission denied for table readings
+```
+
+A stray `GRANT UPDATE` reddens assertion 13 _and_ the isolation matrix's declared-capability case. The API layer echoes it: a guard enumerates the registered routes and fails if any `PATCH`/`PUT`/`DELETE` targets an append-only resource, with the resource set **derived from the same declaration** so `audit_log` joining it at step 7 extends the guard by one entry rather than by memory ([route-inventory.spec.ts](../apps/api/test/api/route-inventory.spec.ts)). `DELETE /assets/:id` is deliberately not caught — `assets` is soft-deleted, not append-only — and that exemption is itself asserted, so the guard cannot quietly become over-broad.
+
+### §8.3 over real HTTP — the money test, with permission ruled out as an explanation
+
+This is the claim §2 has been building toward, now proven end to end in one scenario over real HTTP with real signed cookies: **[step6-acceptance.spec.ts:126-228](../apps/api/test/api/step6-acceptance.spec.ts#L126-L228)**.
+
+User M is an **admin of both tenants**, active in A. Across the full matrix — `GET` list and by id, `GET` both child collections, `POST /assets`, `POST /readings`, `POST /events`, `PATCH`, `DELETE` — M reaches only A's rows. B's asset returns **404 on every verb**, and B's row is then read back **as the migration role** and asserted unchanged: location not modified, status still `active`, `deleted_at` null, exactly one reading, exactly three events.
+
+**The 404 is the property, and M being an admin of B is what makes that legible.** A 403 would mean "you lack permission for this row" — M does not lack permission, M is an admin of the tenant that owns it. A 403 would be the wrong answer _and_ would confirm the row exists. The 404 says the row is not in this request's universe at all, which is what RLS does: under `app.current_tenant = A`, B's rows do not exist for the query. Nothing in the handler decided to refuse them.
+
+Two companions make the point harder to explain away. M **cannot activate** a tenant they hold no live membership in — 403, against a real existent tenant owned by someone else, and the failed switch leaves nothing reachable. And switching to the tenant M _does_ hold flips the entire surface **on the same cookie**, after which M may decommission B's asset — which is what shows the earlier 404s were never about permission.
+
+Mutating the `assets` policy to `USING (true) WITH CHECK (true)` reddens all three of these tests, so the capstone is not passing for want of reaching the boundary.
+
+### The naive-map trap — the one finding closed by a design choice rather than a test
+
+The lifecycle has six event types and four statuses, and **two different transitions land on the same status**: `activated` and `maintenance_completed` both produce `active`. The natural implementation is a lookup from the new status to the event type, and it is wrong by construction — two correct answers for one key, so it must silently pick one. A meter returning from repair would be recorded as having been `activated`. The log would still replay to the right _status_, so every status assertion would pass.
+
+The fix is structural: the client names the **transition**, the target status is derived from it, and the graph is keyed on `event_type` ([lifecycle.ts:67-71](../apps/api/src/assets/lifecycle.ts#L67-L71)). **There is nowhere to put a status-keyed map**, because no code path ever starts from "the new status". The only two occurrences of `statusToEventType` in the repository are comments warning against it.
+
+The guard is one journey — register, then `activated` → `maintenance_started` → `maintenance_completed` — asserting the log reads `created, installed, activated, maintenance_started, maintenance_completed` ([assets-transitions.spec.ts:123-179](../apps/api/test/api/assets-transitions.spec.ts#L123-L179)).
+
+**Applying the naive map as a mutation reddened exactly one test — that one.** Statuses stayed correct, the replay reconciliation still passed, event counts were right, payloads stayed plausible, every request still returned 201. The test's own comment claims the failure is silent everywhere else; the sweep confirmed it rather than asserting it. That is why it is marked load-bearing.
+
+Alongside it, §9.2's invariant is made executable: for every asset, `status` must equal the `to` of its latest status-bearing event ([assets-transitions.spec.ts:550-620](../apps/api/test/api/assets-transitions.spec.ts#L550-L620)). It carries its two preconditions on the test, because both are needed or it false-positives — derive only from events whose payload has a `to` (`created` carries `{}` and shares the genesis timestamp), and run only over API-created assets (the isolation fixtures insert assets with no events by design, so a replay over scaffolding would flag status-with-no-event).
+
+And one more floor, because decommissioning moves two columns that must agree: `CHECK ((status = 'decommissioned') = (deleted_at IS NOT NULL))` ([migration.sql](../apps/api/prisma/migrations/20260912000000_assets_decommission_biconditional/migration.sql)). It landed **before** the endpoint that could violate it. Breaking `DELETE` to set only `status` reddens nine tests, and the floor is proven independently of the endpoint — a migration-role `UPDATE` raises `23514` naming the constraint ([assets-transitions.spec.ts:421-450](../apps/api/test/api/assets-transitions.spec.ts#L421-L450)).
+
+---
+
 ## 8. Method — why the evidence is shaped the way it is
 
 The findings above share a cause: **a test that passes is not the same as a test that covers.** Several practices exist specifically to close that gap.
@@ -469,12 +579,18 @@ That distinction matters: an equivalent mutant is not a coverage hole, and prete
 
 ## 9. What this does **not** prove
 
-The strength of everything above is that each claim is scoped and backed by a live negative. That is worth nothing if the document then implies coverage that does not exist. **Step 5 gave this document more to sell, which is exactly when this section matters most — it has not been shortened to make room.**
+The strength of everything above is that each claim is scoped and backed by a live negative. That is worth nothing if the document then implies coverage that does not exist. **Step 6 gave this document considerably more to sell, which is exactly when this section matters most — it has not been shortened to make room.**
 
-- **Bulk domain isolation is still not proven, and step 5 did not move it.** `assets`, `readings`, `maintenance_records`, `asset_events` and `audit_log` do not exist — they land at step 6. The catalog-driven matrix is built and self-tested against a scratch table, but its fixture registry is **still empty** ([helpers.ts:176](../apps/api/test/db/helpers.ts#L176)), so it generates **zero cases against real tables**. It activates automatically when those tables arrive, and the registry/catalog equality check will fail the build if one arrives without a fixture. **Today, isolation is proven for the identity and tenancy tables only.** "RBAC and membership management landed" says nothing whatever about domain-level coverage.
-- **The generic matrix passing on `memberships` still means nothing.** That is why the bespoke dual-axis suite is mandatory and the exemption is declared rather than implicit.
-- **Invited users cannot log in yet.** `invite_member` creates an identity whose password hash is a sentinel that matches nothing, so an invited person can neither sign in nor register their own organisation (the email is taken). This is a **known, scheduled, temporary** state, not a hidden one: the set-password / invite-token flow is the first slice of step 8, with a hard deadline of step 10 (before deploy, the only people it can lock out are test fixtures), and it is enforced by a Definition-of-Done checkbox rather than by a comment ([PROJECT_BRIEF.md:266](PROJECT_BRIEF.md#L266)) because markers drift and checklists block. Reasoning in [DECISIONS.md:269](DECISIONS.md#L269).
-- **Audit logging does not exist.** It lands at step 7 — and the membership mutations built in step 5 write **no `audit_log` row at all**. Step 7 must go back and **retrofit** them rather than only wiring entities built after it; that is also where the open question of recording role-at-time-of-action is answered. Recorded as a known retrofit rather than a second silent gap.
+This list is kept aligned with the enumerated **Open items register** in [`DECISIONS.md`](DECISIONS.md), so a debt cannot be described one way here and another way there.
+
+- **The domain surface is THREE tables, not the brief's five.** Step 6 proved isolation for `assets`, `asset_events` and `readings` (§7f). **`maintenance_records` is not built** — it is the remaining v1.0 child of `assets`, tracked as **OPEN-8**, and it is deferred rather than dropped: the brief lists "record maintenance" as an essential frontend journey, so it must land before step 8 needs it. It is held back on a real open question rather than for time — every table in the schema today is either soft-deleted or append-only, and a maintenance record is **mutable**, which matches no existing shape; whether it gets a `DELETE` grant at all would be the project's first hard delete against an otherwise all-`RESTRICT` codebase, and the grant is what makes the property real. `audit_log` does not exist either (next bullet). **So "the domain is isolated" is true of the three tables named and of nothing else.**
+- **A green generic matrix is still not evidence for a table registered as bespoke.** `users`, `tenants` and `memberships` are excluded by declaration, and the exclusion is accounted for by the registry-equality check so it cannot be mistaken for an oversight ([helpers.ts:132](../apps/api/test/db/helpers.ts#L132)). Their coverage is the bespoke dual-axis suite (§3), not the 15 generated cases.
+- **Invited users cannot log in yet (OPEN-7).** `invite_member` creates an identity whose password hash is a sentinel that matches nothing, so an invited person can neither sign in nor register their own organisation (the email is taken). This is a **known, scheduled, temporary** state, not a hidden one: the set-password / invite-token flow is the first slice of step 8, with a hard deadline of step 10 (before deploy, the only people it can lock out are test fixtures), and it is enforced by a Definition-of-Done checkbox rather than by a comment ([PROJECT_BRIEF.md:266](PROJECT_BRIEF.md#L266)) because markers drift and checklists block. Reasoning in [DECISIONS.md:269](DECISIONS.md#L269).
+- **Audit logging does not exist, and the lifecycle log is NOT the audit trail.** This is the step-6 claim most open to being misread, so it is stated flatly: `asset_events` records what happened to a physical **asset**; `audit_log` records who changed which **record**, with before/after. Neither derives from the other — a bulk import produces lifecycle events with no user-facing mutation, and correcting a typo in `location` produces an audit row with **no lifecycle event at all**. That `PATCH` case is the one Phase 3 mutation for which `audit_log` would be the only record, and it is invisible in the event log today.
+
+  `audit_log` lands at step 7, which means **seven** mutation types now need retrofitting rather than wiring: the three step-5 membership writes plus asset creation, metadata update, reading creation, status transitions and decommission. Tracked as **OPEN-6**, with **OPEN-4** (whether to record role-at-time-of-action) answered there. Recorded as a known retrofit, and it grew when step 6 landed rather than being discovered at step 7.
+
+- **The API surface is proven by acceptance tests, not by use.** Every claim in §7f is an automated test against a local or CI Postgres. No frontend consumes these endpoints (step 8), no load test has run against them (§13's k6 is outstanding), and the `EXPLAIN ANALYZE` numbers in [`PERF.md`](PERF.md) are local warm-cache plan comparisons — useful for plan **shape**, not quotable as production latency.
 - **Nothing here is proven against production.** All evidence is local and CI, both of which run the migration role as a cluster **superuser**. Render's is not, and a superuser satisfies `pg_has_role` unconditionally and bypasses RLS — so a class of privilege defect is invisible in both environments where the tests run. That gap is enumerated as a pre-deploy checklist ([ARCHITECTURE.md §16.1](ARCHITECTURE.md)), including the `Secure` cookie flag, which is gated on `NODE_ENV` and therefore **unverifiable by CI by construction**.
 - **The interactive-transaction-per-request cost is priced, not eliminated.** Every authenticated request holds a transaction for its duration; under load, pool exhaustion presents as an apparent hang — rising latency with no error rate (ARCHITECTURE §16.2).
 
@@ -486,29 +602,34 @@ The strength of everything above is that each claim is scoped and backed by a li
 cp .env.example .env      # then set SESSION_SECRET
 docker compose up -d      # Postgres 16 + Redis 7
 npm install && npm run db:migrate
-npm run test              # 150 tests
+npm run test              # 266 tests
 ```
 
-**CI evidence — [run 34401848080](https://github.com/Braiden-07/MeterLog/actions/runs/34401848080), `main` at commit `52d0d51`, verbatim:**
+**Local evidence, `feat/step6-phase3d-capstone`, verbatim:**
 
 ```
- ✓ test/db/membership-writes.spec.ts (31 tests) 811ms
- ✓ test/api/auth.spec.ts (23 tests) 1198ms
- ✓ test/db/interceptor.spec.ts (15 tests) 380ms
- ✓ test/api/memberships.spec.ts (19 tests) 1564ms
- ✓ test/db/membership-isolation.spec.ts (23 tests) 237ms
- ✓ test/db/catalog-rls.spec.ts (12 tests) 99ms
- ✓ test/db/auth-definer.spec.ts (12 tests) 237ms
- ✓ test/api/revocation.spec.ts (3 tests) 532ms
- ✓ test/db/isolation.spec.ts (6 tests) 193ms
- ✓ test/db/definer-probe.spec.ts (5 tests) 219ms
- ✓ src/health/health.controller.spec.ts (1 test) 2ms
+ ✓ test/db/membership-writes.spec.ts (31 tests) 1677ms
+ ✓ test/api/assets-write.spec.ts (23 tests) 3572ms
+ ✓ test/db/isolation.spec.ts (32 tests) 359ms
+ ✓ test/api/auth.spec.ts (23 tests) 2289ms
+ ✓ test/api/assets-transitions.spec.ts (26 tests) 4383ms
+ ✓ test/api/assets-read.spec.ts (21 tests) 2953ms
+ ✓ test/db/interceptor.spec.ts (15 tests) 806ms
+ ✓ test/db/catalog-rls.spec.ts (13 tests) 81ms
+ ✓ test/api/memberships.spec.ts (19 tests) 2861ms
+ ✓ test/api/step6-acceptance.spec.ts (10 tests) 1702ms
+ ✓ test/db/membership-isolation.spec.ts (23 tests) 275ms
+ ✓ test/db/auth-definer.spec.ts (12 tests) 775ms
+ ✓ test/api/revocation.spec.ts (3 tests) 754ms
+ ✓ test/db/definer-probe.spec.ts (5 tests) 170ms
+ ✓ test/api/route-inventory.spec.ts (5 tests) 220ms
+ ✓ test/db/teardown.spec.ts (4 tests) 303ms
 
- Test Files  11 passed (11)
-      Tests  150 passed (150)
+ Test Files  17 passed (17)
+      Tests  266 passed (266)
 ```
 
-The first line is the §7a backstop suite — the one that calls the definer functions directly, with no HTTP anywhere in the process.
+`membership-writes.spec.ts` is the §7a backstop suite — the one that calls the definer functions directly, with no HTTP anywhere in the process. `step6-acceptance.spec.ts` is the §8.3 capstone. Of `isolation.spec.ts`'s 32 tests, **15 are generated** by the catalog-driven matrix across the three domain tables (§7f); it ran 6 before step 6.
 
 Each run builds the schema from migrations on a **fresh** database, so the policies under test are the ones the migrations produce, not ones a developer's database happened to accumulate. The suites connect as `meterlog_app` — the same restricted role the API uses at runtime — which is load-bearing: connecting as anything else would let every structural assertion pass while isolation was gone ([catalog-rls.spec.ts:230](../apps/api/test/db/catalog-rls.spec.ts#L230)).
 
@@ -533,4 +654,6 @@ Five functions — the two pre-auth ones from step 4 and the three membership wr
 - [`ADR-006-membership-model.md`](ADR-006-membership-model.md) — the membership model in full, its stage-1 review corrections, and five amendments: the `users` policy set and decision B (step 4), the last-admin rule and the invite credential mechanism (step 5 phase 1), and the anti-enumeration shape of `MB002` (step 5 phase 2).
 - [`DECISIONS.md`](DECISIONS.md) — ADR-001…006, including ADR-004's operator amendment (§4 above) and the step-5 closeout scheduling.
 - [`PROGRESS.md`](PROGRESS.md) — the phase-by-phase history, including how each finding was reached and the two forward debts step 5 leaves behind.
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — §7 isolation, §8 sessions, §9 the RBAC matrix, §16 deployment topology and the pre-deploy checklist.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — §7 isolation, §8 sessions, §9 the RBAC matrix (§9.1 the domain cells, §9.2 the lifecycle emission contract), §16 deployment topology and the pre-deploy checklist.
+- [`PERF.md`](PERF.md) — the two measured index decisions, with before/after `EXPLAIN ANALYZE` plans.
+- [`DECISIONS.md`](DECISIONS.md) — ADR-007 (composite-FK child tenancy) and the **Open items register**, which this document's §9 is kept aligned with.
