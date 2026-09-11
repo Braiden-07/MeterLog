@@ -15,18 +15,17 @@ import {
 
 import { DEFAULT_LIMIT, MAX_LIMIT } from '../../common/pagination/cursor';
 
-/** Mirrors the `asset_status` enum (PROJECT_BRIEF §5 :136). */
-export const ASSET_STATUSES = ['installed', 'active', 'maintenance', 'decommissioned'] as const;
+/**
+ * Re-exported from `lifecycle.ts`, which is the SINGLE source of the status and
+ * event-type vocabularies and of the transition graph that relates them. These
+ * lists were declared here in phase 3a, before a graph existed; duplicating them
+ * would mean the DTO and the graph could disagree about what an event type is,
+ * which is the drift the declaration-vs-grant assertions exist to prevent
+ * elsewhere. One definition, imported.
+ */
+export { ASSET_EVENT_TYPES, ASSET_STATUSES } from '../lifecycle';
 
-/** Mirrors the `asset_event_type` enum. See ARCHITECTURE §9.2 for what emits each. */
-export const ASSET_EVENT_TYPES = [
-  'created',
-  'installed',
-  'activated',
-  'maintenance_started',
-  'maintenance_completed',
-  'decommissioned',
-] as const;
+import { ASSET_EVENT_TYPES, ASSET_STATUSES } from '../lifecycle';
 
 /**
  * `?flag=true` arrives as the STRING "true". Without this the value is truthy for
@@ -221,4 +220,38 @@ export class CreateReadingDto {
   @ApiProperty({ description: 'When the reading was taken (ISO-8601).' })
   @IsISO8601()
   readAt!: string;
+}
+
+/**
+ * Posting a lifecycle transition.
+ *
+ * **THE ENUM HERE IS ALL SIX EVENT TYPES, AND NARROWING IT TO THE THREE POSTABLE
+ * ONES WOULD BE A REGRESSION.** This looks like dead permissiveness; it is not.
+ *
+ * If the DTO only accepted `activated` / `maintenance_started` /
+ * `maintenance_completed`, then `ValidationPipe` would reject `decommissioned`
+ * with a generic 400 — **indistinguishable from a typo or a value that does not
+ * exist** — and the service's 422 pointing the caller at `DELETE /assets/:id`
+ * would become unreachable code. The caller would be told their input was invalid
+ * when it was perfectly valid and simply belonged at another endpoint.
+ *
+ * So the boundary accepts the full enum and the SERVICE decides postability,
+ * which is what lets the three codes mean three different things: 400 = not a
+ * real event type, 422 = real but not postable here (with the right path named),
+ * 409 = postable but illegal from the current status.
+ *
+ * Same shape of mistake as the argon2 sentinel: a later "tidy-up" that narrows
+ * this enum silently removes a diagnostic while every test that only checks
+ * "rejected" keeps passing. `assets-transitions.spec.ts` asserts the 422 CODES
+ * specifically, which is what pins this.
+ */
+export class PostEventDto {
+  @ApiProperty({
+    enum: ASSET_EVENT_TYPES,
+    example: 'activated',
+    description:
+      'Postable: activated, maintenance_started, maintenance_completed. created/installed come from POST /assets; decommissioned from DELETE /assets/:id.',
+  })
+  @IsIn(ASSET_EVENT_TYPES)
+  eventType!: (typeof ASSET_EVENT_TYPES)[number];
 }
