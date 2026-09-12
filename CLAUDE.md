@@ -23,10 +23,11 @@
 - Install: `npm install`
 - Dev (all): `cp .env.example .env` → `docker compose up -d` → `npm run db:migrate` → `npm run dev`
 - Test (unit/integration): `npm run test`
-- Test (DB suites only): `npm run test:db` — catalog RLS coverage, the catalog-driven isolation harness, the membership dual-axis proof, the definer probe, the pre-auth definer functions, the membership-write definer functions and their §7 body-level authorization, and the tenant-context interceptor
+- Test (DB suites only): `npm run test:db` — catalog RLS coverage, the catalog-driven isolation harness, the membership dual-axis proof, the definer probe, the pre-auth definer functions, the membership-write definer functions and their §7 body-level authorization, the tenant-context interceptor, and (step 7a) the audit-capture proofs
 - Test (API acceptance): included in `npm run test` — the step-4 auth suite, the step-5 RBAC suite, and the revocation-over-HTTP proof, all over real HTTP with real signed cookies through the bound interceptor
 - Test (e2e): `npm run test:e2e`
 - Lint: `npm run lint` · Typecheck: `npm run typecheck` · Build: `npm run build`
+- **Doc citations: `npm run docs:check`** — walks `docs/*.md`, and for every `file#Lnn` link asserts the path resolves, the line exists, AND (where the link text quotes a string or an identifier) that the literal appears within a few lines of the anchor. **A distinct CI step**, so drift reads as "citation drift" rather than as a buried test failure. Points 1–2 only catch deletions; point 3 is what catches an anchor that slid.
 - DB migrate: `npm run db:migrate` (dev) / `npm run db:migrate:deploy` (CI + prod)
 - Prisma client: `npm run db:generate`
 
@@ -47,11 +48,11 @@
 
 **The list.** These tables are append-only: rows are inserted and read, never updated and never deleted. A correction is a **new row**, not an edit.
 
-| Table          | Declared since | Basis                                                                                                              |
-| -------------- | -------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `asset_events` | step 6 phase 1 | `PROJECT_BRIEF.md` §5 :137 — "**append-only**, no updates/deletes"                                                 |
-| `readings`     | step 6 phase 2 | `PROJECT_BRIEF.md` §5 :138 + :146 — implied by omission; see below. **Declared and enforced from step 6 phase 2.** |
-| `audit_log`    | step 7         | `PROJECT_BRIEF.md` §5 :140 — "**append-only**"                                                                     |
+| Table          | Declared since               | Basis                                                                                                                      |
+| -------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `asset_events` | step 6 phase 1               | `PROJECT_BRIEF.md` §5 :137 — "**append-only**, no updates/deletes"                                                         |
+| `readings`     | step 6 phase 2               | `PROJECT_BRIEF.md` §5 :138 + :146 — implied by omission; see below. **Declared and enforced from step 6 phase 2.**         |
+| `audit_log`    | **step 7 phase 7a — LANDED** | `PROJECT_BRIEF.md` §5 :140 — "**append-only**", and the strongest case here: the app role cannot write it AT ALL (ADR-010) |
 
 **Why this is written down instead of left to be noticed.** The brief marks `asset_events` (:137) and `audit_log` (:140) append-only in so many words. It never says it about `readings` (:138) — the property is there only **by omission**, because :146 says "append-only tables get `created_at` only" and `readings` is the one domain table with no `updated_at` and no `deleted_at`. That is a true inference and a **dangerous way to hold a security-relevant property.**
 
@@ -60,11 +61,12 @@ Implicit-by-omission is the exact shape of this repo's worst bugs. `WITH CHECK` 
 **So the property is declared, and the declaration is enforced:**
 
 - `APPEND_ONLY_TABLES` in `apps/api/test/db/helpers.ts` is this table's executable mirror. Keep the two in step — the constant is what CI reads.
-- **Catalog assertion 13** binds the declaration to the grants: a declared append-only table must hold **exactly `SELECT, INSERT`** for `meterlog_app`. A future `GRANT UPDATE ON public.asset_events TO meterlog_app` turns the suite **red** instead of silently widening the table's write surface.
+- **Catalog assertion 13** binds the declaration to the grants: a declared append-only table must hold **exactly `SELECT, INSERT`** for `meterlog_app` — or **exactly `SELECT`** where the writer is a `SECURITY DEFINER` trigger rather than the app role. A future `GRANT UPDATE ON public.asset_events TO meterlog_app` turns the suite **red** instead of silently widening the table's write surface.
+  - **The second case arrived with `audit_log` at step 7a and is DERIVED, not hand-listed:** `DEFINER_WRITTEN_APPEND_ONLY_TABLES` is the intersection of `APPEND_ONLY_TABLES` with `DEFINER_ACCESSIBLE_TABLES`. So the expected grant is still an **equality** in both cases, never relaxed to a subset — and if `audit_log` were ever removed from the definer-reachable list, assertion 13 would tighten back to demanding `INSERT` and turn red, which is the correct alarm. **Widening the grant to make one expected string work would hand the app role the very `INSERT` ADR-010 exists to withhold** — the same trap as granting `TRUNCATE` to fix a teardown.
 - The isolation matrix reads the same declaration through each fixture's `appWrites` capability, and asserts `permission denied` on UPDATE/DELETE where writes are not declared — so the property is proven behaviourally too, not only structurally.
 - **`appWrites` is read from the declaration, never from `has_table_privilege`.** Deriving it from the live grant would make the test assert whatever the grant happens to be, which catches nothing by construction — the tautology that made a mutated policy indistinguishable from a correct one until catalog assertion 4 was tightened to assert the pin's _content_.
 
-Adding a table here means adding it to `APPEND_ONLY_TABLES` and giving it a `SELECT, INSERT`-only grant. Removing one requires a reviewed edit in both places, which is the point.
+Adding a table here means adding it to `APPEND_ONLY_TABLES` and giving it a `SELECT, INSERT`-only grant — or, if a definer trigger is its writer, a `SELECT`-only grant plus an entry in `DEFINER_ACCESSIBLE_TABLES`. It also needs a URL segment in `TABLE_TO_SEGMENT` (`test/api/route-inventory.spec.ts`), which is asserted set-equal to the declaration and went red the moment `audit_log` landed — as designed. Removing one requires a reviewed edit in every one of those places, which is the point.
 
 ## Test-suite invariants (do not "optimize" these away)
 

@@ -16,7 +16,7 @@ env:
 
 jobs:
   verify:
-    name: lint · typecheck · test
+    name: docs · lint · typecheck · test
     runs-on: ubuntu-latest
 
     services:
@@ -66,6 +66,21 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      - name: Check doc citations
+        # ITS OWN STEP, DELIBERATELY (step 7 phase 7a, Part 0). Folding this into
+        # `test` would make citation drift surface as a red test among 300 others,
+        # named after whichever spec file happened to host the check. As a named
+        # step the GitHub summary says "Check doc citations" and nothing else, so
+        # the failure names its own cause.
+        #
+        # Positioned before lint/typecheck/test so it fails the gate FAST: it needs
+        # no database, no Prisma client and no build, and a docs-only PR should not
+        # wait on a Postgres service container to be told an anchor slid.
+        #
+        # It exists because nothing checked `file#Lnn` anchors before, which is why
+        # phase 3d's drifted and phase 4 rationally retreated to file-level links.
+        run: npm run docs:check
 
       - name: Generate Prisma client
         run: npm run db:generate

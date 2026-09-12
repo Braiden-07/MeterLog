@@ -15,6 +15,7 @@
     "dev": "npm run dev --workspace=@meterlog/api & npm run dev --workspace=@meterlog/web",
     "build": "npm run build --workspaces --if-present",
     "lint": "eslint .",
+    "docs:check": "node scripts/check-doc-citations.mjs",
     "lint:fix": "eslint . --fix",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",

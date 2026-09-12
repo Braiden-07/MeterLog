@@ -44,6 +44,29 @@ enum AssetEventType {
   @@map("asset_event_type")
 }
 
+/// The audit action vocabulary (ADR-012). Fourteen values over the ELEVEN named
+/// mutation types; `user.created`, `asset_event.created` and the
+/// `membership.updated` total-function fallback are the three extras. Prisma
+/// cannot express a dotted enum member name, so each is `@map`ped.
+enum AuditAction {
+  user_created            @map("user.created")
+  membership_created      @map("membership.created")
+  membership_role_changed @map("membership.role_changed")
+  membership_revoked      @map("membership.revoked")
+  membership_updated      @map("membership.updated")
+  asset_created           @map("asset.created")
+  asset_updated           @map("asset.updated")
+  asset_status_changed    @map("asset.status_changed")
+  asset_decommissioned    @map("asset.decommissioned")
+  asset_event_created     @map("asset_event.created")
+  reading_created         @map("reading.created")
+  maintenance_created     @map("maintenance.created")
+  maintenance_updated     @map("maintenance.updated")
+  maintenance_deleted     @map("maintenance.deleted")
+
+  @@map("audit_action")
+}
+
 model Tenant {
   id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   name      String
@@ -73,6 +96,7 @@ model User {
   assetEvents AssetEvent[]
   readings    Reading[]
   maintenance MaintenanceRecord[]
+  auditRows   AuditLog[]
 
   @@map("users")
 }
@@ -212,4 +236,59 @@ model MaintenanceRecord {
   @@index([tenantId], map: "maintenance_records_tenant_id_idx")
   @@index([assetId, performedAt, id], map: "maintenance_records_asset_id_performed_at_idx")
   @@map("maintenance_records")
+}
+
+/// APPEND-ONLY, and the strongest instance of that property in the schema: the
+/// other two are written by the app role and merely never updated, while this one
+/// THE APP ROLE CANNOT WRITE AT ALL. It holds `SELECT` and nothing else; the
+/// `audit_capture` SECURITY DEFINER trigger is the only writer (ADR-009/ADR-010).
+///
+/// NOT MODELLED HERE, and both absences are load-bearing rather than oversights —
+/// Prisma models tables and never triggers, policies, or grants (ADR-002):
+///   * the six `*_audit` triggers and the `audit_capture` function;
+///   * the per-table redaction allowlist each trigger carries (ADR-011).
+/// All of it lives in migration SQL, and `catalog-rls.spec.ts` asserts it rather
+/// than trusting it — assertions 16 and 17 in particular.
+///
+/// NO RELATION TO Tenant, deliberately: the migration gives `tenant_id` no foreign
+/// key, because a RESTRICT FK would let the audit trail BLOCK a future tenant
+/// deletion, and an audit trail must never veto the operation it is recording.
+model AuditLog {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// NULLABLE. Taken from the mutated row where it has a tenant_id; from
+  /// app.current_tenant where it does not (`users` — ADR-006 §2). NULL for the
+  /// pre-auth bootstrap, which reaches neither. No FK — see the note above.
+  tenantId String? @map("tenant_id") @db.Uuid
+
+  /// NULLABLE (ADR-009). `register_tenant` runs pre-authentication, so there is
+  /// no actor BY CONSTRUCTION. NULL actor + NULL role + NULL tenant all mean one
+  /// thing: a system / pre-authentication action, reachable only via bootstrap.
+  actorUserId String? @map("actor_user_id") @db.Uuid
+
+  /// ROLE AT THE TIME OF THE ACTION (OPEN-4), looked up by the trigger while the
+  /// mutation is in flight. A DENORMALIZED SNAPSHOT — do NOT "normalize" it away
+  /// by joining to Membership at read time: the role may have changed or the
+  /// membership been revoked, which is exactly the point of storing it.
+  actorRole MembershipRole? @map("actor_role")
+
+  /// PROJECT_BRIEF §5 calls these entity_type / entity_id. Renamed because the
+  /// trail is keyed by TABLE and ROW, which is what a trigger knows (ADR-011).
+  tableName String @map("table_name")
+  rowId     String @map("row_id") @db.Uuid
+
+  action AuditAction
+
+  /// `{ before, after }` in one column rather than the brief's two, so the
+  /// redaction filter and the changed-column diff cannot drift apart (ADR-011).
+  payload Json
+
+  /// Append-only: created_at only (PROJECT_BRIEF §5 :146).
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId, createdAt, id], map: "audit_log_tenant_id_created_at_idx")
+  @@index([tableName, rowId], map: "audit_log_table_name_row_id_idx")
+  @@map("audit_log")
 }
