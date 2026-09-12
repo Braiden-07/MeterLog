@@ -63,10 +63,32 @@ export async function execAll(client: PrismaClient, statements: string[]): Promi
 export const RLS_EXEMPT_TABLES: readonly string[] = ['_prisma_migrations'];
 
 /**
- * Tables the pre-auth SECURITY DEFINER path is permitted to reach, and the only
- * ones allowed to carry a policy scoped `TO meterlog_definer` (ADR-004).
+ * Tables a SECURITY DEFINER function is permitted to reach, and the only ones
+ * allowed to carry a policy scoped `TO meterlog_definer` (ADR-004, catalog
+ * assertion 5). Such a policy is a hole in the isolation boundary by
+ * construction, so widening this list is a reviewed edit.
+ *
+ * `audit_log` JOINED AT STEP 7 PHASE 7A, and it is the first entry that is not
+ * an identity table — the list's meaning was always "definer-reachable", the
+ * first three just happened to be the auth tables. It needs a definer policy
+ * because it is under FORCE ROW LEVEL SECURITY, which applies policies to the
+ * table OWNER as well, so the `audit_capture` trigger cannot insert without one
+ * (ADR-009/ADR-010).
+ *
+ * ADDING IT HERE DOES MORE THAN SATISFY ASSERTION 5. Assertions 9 and 10 are
+ * driven off this same list, and applied to `audit_log` they assert exactly
+ * ADR-010: **9** that the app role holds no INSERT/UPDATE/DELETE on it — which
+ * IS immutability-by-grant, pinned at the catalog level — and **10** that it is
+ * nevertheless readable, so 9 cannot be satisfied by a table nobody can touch.
+ * Both assertions were already written; the trail simply became their fourth
+ * subject.
  */
-export const DEFINER_ACCESSIBLE_TABLES: readonly string[] = ['tenants', 'users', 'memberships'];
+export const DEFINER_ACCESSIBLE_TABLES: readonly string[] = [
+  'tenants',
+  'users',
+  'memberships',
+  'audit_log',
+];
 
 /**
  * The complete set of SECURITY DEFINER functions. Each is a deliberate,
@@ -98,6 +120,21 @@ export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = [
   'invite_member',
   'change_member_role',
   'revoke_member',
+  // STEP 7 PHASE 7A. `audit_capture` is the sixth, and the first that is a
+  // TRIGGER function rather than one the app calls by name. It is SECURITY
+  // DEFINER for a reason ADR-010 forces rather than chooses: the app role holds
+  // no INSERT on `audit_log`, so an invoker-rights trigger could not write the
+  // audit row, and capture would break on the very immutability it serves.
+  //
+  // Being a trigger function changes what the paired assertions can ask of it.
+  // Assertion 12 (every definer function is callable by the app role) is
+  // narrowed to exclude it, because Postgres checks EXECUTE at CREATE TRIGGER
+  // time and never at fire time — granting EXECUTE would buy nothing and would
+  // make 12 satisfiable by an empty gesture. Assertion 16 replaces the cover:
+  // a trigger-returning definer function must actually be ATTACHED to at least
+  // one trigger, so the carve-out cannot become a way to keep an unreachable
+  // definer function nobody notices.
+  'audit_capture',
 ];
 
 /**
@@ -129,7 +166,24 @@ export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = [
  * list above is what keeps that fact honest: these three are absent from the
  * matrix by declaration, not by omission.
  */
-export const ISOLATION_BESPOKE_TABLES: readonly string[] = ['memberships', 'users', 'tenants'];
+export const ISOLATION_BESPOKE_TABLES: readonly string[] = [
+  'memberships',
+  'users',
+  'tenants',
+  // STEP 7 PHASE 7A — and for the SECOND of the two reasons above, exactly.
+  //
+  // The generic matrix seeds through the app role, and the app role holds no
+  // INSERT on `audit_log` (ADR-010). Its INSERT case asserts an RLS `WITH CHECK`
+  // rejection and explicitly asserts `permission denied` ABSENT — so registering
+  // a fixture here would produce a failure about GRANTS while claiming to be
+  // about isolation, and the only way to make it pass would be to grant the app
+  // role the INSERT the whole ADR exists to withhold.
+  //
+  // Its coverage is the bespoke DB-layer suite in `audit.spec.ts`, which seeds
+  // the audit rows the only way anything can — by performing real mutations and
+  // letting the trigger write them.
+  'audit_log',
+];
 
 /**
  * Request-scoped context, as the interceptor will set it in Phase 3.
@@ -177,6 +231,12 @@ export async function withContext<T>(
  *   * the fixture/declaration agreement check in isolation.spec.ts — a table
  *     listed here must have a fixture declaring no update and no delete.
  *
+ * `audit_log` JOINED AT STEP 7 PHASE 7A, paying the row CLAUDE.md's declaration
+ * table has carried since step 6. It is append-only in the STRONGEST sense of
+ * any entry here: the other two are written by the app role and merely never
+ * updated, while this one the app role cannot write AT ALL (ADR-010). See
+ * `DEFINER_WRITTEN_APPEND_ONLY_TABLES` below for what that does to assertion 13.
+ *
  * `readings` JOINED AT STEP 6 PHASE 2, and it is the entry this whole mechanism
  * was built for. `asset_events` and `audit_log` are marked append-only in the
  * brief in words (:137, :140); `readings` (:138) is NOT — it is append-only only
@@ -184,7 +244,28 @@ export async function withContext<T>(
  * it from absent columns is precisely what this list refuses to do. `audit_log`
  * joins at step 7.
  */
-export const APPEND_ONLY_TABLES: readonly string[] = ['asset_events', 'readings'];
+export const APPEND_ONLY_TABLES: readonly string[] = ['asset_events', 'readings', 'audit_log'];
+
+/**
+ * Append-only tables whose writer is the SECURITY DEFINER trigger, NOT the app
+ * role — so their app-role grant is `SELECT` ALONE, with no `INSERT`.
+ *
+ * Derived, never hand-listed: it is exactly the tables that are both declared
+ * append-only AND definer-reachable. Catalog assertion 13 reads this to pick the
+ * expected grant string per table, so the equality stays an equality — `SELECT,
+ * INSERT` where the app inserts, `SELECT` where the definer does — rather than
+ * being relaxed to a subset to accommodate the new shape.
+ *
+ * **Widening the grant to satisfy the assertion would hand the app role the very
+ * INSERT ADR-010 exists to withhold**, which is the same trap as granting
+ * `TRUNCATE` to make a teardown convenient. Deriving the exception instead means
+ * that if `audit_log` were ever removed from `DEFINER_ACCESSIBLE_TABLES`,
+ * assertion 13 would tighten back to demanding `INSERT` and turn red — which is
+ * the correct alarm, not a nuisance.
+ */
+export const DEFINER_WRITTEN_APPEND_ONLY_TABLES: readonly string[] = APPEND_ONLY_TABLES.filter(
+  (t) => DEFINER_ACCESSIBLE_TABLES.includes(t),
+);
 
 /**
  * SOFT-DELETE-ONLY TABLES — tables the app role may UPDATE but never DELETE.

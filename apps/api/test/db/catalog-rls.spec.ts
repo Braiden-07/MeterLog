@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   APPEND_ONLY_TABLES,
+  DEFINER_WRITTEN_APPEND_ONLY_TABLES,
   SOFT_DELETE_ONLY_TABLES,
   DEFINER_ACCESSIBLE_TABLES,
   EXPECTED_DEFINER_FUNCTIONS,
@@ -413,16 +414,33 @@ describe('RLS catalog coverage', () => {
     ).toEqual([]);
   });
 
-  it('12. every SECURITY DEFINER function IS executable by the app role', async () => {
+  it('12. every CALLABLE SECURITY DEFINER function IS executable by the app role', async () => {
     // Pairs with 11 the way 10 pairs with 9. On its own, 11 is satisfied by a
     // function nobody can call — fail-closed, but broken: the login and register
     // paths would 500 rather than being denied, and no other assertion notices.
+    //
+    // NARROWED AT STEP 7 PHASE 7A to exclude TRIGGER functions, and the carve-out
+    // is narrow on purpose. `audit_capture` returns `trigger` and is never called
+    // by name: Postgres checks EXECUTE at CREATE TRIGGER time, not at fire time,
+    // so the app role needs no privilege on it and a direct call is refused by
+    // the server regardless ("trigger functions can only be called as triggers").
+    //
+    // The alternative — granting EXECUTE anyway to keep the query unchanged —
+    // would be a privilege that buys nothing, and worse, it would make this
+    // assertion satisfiable by an empty gesture: the thing it checks (that a
+    // definer function is actually REACHABLE) would no longer be what it asserts.
+    //
+    // The cover it would have lost is replaced by assertion 16, which requires a
+    // trigger-returning definer function to be ATTACHED to at least one trigger.
+    // So reachability is still asserted for every definer function — by the right
+    // question for each kind.
     const rows = await db.$queryRawUnsafe<{ function_name: string; callable: boolean }[]>(`
       SELECT p.proname AS function_name,
              has_function_privilege('meterlog_app', p.oid, 'EXECUTE') AS callable
       FROM pg_proc p
       JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = 'public' AND p.prosecdef
+        AND p.prorettype <> 'pg_catalog.trigger'::regtype
       ORDER BY 1
     `);
 
@@ -474,12 +492,31 @@ describe('RLS catalog coverage', () => {
       APPEND_ONLY_TABLES as string[],
     );
 
+    // EXTENDED AT STEP 7 PHASE 7A, and extended rather than relaxed.
+    //
+    // `audit_log` is append-only too, but its writer is the `audit_capture`
+    // SECURITY DEFINER trigger, not the app role — so its app-role grant is
+    // `SELECT` ALONE (ADR-010). Widening the grant to `SELECT, INSERT` to keep
+    // one expected string would hand the app role the very INSERT that ADR its
+    // entire immutability claim rests on withholding, to make an assertion
+    // convenient. That is the same trap as granting TRUNCATE to fix a teardown.
+    //
+    // So the expected value is chosen PER TABLE, from a DERIVED list — an
+    // append-only table that is also definer-reachable expects `SELECT`, every
+    // other expects `INSERT, SELECT`. Still an equality in both cases, never a
+    // subset: "holds no UPDATE" would be satisfied by a table the app role cannot
+    // read or insert into at all, which is the trap assertion 10 closes for 9.
     const actual = Object.fromEntries(rows.map((r) => [r.table_name, r.privileges]));
-    const expected = Object.fromEntries(APPEND_ONLY_TABLES.map((t) => [t, 'INSERT, SELECT']));
+    const expected = Object.fromEntries(
+      APPEND_ONLY_TABLES.map((t) => [
+        t,
+        DEFINER_WRITTEN_APPEND_ONLY_TABLES.includes(t) ? 'SELECT' : 'INSERT, SELECT',
+      ]),
+    );
 
     expect(
       actual,
-      'an append-only table must hold exactly SELECT, INSERT for the app role — a stray GRANT reopens it to mutation',
+      'an append-only table must hold exactly SELECT, INSERT for the app role — or SELECT alone where the definer trigger is the writer. A stray GRANT reopens it to mutation',
     ).toEqual(expected);
   });
 
@@ -542,6 +579,113 @@ describe('RLS catalog coverage', () => {
     expect(
       overlap,
       `declared both append-only and soft-delete-only: ${overlap.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('16. every trigger-returning SECURITY DEFINER function is actually ATTACHED', async () => {
+    // THE REPLACEMENT COVER FOR ASSERTION 12's CARVE-OUT (step 7 phase 7a).
+    //
+    // 12 asks "can the app role call it?", which is the right reachability
+    // question for a function called by name and a meaningless one for a trigger
+    // function. Excluding trigger functions from 12 without asking a different
+    // reachability question would open a gap the allowlist cannot see: a SECURITY
+    // DEFINER function could sit in `EXPECTED_DEFINER_FUNCTIONS`, owned by the
+    // definer role, pinned and correct in every structural respect, and be
+    // attached to NOTHING — so every audited mutation would go uncaptured while
+    // assertions 4, 11 and 12 all stayed green.
+    //
+    // That is the exact failure shape this repo keeps meeting: not a wrong
+    // answer, an unreachable guard (the RBAC gate in ISOLATION §7d, the readings
+    // tiebreaker in §7e). So the question is asked in the form that fits: an
+    // unattached trigger function is a definer function with no caller.
+    const rows = await db.$queryRawUnsafe<{ function_name: string; attachments: number }[]>(`
+      SELECT p.proname AS function_name,
+             (SELECT count(*)::int FROM pg_trigger t
+               WHERE t.tgfoid = p.oid AND NOT t.tgisinternal) AS attachments
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.prosecdef
+        AND p.prorettype = 'pg_catalog.trigger'::regtype
+      ORDER BY 1
+    `);
+
+    // Non-vacuity: if this query ever returns nothing, the assertion below passes
+    // trivially. `audit_capture` is the only such function today and must be here.
+    expect(
+      rows.map((r) => r.function_name),
+      'no trigger-returning SECURITY DEFINER function found — this assertion would be vacuous',
+    ).toContain('audit_capture');
+
+    const orphans = rows.filter((r) => r.attachments === 0).map((r) => r.function_name);
+    expect(
+      orphans,
+      `SECURITY DEFINER trigger functions attached to no trigger — capture is silently dead: ${orphans.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('17. no audit trigger allowlist admits password_hash, and every audited table has one', async () => {
+    // ADR-011's REDACTION, ASSERTED STRUCTURALLY (step 7 phase 7a).
+    //
+    // The per-table column allowlist is passed as the TRIGGER'S ARGUMENT rather
+    // than hard-coded in the function body, precisely so it lands in
+    // `pg_trigger.tgargs` and a single catalog query can read every one of them.
+    //
+    // WHY A STRUCTURAL CHECK WHEN A BEHAVIOURAL ONE EXISTS. The behavioural proof
+    // in `audit.spec.ts` is the stronger evidence — it writes a real hash and
+    // reads the audit row back — but it can only cover the paths a fixture
+    // exercises. This covers ALL of them, including a table that no test happens
+    // to mutate, and it fails at the moment a migration adds the column to an
+    // allowlist rather than at the moment someone writes a row through it.
+    //
+    // `tgargs` is a null-separated byte string; `pg_get_triggerdef` is easier to
+    // read and is what a reviewer would look at, so the check is done on that.
+    const rows = await db.$queryRawUnsafe<{ table_name: string; definition: string }[]>(`
+      SELECT c.relname AS table_name, pg_get_triggerdef(t.oid) AS definition
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_proc p ON p.oid = t.tgfoid
+      WHERE n.nspname = 'public'
+        AND NOT t.tgisinternal
+        AND p.proname = 'audit_capture'
+      ORDER BY 1
+    `);
+
+    // Non-vacuity, and this one is load-bearing: an empty result set makes the
+    // leak check below pass while NOTHING IS AUDITED AT ALL. The six audited
+    // tables are named (ADR-012) so a dropped attachment fails here.
+    expect(
+      rows.map((r) => r.table_name),
+      'the audit trigger is not attached where ADR-012 says it is',
+    ).toEqual([
+      'asset_events',
+      'assets',
+      'maintenance_records',
+      'memberships',
+      'readings',
+      'users',
+    ]);
+
+    const leaking = rows
+      .filter((r) => r.definition.includes('password_hash'))
+      .map((r) => r.table_name);
+    expect(
+      leaking,
+      `an audit allowlist admits password_hash — the trail would become a privilege-escalation path (ADR-011): ${leaking.join(', ')}`,
+    ).toEqual([]);
+
+    // And every attachment must carry an allowlist at all. A trigger created with
+    // NO argument would make `TG_ARGV[0]` NULL, `string_to_array` return NULL, and
+    // every diff come out empty — capture that looks alive and records nothing.
+    const argless = rows
+      // `pg_get_triggerdef` renders the function name search_path-relative, so
+      // the schema prefix is optional here rather than assumed.
+      .filter((r) => !/EXECUTE FUNCTION (public\.)?audit_capture\('[^']+'\)/.test(r.definition))
+      .map((r) => r.table_name);
+    expect(
+      argless,
+      `audit trigger attached with no column allowlist: ${argless.join(', ')}`,
     ).toEqual([]);
   });
 });

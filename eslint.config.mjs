@@ -26,6 +26,17 @@ export default tseslint.config(
     },
   },
   {
+    // Node scripts run outside the TypeScript projects and outside any browser:
+    // `console` and `process` are globals here, not undefined identifiers. Listed
+    // explicitly rather than pulling in the `globals` package for two names —
+    // this repo is deliberately install-light (CLAUDE.md guardrails).
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: { console: 'readonly', process: 'readonly' },
+      sourceType: 'module',
+    },
+  },
+  {
     // Raw SQL in the database suites is composed from module-level constants,
     // never from user input; $queryRawUnsafe is the only Prisma API that accepts
     // catalog queries and DDL.

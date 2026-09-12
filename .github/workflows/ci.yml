@@ -16,6 +16,23 @@ env:
 
 jobs:
   verify:
+    # DO NOT RENAME THIS JOB. It is the required status-check CONTEXT in the
+    # `main` ruleset, matched by exact string. Step 7a renamed it to
+    # "docs · lint · typecheck · test" to advertise the new citation step, and
+    # that silently made every PR unmergeable: the required context
+    # "lint · typecheck · test" no longer existed, so it could never report, and
+    # GitHub showed a GREEN check next to a permanently BLOCKED merge button.
+    #
+    # The failure mode is the one this repo keeps meeting — not a wrong answer, a
+    # check that cannot run. Nothing was red; the PR simply could not merge, and
+    # the reason was visible only in the ruleset, not in the run.
+    #
+    # The docs step advertises itself where it actually helps: its own STEP name,
+    # "Check doc citations", which is what the run summary shows on failure. The
+    # job name buys nothing and costs the merge contract.
+    #
+    # If this name must ever change, the ruleset's required_status_checks context
+    # has to change in the same breath — repository settings, not this file.
     name: lint · typecheck · test
     runs-on: ubuntu-latest
 
@@ -66,6 +83,21 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      - name: Check doc citations
+        # ITS OWN STEP, DELIBERATELY (step 7 phase 7a, Part 0). Folding this into
+        # `test` would make citation drift surface as a red test among 300 others,
+        # named after whichever spec file happened to host the check. As a named
+        # step the GitHub summary says "Check doc citations" and nothing else, so
+        # the failure names its own cause.
+        #
+        # Positioned before lint/typecheck/test so it fails the gate FAST: it needs
+        # no database, no Prisma client and no build, and a docs-only PR should not
+        # wait on a Postgres service container to be told an anchor slid.
+        #
+        # It exists because nothing checked `file#Lnn` anchors before, which is why
+        # phase 3d's drifted and phase 4 rationally retreated to file-level links.
+        run: npm run docs:check
 
       - name: Generate Prisma client
         run: npm run db:generate

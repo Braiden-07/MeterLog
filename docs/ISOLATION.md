@@ -181,7 +181,7 @@ Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Wid
 ### The guard split — stated so neither half is mistaken for the other
 
 - The **loud** kind (an unqualified function or table reference failing to resolve) is caught structurally by definer-probe case E, and by catalog assertion 4 ([catalog-rls.spec.ts:108](../apps/api/test/db/catalog-rls.spec.ts#L108)).
-- The **silent** kind is caught by exactly one thing: the behavioural test [`matches case-insensitively — regression guard, this was broken`](../apps/api/test/db/auth-definer.spec.ts#L223). No structural assertion can replace it, because at the catalog level the broken function and the correct one are **identical** — same owner, same `search_path`, same everything. That test is annotated as load-bearing and must not be deleted as redundant ([CLAUDE.md:50](../CLAUDE.md#L50)). Its step-5 counterpart is [`invite attaches a membership to an EXISTING identity, case-insensitively`](../apps/api/test/db/membership-writes.spec.ts#L752).
+- The **silent** kind is caught by exactly one thing: the behavioural test [`matches case-insensitively — regression guard, this was broken`](../apps/api/test/db/auth-definer.spec.ts#L217). No structural assertion can replace it, because at the catalog level the broken function and the correct one are **identical** — same owner, same `search_path`, same everything. That test is annotated as load-bearing and must not be deleted as redundant ([CLAUDE.md:50](../CLAUDE.md#L50)). Its step-5 counterpart is [`invite attaches a membership to an EXISTING identity, case-insensitively`](../apps/api/test/db/membership-writes.spec.ts#L752).
 
 Assertion 4 was tightened at the same time from checking that a pin _exists_ to checking its _content_ — it previously accepted `search_path = public, pg_catalog, pg_temp`: pin present, hardening gone.
 
@@ -525,7 +525,7 @@ ERROR:  permission denied for table asset_events
 ERROR:  permission denied for table readings
 ```
 
-A stray `GRANT UPDATE` reddens assertion 13 _and_ the isolation matrix's declared-capability case. The API layer echoes it: a guard enumerates the registered routes and fails if any `PATCH`/`PUT`/`DELETE` targets an append-only resource, with the resource set **derived from the same declaration** so `audit_log` joining it at step 7 extends the guard by one entry rather than by memory ([route-inventory.spec.ts](../apps/api/test/api/route-inventory.spec.ts)). `DELETE /assets/:id` is deliberately not caught — `assets` is soft-deleted, not append-only — and that exemption is itself asserted, so the guard cannot quietly become over-broad.
+A stray `GRANT UPDATE` reddens assertion 13 _and_ the isolation matrix's declared-capability case. The API layer echoes it: a guard enumerates the registered routes and fails if any `PATCH`/`PUT`/`DELETE` targets an append-only resource, with the resource set **derived from the same declaration** so `audit_log` joining it at step 7 extends the guard by one entry rather than by memory ([`TABLE_TO_SEGMENT`](../apps/api/test/api/route-inventory.spec.ts#L51)). `DELETE /assets/:id` is deliberately not caught — `assets` is soft-deleted, not append-only — and that exemption is itself asserted, so the guard cannot quietly become over-broad.
 
 ### §8.3 over real HTTP — the money test, with permission ruled out as an explanation
 
@@ -551,7 +551,7 @@ The guard is one journey — register, then `activated` → `maintenance_started
 
 Alongside it, §9.2's invariant is made executable: for every asset, `status` must equal the `to` of its latest status-bearing event ([assets-transitions.spec.ts:550-620](../apps/api/test/api/assets-transitions.spec.ts#L550-L620)). It carries its two preconditions on the test, because both are needed or it false-positives — derive only from events whose payload has a `to` (`created` carries `{}` and shares the genesis timestamp), and run only over API-created assets (the isolation fixtures insert assets with no events by design, so a replay over scaffolding would flag status-with-no-event).
 
-And one more floor, because decommissioning moves two columns that must agree: `CHECK ((status = 'decommissioned') = (deleted_at IS NOT NULL))` ([migration.sql](../apps/api/prisma/migrations/20260912000000_assets_decommission_biconditional/migration.sql)). It landed **before** the endpoint that could violate it. Breaking `DELETE` to set only `status` reddens nine tests, and the floor is proven independently of the endpoint — a migration-role `UPDATE` raises `23514` naming the constraint ([assets-transitions.spec.ts:421-450](../apps/api/test/api/assets-transitions.spec.ts#L421-L450)).
+And one more floor, because decommissioning moves two columns that must agree: `CHECK ((status = 'decommissioned') = (deleted_at IS NOT NULL))` ([`assets_decommissioned_iff_deleted`](../apps/api/prisma/migrations/20260912000000_assets_decommission_biconditional/migration.sql#L42-L43)). It landed **before** the endpoint that could violate it. Breaking `DELETE` to set only `status` reddens nine tests, and the floor is proven independently of the endpoint — a migration-role `UPDATE` raises `23514` naming the constraint ([assets-transitions.spec.ts:421-450](../apps/api/test/api/assets-transitions.spec.ts#L421-L450)).
 
 ---
 
@@ -572,7 +572,7 @@ Every other domain table fits a profile already proven. The grant profile, read 
  readings            | INSERT, SELECT
 ```
 
-`maintenance_records` shares `assets`' privileges and **not its semantics.** On `assets`, `PATCH` edits metadata and `status` changes only through the transition engine — there is no general field edit, and `DELETE` is decommissioning (an `UPDATE`). On `maintenance_records` a technician corrects a description or a date and nothing about the asset's lifecycle changed. **This is the first domain table where `UPDATE` means "edit a field" rather than "advance a state machine"** ([the GRANT, migration.sql:154](../apps/api/prisma/migrations/20260913000000_domain_maintenance_records/migration.sql#L154), [the policy, :141-145](../apps/api/prisma/migrations/20260913000000_domain_maintenance_records/migration.sql#L141-L145), [service](../apps/api/src/maintenance/maintenance.service.ts)).
+`maintenance_records` shares `assets`' privileges and **not its semantics.** On `assets`, `PATCH` edits metadata and `status` changes only through the transition engine — there is no general field edit, and `DELETE` is decommissioning (an `UPDATE`). On `maintenance_records` a technician corrects a description or a date and nothing about the asset's lifecycle changed. **This is the first domain table where `UPDATE` means "edit a field" rather than "advance a state machine"** ([the GRANT, migration.sql:154](../apps/api/prisma/migrations/20260913000000_domain_maintenance_records/migration.sql#L154), [the policy, :141-145](../apps/api/prisma/migrations/20260913000000_domain_maintenance_records/migration.sql#L141-L145), [`deleted_at = now()`](../apps/api/src/maintenance/maintenance.service.ts#L226)).
 
 ### The trap
 
@@ -590,7 +590,7 @@ Two traps, and they pull in opposite directions.
 ERROR:  new row violates row-level security policy for table "maintenance_records"
 ```
 
-Asserted on `42501` **and** the row-security message, and explicitly **not** on `permission denied` — `UPDATE` _is_ granted here, so a privilege-shaped refusal would mean the grant was wrong rather than the policy working ([isolation.spec.ts](../apps/api/test/db/isolation.spec.ts)). Its non-vacuous partner asserts that an ordinary field edit **succeeds**, because "cannot change tenant" is trivially satisfied by a table nobody can update at all.
+Asserted on `42501` **and** the row-security message, and explicitly **not** on `permission denied` — `UPDATE` _is_ granted here, so a privilege-shaped refusal would mean the grant was wrong rather than the policy working ([`TENANT IMMUTABILITY — an UPDATE cannot move a row to another tenant`](../apps/api/test/db/isolation.spec.ts#L427)). Its non-vacuous partner asserts that an ordinary field edit **succeeds**, because "cannot change tenant" is trivially satisfied by a table nobody can update at all.
 
 **The OPEN-5 deadlock, proven avoided rather than assumed.** `deleted_at` appears in no policy predicate, so the soft-delete write succeeds:
 
@@ -625,13 +625,150 @@ Asserted on `42501` **and** `permission denied for table maintenance_records`, e
 
 ### And the matrix extended itself
 
-The isolation matrix generates **20 cases across four tables**, up from 15 at phase 3d and from zero before step 6 — five per table, automatically, because the registry's key set is asserted equal to the catalog's in both directions ([isolation.spec.ts](../apps/api/test/db/isolation.spec.ts), registry at [helpers.ts](../apps/api/test/db/helpers.ts)). The fourth table required no new harness mechanism, which is the point of having built the contract for two write shapes at phase 1.
+The isolation matrix generates **20 cases across four tables**, up from 15 at phase 3d and from zero before step 6 — five per table, automatically, because the registry's key set is asserted equal to the catalog's in both directions ([`every tenant-scoped table has an isolation fixture, and vice versa`](../apps/api/test/db/isolation.spec.ts#L85), registry at [`ISOLATION_FIXTURES`](../apps/api/test/db/helpers.ts#L376)). The fourth table required no new harness mechanism, which is the point of having built the contract for two write shapes at phase 1.
 
 ### A postscript worth more than the table it came from
 
 Finding 7's lesson was applied here from day one: the list endpoint's cursor carries the sort column's raw **text** and an `id` tiebreaker, and the index is three columns rather than two. Then the sweep restored the truncating cursor as a mutation and **nothing reddened.**
 
 The new tests had been written with whole-millisecond fixtures — rows created by separate HTTP requests, timestamps like `2026-03-03T00:00:00.000Z` — where truncating microseconds is exactly lossless. **That is the same blind spot that let Finding 7 through phase 3a's seven-mutation sweep.** Writing a test "for the lesson" does not test the lesson if its fixtures cannot express the failure. The fix was a case whose two rows are inserted in one statement and therefore genuinely share a microsecond; it carries a non-vacuity assertion that they do. The mutation now reddens it.
+
+---
+
+## 7h. Finding 10 — the trail that the application cannot write, and a role that survives being taken away
+
+Step 7a built the audit **capture** mechanism and proved it at the database layer. The read surface, the admin/auditor gate and the maintenance-edit capstone are step 7b; nothing below claims them.
+
+### The premise, and why it decided the mechanism
+
+`audit_log` could have been derived. Every other tenant-scoped write in this system already leaves a trace — `asset_events` records what happened to an asset, and `created_by` is on every child row — so a trail assembled from those was the cheap answer.
+
+**Step 6 disproved it.** A maintenance edit emits **no lifecycle event at all**: correcting a description is not something that happened to the physical asset. The asset-metadata `PATCH` is the same shape (ARCHITECTURE §9.2). A derived trail is therefore silent for the entire class of change an auditor is most likely to be investigating — and silent without erroring, which is this document's recurring failure mode.
+
+So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L387)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
+
+### The centerpiece — immutable by grant
+
+The app role holds `SELECT` on `audit_log` and **nothing else**. Forge, alter, suppress — three refusals, verbatim, as `meterlog_app`:
+
+```
+=== FORGE ===
+psql:/tmp/neg.sql:7:  ERROR:  permission denied for table audit_log
+=== ALTER ===
+psql:/tmp/neg.sql:9:  ERROR:  permission denied for table audit_log
+=== SUPPRESS ===
+psql:/tmp/neg.sql:11: ERROR:  permission denied for table audit_log
+```
+
+Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L435)).
+
+Two vacuity guards sit under it. The `ALTER` and `SUPPRESS` negatives assert the row **existed, was visible under that tenant, and is unchanged afterwards**, so neither can pass against an empty table. And a positive pairs with all three — the app role **can** read its own tenant's rows ([`the app role CAN read its own tenant rows`](../apps/api/test/db/audit.spec.ts#L335)) — because "cannot write" is otherwise satisfied by a table nobody can reach at all, which is fail-closed and broken.
+
+**The counter-face is the interesting half.** The trigger writes rows into a table its caller cannot write, and both properties have to hold at once or the mechanism is either broken or pointless. That is what forces `SECURITY DEFINER`, and ADR-009 and ADR-010 are therefore not independent: the grant creates the need for the definer.
+
+### Role-at-time-of-action — OPEN-4 answered by where the code runs
+
+OPEN-4 asked, since step 4, whether `audit_log` should record the actor's role as it was when they acted. The obvious implementation is a third GUC. It was rejected — partly because `app.current_role` would be indistinguishable, to a reviewer, from the role-in-a-policy that DECISION C turned down, and partly because it is unnecessary: **the trigger fires during the mutation, so the `memberships` row it reads _is_ the role at the time of the action.** There is nothing to propagate and nothing to retrofit.
+
+Proven as a property, twice, because the two failure modes differ:
+
+- A technician records a reading, is then **promoted to admin**, and the audit row still reads `technician` ([`a technician acts, is promoted to admin`](../apps/api/test/db/audit.spec.ts#L356)). The test then runs **the join a reader would be tempted to write** — recovering the role from `memberships` at read time — and asserts it returns `admin`, the wrong answer. That is why `actor_role` is denormalized and must stay so.
+- A member records maintenance, is then **revoked**, and the audit row still reads `technician` ([`a member acts, is REVOKED`](../apps/api/test/db/audit.spec.ts#L420)). Here the naive lookup returns **nothing at all**, so without the snapshot the action would be permanently unattributable to a role.
+
+Capture also reaches the three mutations that have no service in front of them — `invite_member`, `change_member_role`, `revoke_member` are definer functions (ADR-006 §7), and a service-layer audit would have needed a second implementation inside them. The revoke is captured with the **admin who performed it** ([`the revoke itself is captured with the ADMIN who performed it`](../apps/api/test/db/audit.spec.ts#L479)).
+
+### The system actor, and a nullable column that keeps the front door open
+
+`register_tenant` runs **before** authentication, so the trigger finds `app.current_user` empty and there is no actor by construction. `actor_user_id` is therefore nullable — and the failure this guards against is not a missing row, it is **a broken registration**: a `NOT NULL` column would make the trigger's insert fail, the exception would propagate, and the only way into the product would have been closed by the audit module.
+
+Asserted in that order ([`registration SUCCEEDS with capture live`](../apps/api/test/db/audit.spec.ts#L511)) — registration worked, all three rows persisted, and _then_ the system row is inspected. Live, with capture on:
+
+```
+       action       | tenant_null | actor_null | role_null | leaks_hash
+--------------------+-------------+------------+-----------+------------
+ membership.created | f           | t          | t         | f
+ user.created       | t           | t          | t         | f
+```
+
+`tenant_id` is nullable too, and that came out of read-back rather than design. **`users` has no `tenant_id` column** — ADR-006 §2 made it pure identity — and registration inserts the user _before_ the membership with no tenant context set, so for that one write there is no tenant from either source. The ADR pins one meaning for all three: **NULL actor, NULL role and NULL tenant mean a pre-authentication bootstrap action**, reachable only via `register_tenant`.
+
+The consequence is asserted rather than left to be met later ([`the tenant-NULL system row is invisible to app-role reads`](../apps/api/test/db/audit.spec.ts#L554)): a tenant sees the `membership.created` row and not the `user.created` one. A global identity row is not any tenant's audit data, and the bootstrap is still in that tenant's trail.
+
+### Redaction, and the reason a redaction test usually proves nothing
+
+`users.password_hash` is withheld from the app role by a **column-level** grant. But `to_jsonb(NEW)` inside a `SECURITY DEFINER` trigger reads the tuple from memory with no privilege consulted, and would write the hash into a table the app role **can** read. **The audit trail would have become a privilege-escalation path, and it would have looked like a feature while it did it.**
+
+The defence is a per-table column **allowlist**, carried as the trigger's argument and therefore visible in the catalog:
+
+```
+        table        |                                  allowlist
+---------------------+------------------------------------------------------------------------------
+ users               | 'id,email,created_at,updated_at,deleted_at'
+ memberships         | 'id,user_id,tenant_id,role,created_at,updated_at,deleted_at'
+ assets              | 'id,tenant_id,serial_number,type,status,location,installed_at,created_at,...'
+ asset_events        | 'id,tenant_id,asset_id,event_type,payload,created_by,created_at'
+ readings            | 'id,tenant_id,asset_id,value,unit,read_at,created_by,created_at'
+ maintenance_records | 'id,tenant_id,asset_id,description,performed_at,created_by,created_at,...'
+```
+
+Allowlist rather than denylist, deliberately: a denylist naming `password_hash` is correct today and wrong the first time a column is added — a `totp_secret`, or the reset token OPEN-7's flow will need. **An allowlist fails closed on exactly that change.**
+
+**And the proof is non-vacuous, which is the part worth stating.** A redaction test is worth nothing if no fixture carries the secret: the source row would hold an empty hash, the audit row would lack it, and the assertion would pass just as happily against a trigger with the allowlist deleted. That is Finding 7's lesson — seven mutations passed against fixtures whose _data shape_ was the blind spot. So the test asserts the secret **is really there, in full, in the source row** before asserting its absence anywhere else ([`the SOURCE row genuinely carries the secret`](../apps/api/test/db/audit.spec.ts#L575)), and checks the audit row is not merely empty by asserting `email` and `id` _are_ present.
+
+A [`GLOBAL SCAN`](../apps/api/test/db/audit.spec.ts#L609) backs it up across every row from every path, against every hash in the database — with its own non-vacuity guard on the number of **distinct** hashes, which failed on first run and caught the test reusing one literal across two identities. Catalog assertion 17 covers the same property structurally, so a table no fixture happens to mutate is covered too.
+
+### What the layers caught, and the guard that fired on its own
+
+The sweep ran **18 mutations against the database and the harness; all 18 reddened at least one test.** (Five more were run against the citation guard itself — see §10 — for **23 in total**, which is the number `PROGRESS.md` quotes. Stated both ways on purpose: this phase corrected two stale counts that had drifted between documents, and a third would be careless.) The ones worth naming:
+
+| mutation                                                            | what reddened                                                                                       |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `GRANT INSERT` / `UPDATE` / `DELETE` on `audit_log` to the app role | the matching forge / alter / suppress negative — one each, no overlap                               |
+| the same `GRANT INSERT`, seen structurally                          | catalog assertions 9 **and** 13                                                                     |
+| `REVOKE SELECT` from the app role                                   | assertion 10 — the fail-closed-but-broken case                                                      |
+| drop the `NULLIF` from the read policy                              | the no-context test, with `22P02 invalid input syntax for type uuid: ""` on a **pooled** connection |
+| read policy → `USING (true)`                                        | all three isolation assertions                                                                      |
+| role lookup removed from the trigger                                | capture **and** both role-at-time tests                                                             |
+| changed-column diff → full-row                                      | the diff test alone                                                                                 |
+| `actor_user_id SET NOT NULL`                                        | registration, and therefore every test — the nullable decision is load-bearing                      |
+| drop the definer INSERT policy, or its grant                        | capture dies entirely                                                                               |
+| `password_hash` admitted to the `users` allowlist                   | assertion 17 **and** both behavioural redaction tests                                               |
+| `DROP TRIGGER maintenance_records_audit`                            | assertion 17 and three behavioural tests                                                            |
+
+Two results are worth more than the count. **The redaction mutation reddened both a structural and a behavioural assertion** — the pairing was designed for that and it held. And `actor_user_id SET NOT NULL` reddening _registration_ is the clearest statement of why that column is nullable: the alternative does not degrade the audit trail, it closes the product.
+
+**And one defect was found by building, recorded rather than quietly fixed.** The first draft of the new migration's ownership block granted the migration role membership in `meterlog_definer` to run `ALTER FUNCTION ... OWNER TO` — and **never revoked it**, unlike the step-4 and step-5 blocks it was modelled on. That is the standing deployment risk in `PROGRESS.md`, reintroduced: RLS matches a policy's roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent.
+
+**No test caught it, and no test can.** Locally and in CI the migration role is the cluster bootstrap **superuser**, for which `pg_has_role` is unconditionally true, so the grant branch never executes and there is nothing to revoke — the defect is **invisible by construction in both environments where the suite runs**, and would have appeared for the first time against Render. It was found by reading the two prior migrations to check the pattern matched, which is the only thing that could have found it. Fixed, and `pg_auth_members` verified empty after a from-scratch rebuild — which proves the absence of a stray grant, not the correctness of the revoke branch, and the difference is the whole point of this paragraph.
+
+**One guard fired without being asked.** `audit_log` joining `APPEND_ONLY_TABLES` turned `route-inventory.spec.ts` red, because its `TABLE_TO_SEGMENT` map is asserted set-equal to the declaration. That file had _predicted_ this in a comment written at step 6 — "when `audit_log` joins `APPEND_ONLY_TABLES` at step 7, this guard extends by ONE entry" — and the prediction cost nothing to keep because the assertion, not the comment, is what enforced it.
+
+Extending it exposed a real boundary. The guard's pairing check requires every append-only resource to expose a `GET` **and** a `POST`, which was right while the API was the writer of every such table. `audit_log` is the first whose writer is a trigger, and for it a `POST` is not merely absent but **forbidden** — the app role holds no `INSERT`, so the endpoint could only ever 500. So the check was **split by writer rather than loosened**: definer-written tables must expose no `POST` (asserted now), and the `GET` obligation tightens on its own at 7b, since any route that does appear on the segment must be a read.
+
+### The definer surface, from the live catalog
+
+```
+      function      |      owner       | secdef |             config              | app_execute | is_trigger
+--------------------+------------------+--------+---------------------------------+-------------+------------
+ audit_capture      | meterlog_definer | t      | search_path=pg_catalog, pg_temp | f           | t
+ change_member_role | meterlog_definer | t      | search_path=pg_catalog, pg_temp | t           | f
+ invite_member      | meterlog_definer | t      | search_path=pg_catalog, pg_temp | t           | f
+ login_lookup       | meterlog_definer | t      | search_path=pg_catalog, pg_temp | t           | f
+ register_tenant    | meterlog_definer | t      | search_path=pg_catalog, pg_temp | t           | f
+ revoke_member      | meterlog_definer | t      | search_path=pg_catalog, pg_temp | t           | f
+```
+
+Six, up from five, with the allowlist extended in the same PR ([`EXPECTED_DEFINER_FUNCTIONS`](../apps/api/test/db/helpers.ts#L117)) because assertion 4 fails loudly otherwise — which is the system working.
+
+`audit_capture` is the first entry with `app_execute = f`, and that is deliberate. **A trigger function is never called by name:** Postgres checks `EXECUTE` at `CREATE TRIGGER` time, not at fire time. Granting it would be a privilege that buys nothing, and worse, it would let assertion 12 — "every definer function is callable by the app role" — be satisfied by an empty gesture. So 12 was narrowed to exclude trigger functions, and **assertion 16 replaces the cover it would have lost**: a trigger-returning definer function must be **attached to at least one trigger**, with a non-vacuity check that such a function exists at all. The reachability question is still asked of every definer function — in the form that fits each kind.
+
+`audit_log` also joins `DEFINER_ACCESSIBLE_TABLES`, the first entry there that is not an identity table. It needs a definer policy because `FORCE ROW LEVEL SECURITY` applies policies to the owner too. The side effect is the useful part: assertions **9** and **10**, already written, now assert exactly ADR-010 — the app role holds no `INSERT`/`UPDATE`/`DELETE` on the trail, and can nevertheless read it.
+
+### What 7a does not prove
+
+The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L506) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L666)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
+
+Hash-chaining is deferred, and ADR-010 records why as engineering rather than scope. What immutability-by-grant does **not** give, stated plainly: it defends against the application and against anyone holding only the app role's credentials. It does **not** defend against the migration/owner role or a cluster superuser, who can `ALTER TABLE`. Tamper-evidence against a privileged operator is what a chain buys, and that threat model is not v1.0's.
 
 ---
 
@@ -651,7 +788,7 @@ The findings above share a cause: **a test that passes is not the same as a test
 
 That distinction matters: an equivalent mutant is not a coverage hole, and pretending otherwise by contriving a test would be exactly the dishonesty the rest of the discipline exists to prevent. It is also why the two step-5 escapers were _not_ classified that way — both were real defects that no existing test could see.
 
-**Two defects were found by building, and are recorded rather than quietly fixed.** A protected route with no session returned **500 instead of 401** — the right refusal for the wrong reason — and the first version of the test _asserted the 500_, documenting the defect instead of catching it. The obvious fix made it worse: a `CanActivate` guard rejected **every** request, because Nest runs guards _before_ interceptors, so the guard could not see a context the interceptor had not yet established. Found empirically, not by reasoning. The resolution puts the _declaration_ at the route as metadata and keeps the single _enforcement_ point inside the interceptor that already resolved the session ([requires-session.decorator.ts](../apps/api/src/common/auth/requires-session.decorator.ts), [interceptor:74-95](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L74-L95)). Step 5's role gate follows the identical shape for the identical reason ([requires-role.decorator.ts:50](../apps/api/src/common/auth/requires-role.decorator.ts#L50)) — and the hazard was re-measured rather than inherited on faith.
+**Two defects were found by building, and are recorded rather than quietly fixed.** A protected route with no session returned **500 instead of 401** — the right refusal for the wrong reason — and the first version of the test _asserted the 500_, documenting the defect instead of catching it. The obvious fix made it worse: a `CanActivate` guard rejected **every** request, because Nest runs guards _before_ interceptors, so the guard could not see a context the interceptor had not yet established. Found empirically, not by reasoning. The resolution puts the _declaration_ at the route as metadata and keeps the single _enforcement_ point inside the interceptor that already resolved the session ([`RequiresSession`](../apps/api/src/common/auth/requires-session.decorator.ts#L20), [interceptor:74-95](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L74-L95)). Step 5's role gate follows the identical shape for the identical reason ([requires-role.decorator.ts:50](../apps/api/src/common/auth/requires-role.decorator.ts#L50)) — and the hazard was re-measured rather than inherited on faith.
 
 **Timing as a boundary.** The no-such-user login branch performs a real argon2 verify so it costs what the wrong-password branch costs. The dummy hash is derived from the same exported parameters production uses ([auth.service.ts:52](../apps/api/src/auth/auth.service.ts#L52), [:290](../apps/api/src/auth/auth.service.ts#L290)), and a test **parses `m=`, `t=`, `p=`** out of both a dummy hash and a hash taken from the real registration path and asserts they agree ([auth.spec.ts:451](../apps/api/test/api/auth.spec.ts#L451)). Previously both call sites simply inherited library defaults — they agreed, but by coincidence rather than by construction, which is a drift vector regardless of whether the numbers match today. The same rule governs the sentinel hash step 5's invite writes for a new identity: derived from those parameters, never a literal, and asserted by parsing them back out ([membership-writes.spec.ts:784](../apps/api/test/db/membership-writes.spec.ts#L784)).
 
@@ -667,9 +804,13 @@ This list is kept aligned with the enumerated **Open items register** in [`DECIS
 - **`maintenance_records` is SOFT-DELETE ONLY, and hard delete is deferred (OPEN-9).** v1.0 has no way to destroy a maintenance record: the app role holds no `DELETE` privilege, proven by the `permission denied` negative in §7g and pinned by catalog assertion 14. The deferral is deliberate rather than unfinished — **a destructive operation must not predate the audit trail that makes it accountable**, because a purged row with no `audit_log` entry leaves no trace of itself, of who removed it, or of what it said. When hard delete lands it lands behind audit, and it inherits the question of what a purge writes there ([ADR-008](DECISIONS.md)).
 - **A green generic matrix is still not evidence for a table registered as bespoke.** `users`, `tenants` and `memberships` are excluded by declaration, and the exclusion is accounted for by the registry-equality check so it cannot be mistaken for an oversight ([helpers.ts:132](../apps/api/test/db/helpers.ts#L132)). Their coverage is the bespoke dual-axis suite (§3), not the 15 generated cases.
 - **Invited users cannot log in yet (OPEN-7).** `invite_member` creates an identity whose password hash is a sentinel that matches nothing, so an invited person can neither sign in nor register their own organisation (the email is taken). This is a **known, scheduled, temporary** state, not a hidden one: the set-password / invite-token flow is the first slice of step 8, with a hard deadline of step 10 (before deploy, the only people it can lock out are test fixtures), and it is enforced by a Definition-of-Done checkbox rather than by a comment ([PROJECT_BRIEF.md:266](PROJECT_BRIEF.md#L266)) because markers drift and checklists block. Reasoning in [DECISIONS.md:269](DECISIONS.md#L269).
-- **Audit logging does not exist, and the lifecycle log is NOT the audit trail.** This is the step-6 claim most open to being misread, so it is stated flatly: `asset_events` records what happened to a physical **asset**; `audit_log` records who changed which **record**, with before/after. Neither derives from the other — a bulk import produces lifecycle events with no user-facing mutation, and correcting a typo in `location` produces an audit row with **no lifecycle event at all**. That `PATCH` case is the one Phase 3 mutation for which `audit_log` would be the only record, and it is invisible in the event log today.
+- **Audit CAPTURE exists as of step 7a; the READ SURFACE does not (step 7b).** The rest of this bullet is the step-6 statement it replaces, kept because the distinction it draws is still the one that matters.
 
-  `audit_log` lands at step 7, which means **ten** mutation types now need retrofitting rather than wiring: the three step-5 membership writes, plus asset creation, asset metadata update, reading creation, status transitions and decommission, plus maintenance creation, maintenance editing and maintenance soft-delete. Tracked as **OPEN-6**, with **OPEN-4** (whether to record role-at-time-of-action) answered there. Recorded as a known retrofit, and it grew twice during step 6 rather than being discovered at step 7.
+  What landed: a `SECURITY DEFINER` trigger on six tables writes an `audit_log` row for every one of the eleven mutation types, with actor and **role-at-time-of-action** on each (§7h). What has NOT landed: `GET /audit`, the admin/auditor RBAC gate on it, and the HTTP-level isolation proof. So **"the trail is captured" is true, and "the trail is readable by the people entitled to read it" is not yet** — the rows exist and only the migration role and a tenant-scoped `SELECT` can reach them.
+
+- **The lifecycle log is NOT the audit trail, and neither derives from the other.** This is the step-6 claim most open to being misread, so it is stated flatly: `asset_events` records what happened to a physical **asset**; `audit_log` records who changed which **record**, with before/after. Neither derives from the other — a bulk import produces lifecycle events with no user-facing mutation, and correcting a typo in `location` produces an audit row with **no lifecycle event at all**. That `PATCH` case is the one Phase 3 mutation for which `audit_log` would be the only record, and it is invisible in the event log today.
+
+  `audit_log` landed at step 7a, capturing the **eleven** mutation types that had to be retrofitted rather than wired. **The count was wrong here until 7a and is corrected rather than quietly fixed:** this sentence said "ten" over a list of eleven, and `OPEN-6`'s title said "SEVEN" over a body listing eight. The _names_ were maintained as the list grew at phase 3b, 3c and phase 4; the arithmetic was not — a small instance of exactly the drift the new citation guard exists to catch in the citations. The eleven are: the three step-5 membership writes, plus asset creation, asset metadata update, reading creation, status transitions and decommission, plus maintenance creation, maintenance editing and maintenance soft-delete. Tracked as **OPEN-6** — now **DONE** at step 7a — with **OPEN-4** (whether to record role-at-time-of-action) answered there, and answered as a _property of the mechanism_ rather than as a payload decision: the trigger fires during the mutation, so the `memberships` row it reads is the role at the time of the action (ADR-009, §7h). Recorded as a known retrofit, and it grew twice during step 6 rather than being discovered at step 7.
 
   **`maintenance_records` is where this gap is sharpest.** A maintenance edit emits **no lifecycle event at all** — correcting a description is not something that happened to the physical asset — so for that mutation the event log is silent and `audit_log` would be the _only_ record. Of the domain's mutations it is the one a retrofit driven from `asset_events` would most certainly miss, because there is nothing in `asset_events` to drive from.
 
@@ -685,22 +826,24 @@ This list is kept aligned with the enumerated **Open items register** in [`DECIS
 cp .env.example .env      # then set SESSION_SECRET
 docker compose up -d      # Postgres 16 + Redis 7
 npm install && npm run db:migrate
-npm run test              # 299 tests
+npm run test              # 319 tests
+npm run docs:check        # the citation guard (its own CI step)
 ```
 
-**Local evidence, `feat/step6-phase4-maintenance`, verbatim:**
+**Local evidence, `feat/step7a-audit-capture`, on a FRESH database, verbatim:**
 
 ```
+ ✓ test/db/isolation.spec.ts (42 tests)
  ✓ test/db/membership-writes.spec.ts (31 tests)
  ✓ test/api/assets-transitions.spec.ts (26 tests)
  ✓ test/api/assets-write.spec.ts (23 tests)
  ✓ test/api/auth.spec.ts (23 tests)
+ ✓ test/db/membership-isolation.spec.ts (23 tests)
  ✓ test/api/maintenance.spec.ts (22 tests)
  ✓ test/api/assets-read.spec.ts (21 tests)
- ✓ test/db/isolation.spec.ts (42 tests)
- ✓ test/db/membership-isolation.spec.ts (23 tests)
  ✓ test/api/memberships.spec.ts (19 tests)
- ✓ test/db/catalog-rls.spec.ts (15 tests)
+ ✓ test/db/audit.spec.ts (17 tests)
+ ✓ test/db/catalog-rls.spec.ts (17 tests)
  ✓ test/db/interceptor.spec.ts (15 tests)
  ✓ test/db/auth-definer.spec.ts (12 tests)
  ✓ test/api/step6-acceptance.spec.ts (10 tests)
@@ -710,9 +853,11 @@ npm run test              # 299 tests
  ✓ test/api/revocation.spec.ts (3 tests)
  ✓ src/health/health.controller.spec.ts (1 test)
 
- Test Files  18 passed (18)
-      Tests  299 passed (299)
+ Test Files  19 passed (19)
+      Tests  319 passed (319)
 ```
+
+`audit.spec.ts` is the step-7a gate (§7h) — capture, immutability, role-at-time, the system actor, redaction and DB-layer isolation on the trail. `catalog-rls.spec.ts` went from 15 to 17: assertion **16** (a trigger-returning definer function must be attached) and assertion **17** (no audit allowlist admits `password_hash`, and the trigger is attached exactly where ADR-012 says).
 
 `membership-writes.spec.ts` is the §7a backstop suite — the one that calls the definer functions directly, with no HTTP anywhere in the process. `step6-acceptance.spec.ts` is the §8.3 capstone, now covering all four domain tables in one scenario. Of `isolation.spec.ts`'s tests, **20 are generated** by the catalog-driven matrix across the four domain tables (§7f, §7g); it ran 6 before step 6 and 15 at phase 3d.
 
@@ -723,6 +868,7 @@ The definer surface, read from the live catalog:
 ```
       function      |      owner       | secdef |             config              | public_execute
 --------------------+------------------+--------+---------------------------------+----------------
+ audit_capture      | meterlog_definer | t      | search_path=pg_catalog, pg_temp | f
  change_member_role | meterlog_definer | t      | search_path=pg_catalog, pg_temp | f
  invite_member      | meterlog_definer | t      | search_path=pg_catalog, pg_temp | f
  login_lookup       | meterlog_definer | t      | search_path=pg_catalog, pg_temp | f
@@ -730,7 +876,29 @@ The definer surface, read from the live catalog:
  revoke_member      | meterlog_definer | t      | search_path=pg_catalog, pg_temp | f
 ```
 
-Five functions — the two pre-auth ones from step 4 and the three membership writers from step 5 — all owned by the definer role, all with the path pinned, and **none executable by `PUBLIC`**: Postgres grants `EXECUTE` to `PUBLIC` by default, so that had to be revoked explicitly ([migration.sql:179-183](../apps/api/prisma/migrations/20260908000000_auth_definer_functions/migration.sql#L179-L183)). The allowlist is asserted against the catalog ([helpers.ts:94](../apps/api/test/db/helpers.ts#L94)), so a sixth cannot appear without a reviewed edit.
+Six functions — the two pre-auth ones from step 4, the three membership writers from step 5, and `audit_capture` from step 7a (§7h) — all owned by the definer role, all with the path pinned, and **none executable by `PUBLIC`**: Postgres grants `EXECUTE` to `PUBLIC` by default, so that had to be revoked explicitly ([migration.sql:179-183](../apps/api/prisma/migrations/20260908000000_auth_definer_functions/migration.sql#L179-L183)). The allowlist is asserted against the catalog ([`EXPECTED_DEFINER_FUNCTIONS`](../apps/api/test/db/helpers.ts#L117)), so a seventh cannot appear without a reviewed edit — and the sixth did not, which is how the list grew in the same PR that added the function.
+
+### The citation guard, and its own sweep
+
+Every `file#Lnn` link in this document is checked by `npm run docs:check`, which runs as **its own CI step** (step 7a, Part 0). It asserts three things per citation: the path resolves, the line numbers are inside the file, and — where the link text carries a quoted string, an identifier, or a record id like `ADR-009` — that the literal appears within five lines of the anchor.
+
+**Checks 1 and 2 catch only deletions and truncations.** A citation that slides twenty lines because someone added an import passes both of them every time. The content check is the one that earns line-level precision, and it is affordable because this document already cites tests by their `it(...)` name.
+
+Held to the same standard as everything else here, it was swept too — five mutations, five red:
+
+| mutation                                                         | caught by                             |
+| ---------------------------------------------------------------- | ------------------------------------- |
+| repoint a citation at a non-existent file                        | check 1                               |
+| push a line number past the end of the file                      | check 2                               |
+| slide an anchor 20 lines (path and line still valid)             | **check 3** — neither 1 nor 2 notices |
+| slide an `ADR-009` anchor within `DECISIONS.md`                  | check 3, via the record-id rule       |
+| point a record-id link at a PROSE MENTION instead of its heading | check 3, via the heading-only rule    |
+
+**The fifth row is there because the guard produced a FALSE NEGATIVE and it is recorded rather than quietly patched.** Inserting the full redaction allowlist into ADR-011 pushed ADR-012's heading down fifteen lines, so the `[ADR-012]` link — anchored at `DECISIONS.md` line 491 — was left pointing at a `- **Consequences:**` bullet belonging to a different ADR. Path and line were both still valid, so checks 1 and 2 saw nothing — **and check 3 passed too**, because the five-line window happened to contain the words "ADR-012's scope" in prose four lines away. Every check green, citation wrong.
+
+The fix is a tightening rather than a wider net: **a link whose entire text is a record id is checked against HEADING lines only.** A document that discusses its own record ids mentions them in prose constantly; prose _mentions_ a record, a heading _declares_ it, and `[ADR-012]` means the latter. Re-anchored to :506, and the mutation that reproduces the false negative — pointing the link at the prose line — is now red.
+
+**It found two real drifts on its first runs, unprompted**: the citation for the citext case-insensitivity regression guard (§4) — the test this document and `CLAUDE.md` both call load-bearing — had slid six lines past its `it(...)`, and an `ADR-006` anchor had drifted. Both were re-anchored, and phase 4's six file-level links were then restored to line level, which was only safe once the guard existed. The guard's own first version reported every mutation as passing, because the reporter interleaves ANSI codes inside the summary line and defeated a regex; the sweep harness now reads exit codes. **A sweep harness that cannot fail is worth exactly as much as a test that cannot fail.**
 
 ---
 
@@ -741,4 +909,5 @@ Five functions — the two pre-auth ones from step 4 and the three membership wr
 - [`PROGRESS.md`](PROGRESS.md) — the phase-by-phase history, including how each finding was reached and the two forward debts step 5 leaves behind.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — §7 isolation, §8 sessions, §9 the RBAC matrix (§9.1 the domain cells, §9.2 the lifecycle emission contract), §16 deployment topology and the pre-deploy checklist.
 - [`PERF.md`](PERF.md) — the two measured index decisions, with before/after `EXPLAIN ANALYZE` plans.
-- [`DECISIONS.md`](DECISIONS.md) — ADR-007 (composite-FK child tenancy) and the **Open items register**, which this document's §9 is kept aligned with.
+- [`DECISIONS.md`](DECISIONS.md) — ADR-007 (composite-FK child tenancy), **ADR-009…012 (the audit module: trigger capture, immutability by grant, redaction, scope/RBAC/volume)**, and the **Open items register**, which this document's §9 is kept aligned with.
+- `scripts/check-doc-citations.mjs` — the citation guard added at step 7a, run as its own CI step. Every `file#Lnn` link in this document is checked by it: path, line, and — where the link text quotes a literal — that the literal is actually near the anchor. It found one drifted anchor on its first run, on the citext regression guard §4 calls load-bearing.

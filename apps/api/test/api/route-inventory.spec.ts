@@ -5,7 +5,7 @@ import { Test } from '@nestjs/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { AppModule } from '../../src/app.module';
-import { APPEND_ONLY_TABLES, loadEnv } from '../db/helpers';
+import { APPEND_ONLY_TABLES, DEFINER_WRITTEN_APPEND_ONLY_TABLES, loadEnv } from '../db/helpers';
 
 /**
  * The route-inventory guard — **the API-layer echo of catalog assertion 13.**
@@ -51,6 +51,19 @@ import { APPEND_ONLY_TABLES, loadEnv } from '../db/helpers';
 const TABLE_TO_SEGMENT: Readonly<Record<string, string>> = {
   asset_events: 'events',
   readings: 'readings',
+  // STEP 7 PHASE 7A — the entry this file predicted above, added the moment
+  // `audit_log` joined APPEND_ONLY_TABLES, because the set-equality check below
+  // went red until it was. The guard did exactly what it was written to do.
+  //
+  // `GET /audit` lands at 7b (PROJECT_BRIEF §6 :166). This guard is about what
+  // must NEVER exist on the segment — PATCH, PUT or DELETE — so it is in force
+  // now, before the read surface, which is the useful order: the constraint on
+  // the endpoints is written down before the endpoints are.
+  //
+  // And it is stricter here than for the other two. `asset_events` and `readings`
+  // at least hold an INSERT grant; `audit_log` holds none, so a mutating route
+  // would be refused by the database whatever it did (ADR-010).
+  audit_log: 'audit',
 };
 
 /** HTTP methods that would mutate or remove an existing row. */
@@ -173,12 +186,45 @@ describe('route inventory — no endpoint may mutate an append-only resource', (
     expect(APPEND_ONLY_TABLES).not.toContain('assets');
   });
 
-  it('the append-only resources DO expose reads and creates', () => {
+  it('the append-only resources DO expose reads and creates — except the one nothing may create', () => {
     // Pairs with the negative above the way assertion 10 pairs with 9: "no mutating
     // route" is trivially satisfied by a resource with no routes at all, which would
     // be fail-closed and broken.
-    for (const segment of Object.values(TABLE_TO_SEGMENT)) {
+    //
+    // SPLIT BY WRITER AT STEP 7 PHASE 7A, and split rather than loosened. Until now
+    // every append-only table was written BY THE API — `POST /assets/:id/readings`
+    // creates a reading — so "exposes a GET and a POST" was the right pairing for
+    // all of them. `audit_log` is the first whose writer is a SECURITY DEFINER
+    // trigger and not the API, and for it a POST is not merely absent, it is
+    // FORBIDDEN: the app role holds no INSERT at all (ADR-010), so an endpoint
+    // offering one could only ever 500 on `permission denied`.
+    //
+    // So the stronger statement is asserted instead of the inapplicable one, and it
+    // is asserted NOW rather than deferred with the read surface.
+    for (const [table, segment] of Object.entries(TABLE_TO_SEGMENT)) {
       const onSegment = routes.filter((r) => r.path.split('/').includes(segment));
+
+      if (DEFINER_WRITTEN_APPEND_ONLY_TABLES.includes(table)) {
+        expect(
+          onSegment.some((r) => r.method === 'POST'),
+          `${segment} exposes a POST, but nothing may create an audit row through the API (ADR-010)`,
+        ).toBe(false);
+
+        // The GET arrives at step 7b — 7a's boundary is "no read endpoints". This
+        // is written as a conditional rather than a comment so it TIGHTENS on its
+        // own the moment any route lands on the segment: whatever appears there
+        // must be a read.
+        if (onSegment.length > 0) {
+          expect(
+            onSegment.every((r) => r.method === 'GET'),
+            `${segment} exposes a non-GET route: ${onSegment
+              .map((r) => `${r.method} ${r.path}`)
+              .join(', ')}`,
+          ).toBe(true);
+        }
+        continue;
+      }
+
       expect(
         onSegment.some((r) => r.method === 'GET'),
         `${segment} exposes no GET`,
