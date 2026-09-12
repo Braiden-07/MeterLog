@@ -145,7 +145,7 @@ Core tables (illustrative — refine during design phase, log schema decisions):
 - UUID primary keys throughout.
 - `created_at` / `updated_at` timestamps on mutable tables; append-only tables get `created_at` only.
 - Soft delete (`deleted_at`) on user-facing entities (tenants, users, assets); queries filter out soft-deleted rows by default.
-- Indexes: composite `(tenant_id, id)` patterns; index foreign keys; index `assets.serial_number`, `readings.(asset_id, read_at)`, `audit_log.(entity_type, entity_id)`.
+- Indexes: composite `(tenant_id, id)` patterns; index foreign keys; index `assets.serial_number`, `readings.(asset_id, read_at)`, `audit_log.(table_name, row_id)`.
 - Foreign keys with appropriate `ON DELETE` behavior (usually restrict; audit/events never cascade-delete).
 - Prove at least one index decision with `EXPLAIN ANALYZE` and note the before/after in docs — this is a resume-worthy detail.
 

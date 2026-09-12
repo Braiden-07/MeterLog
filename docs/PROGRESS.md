@@ -6,13 +6,46 @@
 ## Status
 
 - **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy) **complete and merged** (PR #1). 5 (RBAC + membership management) **complete and merged** (PRs #2, #3, #4). **Step 6 (domain entities) COMPLETE — phases 1, 2, 3a-3d and phase 4 merged (PR #14). The v1.0 domain surface is four tables: `assets` plus `asset_events`, `readings` and `maintenance_records`, all isolation-proven.** **Step 7 (audit module) phase 7a COMPLETE on `feat/step7a-audit-capture`: the capture mechanism, immutable by grant, proven at the database layer.** `audit_log` is the fifth and final table of `PROJECT_BRIEF` §5, so the v1.0 schema is complete. OPEN-6 (eleven mutation types — the count was stale at 'ten'/'seven' and is corrected) and OPEN-4 (role-at-time-of-action) are both **DONE**; OPEN-9 (hard delete) is now unblocked and stays a separate step. Next: **step 7b** — the read surface (`GET /audit`), the admin/auditor RBAC negatives, the maintenance-edit capstone and the doc refresh.
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy), 5 (RBAC + membership management) and 6 (domain entities) **complete and merged**. **Step 7 (audit module) COMPLETE — 7a (capture, merged as PR #15) and 7b (the read surface) — so `audit_log`, the brief's fifth and final table, is built, captured, immutable by grant and readable by admin/auditor.** The v1.0 schema is complete. OPEN-4 and OPEN-6 **DONE**. Next: **step 8** — OPEN-7, the set-password / invite-token flow; OPEN-9 (hard delete) remains deferred and is now unblocked.
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
 ---
 
 ## Session log
+
+### 2026-09-12 — Step 7 Phase 7b: the audit read surface, enforcement and the capstone (§11 step 7)
+
+The second half of step 7, and the close of the audit module. 7a built capture and proved it at the database layer; 7b builds `GET /audit`, turns ADR-012's **recorded** admin/auditor gate into an **enforced** one, and proves the module's premise end to end over HTTP.
+
+**The read-back reopened more than it confirmed, and two items came back as corrections.**
+
+- **`audit_log` was already bespoke.** 7a put it in `ISOLATION_BESPOKE_TABLES` for the missing-`INSERT`-grant reason, so this phase **extended the recorded reason** with ADR-013's NULL-tenant justification rather than relocating the table. Both reasons are now written down, because a future change that removes one must not read as license to move it back into the generic matrix.
+- **The non-member path has TWO faces, not one.** The read-back asked for "the exact shape a non-member fails closed with", to be matched rather than invented — and matching it required splitting a case the question assumed was single. **The test was red until it did.** A session issued _before_ a revoke still names the tenant, so the interceptor's per-request re-verify fires **before** the role gate and answers `MEMBERSHIP_REVOKED`, clearing the active tenant on its way out. Only the _next_ request is in the settled OPEN-2 state (`role === null`) that answers `FORBIDDEN_ROLE` — byte-identical to a technician. Both faces are now asserted in sequence.
+- **Indexes: 7b adds no migration at all.** All three shipped in 7a — the keyset `(tenant_id, created_at, id)` with `id` deliberately included (PERF finding 7), the `(table_name, row_id)` drill-down, and the partial actor index. Postgres scans a btree backwards, so the ascending index serves the `DESC` order. An empty migration file would have been worse than none.
+- **`ADR-006 §2`, not OPEN-1**, is what made `users` pure identity; OPEN-1 is the duplicate-register 409. Cited correctly in ADR-013.
+
+**Decision B reversed before it shipped: actor and date-range filters are in v1.0.** Deferring them would have left 7a's actor and `created_at` indexes with **no query** — the exact shape this project has rejected twice (`memberships(user_id)`, `asset_events.created_by`), on the schema's highest-volume table. All four filters map to indexes that already exist, so the inconsistency is closed rather than opened.
+
+**Three ADRs.** **013** — bootstrap audit rows are write-only from the application: a `user.created` row written pre-authentication has no tenant to belong to, matches no policy, and is invisible to every application read permanently; the rejected system-pseudo-tenant alternative loses twice, because it puts a non-tenant row in `tenants` **and** only works by creating a cross-tenant read path into the trail. **014** — the read surface: RLS-scoped (no `tenant_id` in the handler, deliberately), admin+auditor enforced, four filters, keyset `(created_at DESC, id DESC)`, default 50 / max 200 with an oversized limit **clamped rather than rejected**, an **unsigned** cursor with the reason stated as a property so nobody later "signs it for safety", and no read-time redaction. **015** — `table_name`/`row_id` stand and `PROJECT_BRIEF.md:148` is reconciled to them.
+
+**Two divergences recorded rather than left to be discovered.** The clamp diverges from every other list endpoint, which carries `@Max` and returns 400 — audit clamps because a rejected oversized request leaves the caller no forward path while a clamped one returns rows _and_ a cursor; the envelope reports the **effective** limit, which is also the only thing the clamp test can read. And `PROJECT_BRIEF.md:140` still names `entity_type`/`entity_id`/`before`/`after`; the brief is **author-owned** and only `:148` was authorised, so the remaining drift is flagged in ADR-015 instead of edited quietly.
+
+**The auditor positive is the load-bearing test.** Every RBAC negative — technician 403, non-member 403, cross-tenant empty — passes **identically** against an admin-only gate. Sweep mutation 01 narrows the gate to `admin` and reddens exactly the auditor positive and the capstone's auditor face, and nothing else. It is also the only test in the whole suite that distinguishes an auditor from a read-only technician, since every other endpoint deliberately treats them alike.
+
+**The capstone, at the HTTP layer:** a maintenance edit leaves `asset_events` unmoved, and the resulting `maintenance.updated` row is readable by admin, readable by auditor, refused to technician, and invisible cross-tenant.
+
+**Non-vacuity sweep: 11 mutations, 10 red and one green on purpose.** The green is a deliberate no-op control — a sweep that reddens on everything proves as little as one that reddens on nothing. Breaking the `audit_log` policy to `USING (true)` reddens three tests, which is what makes the "no application-layer tenant predicate" choice checkable rather than merely asserted.
+
+**A process note worth more than the bug it caused.** Two long debugging detours this phase — an entire suite 500ing, then 68 apparent failures — were both **my invocation, not the code**: running `npx vitest` from the repo root uses the root config, which has no `unplugin-swc`, so decorator metadata is never emitted, Nest DI hands every service an `undefined` dependency, and every API test 500s. It looks exactly like a broken application. **API and DB suites must be run from `apps/api`, or through `npm run test` / `npm run test:db`.**
+
+**337 tests green** (up from 319), CI green including the citation-check step. The citation guard caught two of its own anchors drifting as this phase's edits shifted line numbers — which is the guard working.
+
+**OPEN register:** OPEN-7 still **step 8** (set-password, untouched beyond 7a's forward markers). OPEN-9 (hard delete) still deferred; it now inherits a settled answer to the zero-rows-is-not-an-error question, which ADR-014 pre-decided for its fourth appearance.
+
+**Next: step 8** — OPEN-7, the set-password / invite-token flow. **Stopped at the 7b gate.**
+
+---
 
 ### 2026-09-12 — Step 7 Phase 7a: the audit module — capture, immutable by grant, proven at the DB layer (§11 step 7)
 

@@ -34,6 +34,9 @@
 | 010 | Audit integrity: immutable by grant                               | Accepted |
 | 011 | Audit payload: changed-column diff, redaction enforced by trigger | Accepted |
 | 012 | Audit scope, RBAC and volume                                      | Accepted |
+| 013 | Bootstrap audit rows are write-only from the application          | Accepted |
+| 014 | Audit read surface: filters, keyset pagination, enforcement       | Accepted |
+| 015 | `audit_log` column naming reconciled to the shipped names         | Accepted |
 
 ---
 
@@ -573,3 +576,128 @@ The cost is honest: every new tenant-scoped table now requires a fixture before 
   - **Audit only the "interesting" mutations** — rejected. Any such list is a judgment about what an investigator will want, made before the investigation.
   - **Admin-only read** — rejected above, on the brief's own words and on what it would do to the auditor role.
   - **Skip `asset_events`** — tempting, since the table is itself an immutable log with its own `created_by`. Rejected: uniformity is cheaper to defend than a carve-out, and the carve-out's justification ("it is already a log") is one step from the derivation argument step 6 disproved.
+
+## ADR-013 — Bootstrap audit rows are write-only from the application
+
+- **Date:** 2026-09-12
+- **Status:** Accepted
+- **Context:** `register_tenant` writes three rows in one pre-authentication transaction — a tenant, a user, and the founding membership — and the `audit_capture` trigger fires on two of them. The `users` insert is the problem case. `users` has **no `tenant_id` column at all** (ADR-006 §2 made it pure identity and moved the tenant relationship to `memberships`), and at the instant it is written no tenant context exists: `app.current_tenant` is unset because nobody has authenticated. So the trigger finds no tenant from the row and none from the request, and writes `tenant_id = NULL`.
+
+  That is the same construction as `actor_user_id` and `actor_role`, both already nullable for the same reason, and ADR-009 already pins the meaning of all three: **NULL actor, NULL role and NULL tenant together mean a system / pre-authentication bootstrap action, reachable only via tenant bootstrap.**
+
+  What ADR-009 did not state, and what a reader of the read surface will immediately ask, is the _consequence_ for reads. This ADR states it.
+
+- **Decision:** **A bootstrap audit row is permanently invisible to every application read, and that is a property rather than an accident.**
+
+  The canonical tenant-scoped policy compares `tenant_id` to the GUC. `NULL = <anything>` is NULL, which is not true, so the row matches no tenant — not the bootstrapping tenant, not any other. No application path can read it, now or later, whatever endpoint is built. Its sole access path is direct database access as the owner/migration role.
+
+- **Consequences:**
+  - **The trigger stays uniform and the login path stays unbranched.** The alternative designs all require the capture mechanism, or `register_tenant`, to know that this particular insert is special. ADR-009 chose a single trigger attached identically to six tables precisely so that no write path carries audit-specific knowledge; making an exception here would reintroduce it at the one place — pre-auth bootstrap — where a mistake is least visible.
+  - **The forensic value is retained, not discarded.** The row exists, it is complete, and it is readable by anyone with database access during an actual investigation. "Invisible to the application" is not "absent"; the distinction matters because the alternative under consideration was to make it readable by inventing a tenant for it.
+  - **The tenant's own trail still records the bootstrap.** `register_tenant` also writes a `membership.created` row, which carries a real `tenant_id` and is therefore visible to that tenant. So a tenant asking "when was this workspace created, and by what" gets an answer; what they do not get is the global identity row, which was never their data.
+  - **This is asserted, and asserted non-vacuously.** A test that reads as a tenant and finds zero bootstrap rows passes just as happily when no bootstrap row was ever written — the `readWorkspaces` insensitivity lesson. So the proof establishes the positive first, as the owner/migration role: bootstrap rows exist, count > 0. Only then does it assert the tenant-scoped read returns none. Same show-me-the-positive treatment `login_lookup`'s atomicity got.
+  - **It is one more instance of a rule this project keeps re-learning: zero rows is not an error, and it is not evidence either.** Reading nothing has meant three different things in three phases — a policy working, a grant missing, and a fixture that was never seeded. Here it means the first, and the only way to know that is to show the row exists somewhere else first.
+
+- **Alternatives considered:**
+  - **A system pseudo-tenant** — insert a reserved `tenants` row and attribute bootstrap audit rows to it, making them readable. Rejected on two independent grounds, either sufficient. **(a)** It puts a row in `tenants` that is not a tenant: it has no members, no assets, no billing meaning, and every query that counts or lists tenants must now special-case it — the classic sentinel-row tax, paid forever, on the table that anchors the entire isolation model. **(b)** Worse, it only achieves the goal if somebody can _read_ that pseudo-tenant, which means a cross-tenant read path into the audit trail — punching a hole in the exact guarantee this project spends `ISOLATION.md` demonstrating. A feature whose implementation requires weakening the headline security property is not a feature.
+  - **Backfilling `tenant_id` on the `users` bootstrap row after the membership is written** — technically possible inside `register_tenant`. Rejected because it **invents a fact the identity model denies**: ADR-006 §2 says a user does not belong to a tenant, and writing one onto the audit row asserts that they do. It would also require editing proven pre-auth surface to serve the audit module, inverting the dependency ADR-009 established.
+  - **Not auditing `users` at all** — would remove the NULL-tenant case entirely. Rejected in ADR-012: `users` is the only table in the schema carrying a secret, so it is the only place ADR-011's redaction can be proven non-vacuously. Dropping it to tidy a read-surface edge case would cost the redaction proof.
+
+## ADR-014 — The audit read surface: filters, keyset pagination, and enforcement
+
+- **Date:** 2026-09-12
+- **Status:** Accepted
+- **Context:** ADR-012 recorded that the trail is readable by **admin and auditor** and deliberately left enforcement to this phase. 7a built capture and proved it at the database layer; nothing reads the trail. `PROJECT_BRIEF` §6 (:166) specifies `GET /audit` "(admin/auditor)" with "filter by entity, actor, date range, paginated", and §12 (:263) makes "viewable by admin/auditor" a Definition-of-Done item.
+
+- **Decision — the surface.** One endpoint: **`GET /audit`**, tenant-scoped, admin and auditor only.
+
+  **Isolation comes from RLS, not from the handler.** The query carries no `tenant_id` predicate. It runs on the request transaction where the interceptor has set `app.current_tenant`, and the canonical policy scopes the result. Adding an application-layer tenant filter would not strengthen isolation — it would make a policy regression **invisible**, because the redundant predicate would keep returning correct rows after the thing that actually protects the data stopped working. Same rule as `AssetsService.list` and `MembershipsService.list`.
+
+  **Enforcement is `@RequiresRole('admin', 'auditor')`**, which the tenant-context interceptor applies after it has re-read the role from the database. This is the ADR that moves ADR-012's _recorded_ gate to an _enforced_ one.
+
+- **Decision — filters. All four ship in v1.0; nothing is deferred.**
+
+  | filter                | shape                                                                          | index it uses (all shipped in 7a)                                          |
+  | --------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+  | `action`              | one of the fourteen `audit_action` values (ADR-012)                            | — (enum equality, low selectivity by design)                               |
+  | `tableName` / `rowId` | drill-down; table alone **or** the pair; `rowId` without `tableName` → **400** | `audit_log_table_name_row_id_idx`                                          |
+  | `actorUserId`         | uuid                                                                           | `audit_log_actor_user_id_idx` (partial, `WHERE actor_user_id IS NOT NULL`) |
+  | `from` / `to`         | half-open `[from, to)` on `created_at`                                         | `audit_log_tenant_id_created_at_idx` (range predicate)                     |
+
+  **Actor and date-range were briefly slated for deferral, and deferring them was the wrong call — reversed here rather than silently.** 7a already shipped the actor index and the `created_at` index, so the write cost is already being paid on what ADR-012 accepts will be the **largest table in the schema**. This project has **twice** rejected an index nothing queries — `memberships(user_id)` (ADR-006 §2) and `asset_events.created_by` — on exactly that reasoning. Shipping the indexes and withholding the filters would have reproduced the rejected shape and left the inconsistency sitting on the highest-volume table in the database. All four filters map to indexes that already exist; the inconsistency is closed rather than opened.
+
+  **`rowId` without `tableName` is a 400, not an empty result.** A bare `row_id` cannot use the composite index (it is the trailing column), and more importantly it is a **malformed question**: row ids are unique per table by construction but the trail spans six tables, so "row X, table unspecified" is not a query anyone means. The whole family of these is below.
+
+- **Decision — pagination: keyset on `(created_at DESC, id DESC)`.** No new DDL: the supporting index `audit_log_tenant_id_created_at_idx` **already exists**, shipped by 7a's migration with `id` deliberately included. Postgres scans a btree backwards, so the ascending index serves the descending order without a second index. **7b therefore adds no migration at all** — an empty migration file would be worse than none.
+
+  The alternatives are recorded because each is silently wrong and a reviewer will reach for one:
+
+  - **Not offset.** It degrades with depth on the table ADR-012 already accepts will be the largest in the schema, and — the correctness half, which matters more — a row inserted between page 1 and page 2 shifts the window, so the client silently **skips or repeats** rows. On an append-only table under constant insert, that is the normal case.
+  - **Not `created_at` alone.** A single logical mutation fires several triggers in one transaction — a status transition writes `assets` _and_ `asset_events`, registration writes `users` _and_ `memberships` — so rows sharing a `created_at` to the microsecond are **routine on this table, not an edge case**. Ordering by timestamp alone leaves boundary rows arbitrarily ordered between queries, which skips or repeats them. This is the `asset_events` genesis-pair defect (Finding 7), and here it is the common case rather than a designed-in certainty on one table.
+  - **Not `id` alone.** `PROJECT_BRIEF` :145 pins UUID primary keys throughout, and a v4 UUID carries no time ordering, so `id` cannot carry the sort. It can only ever be the tiebreaker.
+
+  The composite `(created_at, id)` pair is total because `id` is a primary key, which is the property keyset pagination requires.
+
+- **Decision — page size: default **50**, hard max **200**, and an oversized `limit` is **clamped**, not rejected.**
+
+  `limit` is a typed DTO field, so `limit=abc`, `limit=-5` and `limit=0` are all **400** from the global `ValidationPipe` for free. `limit=5000` returns **200 OK with 200 rows**.
+
+  **The clamp is silent by design, and the response envelope reports the effective limit** so the client can see what it actually got. A rejected oversized request has no forward path — the client learns only that it asked wrongly. A clamped one returns rows _and_ a cursor, so the caller makes progress and discovers the cap from the envelope. The envelope field is also how the clamp is tested: without it the test could not distinguish "clamped to 200" from "there were only 200 rows".
+
+  **This diverges from the rest of the API, and the divergence is recorded rather than left to be discovered.** `PaginationQuery` (assets, events, readings) uses `DEFAULT_LIMIT = 25`, `MAX_LIMIT = 100`, and `@Max(MAX_LIMIT)` — so those endpoints **reject** an oversized limit with a 400. Audit does not. Two reasons, and they are about this table specifically: it is the highest-volume table in the schema, and its reader is an auditor scanning a trail rather than a UI rendering a list, so larger pages are the normal request and a dead-end 400 is a worse answer. The audit constants are named separately rather than by changing the shared ones, so this stays a deliberate audit-module choice; **if the clamp behaviour is ever judged better generally, that is a separate reviewed change to `PaginationQuery`, not a drift.**
+
+- **Decision — the cursor is opaque base64 over `(created_at, id)`, and deliberately UNSIGNED.** Malformed input is validated and rejected with a clean 400 (`INVALID_CURSOR`); no HMAC is built.
+
+  **The reason is a property, and it is written down to stop a later "sign it for safety" change**: **RLS is the security boundary, not the cursor.** A decoded and edited token can only move the caller **within their own tenant's result set**, because the policy bounds the query regardless of what the cursor contains. Signing would buy nothing and would cost something real — it would imply to every future reader that the tenant boundary rests partly on the token, which is exactly the belief this project's isolation story exists to refuse. `cursor.ts` already states this ("the cursor selects a POSITION, never a permission"); this ADR is where the audit module inherits it rather than re-deciding it.
+
+  The cursor is still **validated** rather than trusted — the `id` half is interpolated into a comparison against a `uuid` column, so a malformed value would surface as a `22P02` cast error, a 500 for what is a client mistake.
+
+- **Decision — no bad request may masquerade as an empty 200.** This is the third appearance of the zero-rows-is-not-an-error family (it bit the `UPDATE` case, and OPEN-9's hard delete inherits it), so it is pre-decided for every shape this endpoint can take:
+
+  | input                         | answer           | mechanism                                                       |
+  | ----------------------------- | ---------------- | --------------------------------------------------------------- |
+  | unknown `action`              | **400**          | closed TS enum in the DTO + `forbidNonWhitelisted` (main.ts:28) |
+  | unknown query parameter       | **400**          | `forbidNonWhitelisted`                                          |
+  | `rowId` without `tableName`   | **400**          | class-level cross-field validator — not expressible per-field   |
+  | malformed `cursor`            | **400**          | `decodeCursor`                                                  |
+  | `limit` non-numeric / < 1     | **400**          | `ValidationPipe`                                                |
+  | `limit` > 200                 | **200**, clamped | deliberate; see above                                           |
+  | valid filter matching nothing | **200**, empty   | the only legitimate empty 200                                   |
+
+  **There is no `GET /audit/:id`, and that is a decision rather than an omission.** `PROJECT_BRIEF` §6 (:166) specifies only the collection; the drill-down the brief actually anticipates is `(table_name, row_id)` — "everything that ever happened to this row" — which the collection endpoint serves. A single audit row is not independently addressable in any product story. **The reasoning is recorded so it stays pre-decided if one is ever added:** under RLS a cross-tenant row is simply invisible, so a naive `findOne` returns **success with nothing** rather than a refusal. Such an endpoint must return a **hard 404**, never 200-with-null — the same trap, a fourth time.
+
+- **Decision — no read-time redaction. The read returns the stored payload verbatim.**
+
+  ADR-011 makes the trigger the **sole** redactor, enforced by a per-table column allowlist carried in `pg_trigger.tgargs` and asserted structurally by catalog assertion 17. The stored rows are therefore safe by construction, and the read is safe because they are.
+
+  **"Defense in depth" is the rejected alternative, and rejecting it is deliberate.** A second redaction pass at read time would imply the stored rows are untrusted — contradicting ADR-011 — and would create the far worse failure mode where the read filter quietly compensates for a broken allowlist, so the allowlist could regress with every test still green. That is the redundant-predicate trap from the isolation query one paragraph up, applied to secrets instead of tenancy. One redactor, asserted, at the point of writing.
+
+- **Decision — the response DTO surfaces `actor_role`.** Role-at-time-of-action is the visible payoff of OPEN-4 and ADR-009, and it is the **one field no other table can reconstruct** once a role has changed or a membership has been revoked — joining to `memberships` at read time returns today's answer, or none. Omitting it would make the auditor view decorative; including it is what makes the trail answer "who did this, and what were they allowed to do at the time". Proven over HTTP, including after a role change, as the HTTP face of 7a's database-layer role-at-time proof.
+
+- **Alternatives considered:**
+  - **Offset pagination**, **`created_at`-only ordering**, **`id`-only cursor** — each rejected above, each silently wrong rather than merely slower.
+  - **Rejecting an oversized `limit`** — consistent with the rest of the API and rejected here for leaving the client no forward path; the divergence is recorded above rather than hidden.
+  - **A signed cursor** — rejected above: no security gain, and a misleading implication about where the tenant boundary lives.
+  - **Deferring actor and date-range filters** — reversed above: it would have left two shipped indexes with no query, the shape this project has already rejected twice.
+
+## ADR-015 — `audit_log` column naming: the shipped names stand, the brief is reconciled
+
+- **Date:** 2026-09-12
+- **Status:** Accepted
+- **Context:** `PROJECT_BRIEF` §5 (:140) sketches `audit_log` with `entity_type` and `entity_id`, and §5 (:148) asks for an index on `audit_log.(entity_type, entity_id)`. 7a shipped the columns as **`table_name`** and **`row_id`**, recorded as a deviation in ADR-011 at the time. The deviation is now load-bearing: the columns are in a proven migration, in the trigger body, in `audit.spec.ts`, in catalog assertion 17, and in the Prisma model.
+
+- **Decision:** **The shipped names stand; `PROJECT_BRIEF.md:148` is reconciled to name the columns that actually exist.**
+
+  The names are right on their own merits, which is why they were chosen. This trail is keyed by **table and row** because that is what a trigger knows — `TG_TABLE_NAME` and the row's `id`. An "entity vocabulary" would be a second naming layer the application would have to maintain in parallel with the schema and keep in step, and the first time they drifted the audit trail would be pointing at entity names that no longer mapped to tables.
+
+- **Consequences:**
+  - **Renaming proven surface to match a sketch would be the wrong trade.** It would touch a migration that has been applied, the trigger, the tests and the Prisma model, to make a document's illustrative column list literally true — while `PROJECT_BRIEF` §5 itself says the core tables are "illustrative — refine during design phase, log schema decisions", which is precisely what this is.
+  - **The reconciliation closes a quiet schema/spec drift.** `docs:check` catches drift in doc _citations_; nothing catches a doc that names a column which does not exist. This ADR plus the `:148` edit is the manual equivalent, and the fact that it needed doing by hand is worth noting for whoever considers extending the guard.
+  - The index itself already exists — `audit_log_table_name_row_id_idx`, shipped in 7a and carrying a comment naming :148 as its origin. The brief and the schema now agree.
+
+  - **:148 IS RECONCILED; :140 IS NOT, AND THAT IS A BOUNDARY RATHER THAN AN OVERSIGHT.** `PROJECT_BRIEF` §5 (:140) still sketches the table as `entity_type`, `entity_id`, `before (jsonb)`, `after (jsonb)` — three deviations from what shipped, since 7a also collapsed `before`/`after` into a single `payload jsonb` (ADR-011). `PROJECT_BRIEF.md` is **author-owned** (CLAUDE.md, Documentation duties), and this phase was authorised to reconcile the index line only. So :140 is left standing and flagged here instead of edited quietly.
+
+    **The remaining drift, stated so it can be closed deliberately:** :140's `entity_type`/`entity_id` → `table_name`/`row_id`; :140's `before`/`after` → one `payload jsonb` holding `{before, after}`. Both are recorded decisions (ADR-011, ADR-015); neither is a bug. A one-line edit to :140 by the author closes the last of it.
+- **Alternatives considered:**
+  - **Rename the columns to `entity_type` / `entity_id`** — rejected above: a migration against proven surface, for a worse name.
+  - **Leave the brief alone and let the deviation sit in ADR-011 only** — rejected. The brief is the document a reader consults for the data model; leaving it naming columns that do not exist means the next person to implement against :148 writes an index on nothing.
