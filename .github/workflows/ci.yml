@@ -16,7 +16,24 @@ env:
 
 jobs:
   verify:
-    name: docs · lint · typecheck · test
+    # DO NOT RENAME THIS JOB. It is the required status-check CONTEXT in the
+    # `main` ruleset, matched by exact string. Step 7a renamed it to
+    # "docs · lint · typecheck · test" to advertise the new citation step, and
+    # that silently made every PR unmergeable: the required context
+    # "lint · typecheck · test" no longer existed, so it could never report, and
+    # GitHub showed a GREEN check next to a permanently BLOCKED merge button.
+    #
+    # The failure mode is the one this repo keeps meeting — not a wrong answer, a
+    # check that cannot run. Nothing was red; the PR simply could not merge, and
+    # the reason was visible only in the ruleset, not in the run.
+    #
+    # The docs step advertises itself where it actually helps: its own STEP name,
+    # "Check doc citations", which is what the run summary shows on failure. The
+    # job name buys nothing and costs the merge contract.
+    #
+    # If this name must ever change, the ruleset's required_status_checks context
+    # has to change in the same breath — repository settings, not this file.
+    name: lint · typecheck · test
     runs-on: ubuntu-latest
 
     services:

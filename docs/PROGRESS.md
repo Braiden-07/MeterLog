@@ -55,6 +55,8 @@ Assertion 12 was narrowed to exclude trigger-returning functions — Postgres ch
 
 **319 tests green on a fresh database** (up from 300), CI green including the new citation-check step.
 
+**One regression this phase introduced and then had to undo, recorded because the failure mode is the repo's favourite.** The CI job was renamed to `docs · lint · typecheck · test` to advertise the new step. The `main` ruleset requires the status-check context `lint · typecheck · test` **by exact string**, so the required check no longer existed, could never report, and PR #15 sat **MERGEABLE but BLOCKED** showing a **green** check. Nothing was red; the PR simply could not merge, and the reason lived in repository settings rather than in the run. The job name is reverted and carries a comment saying why; the docs step advertises itself through its own STEP name, `Check doc citations`, which is what a failing run surfaces anyway. **Renaming a CI job silently breaks a required status check** — worth knowing before step 10 wires the deploy gate.
+
 **Next: step 7b** — `GET /audit`, the admin/auditor RBAC negatives, the maintenance-edit capstone over HTTP, and the doc refresh. **Stopped at the 7a gate.**
 
 ---
