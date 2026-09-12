@@ -137,7 +137,7 @@ Core tables (illustrative — refine during design phase, log schema decisions):
 - **asset_events** — `id (uuid, pk)`, `tenant_id (fk)`, `asset_id (fk)`, `event_type (enum)`, `payload (jsonb)`, `created_by (fk → users)`, `created_at` — **append-only**, no updates/deletes
 - **readings** — `id (uuid, pk)`, `tenant_id (fk)`, `asset_id (fk)`, `value (numeric)`, `unit`, `read_at`, `created_by (fk)`, `created_at`
 - **maintenance_records** — `id (uuid, pk)`, `tenant_id (fk)`, `asset_id (fk)`, `description`, `performed_at`, `created_by (fk)`, `created_at`, `updated_at`
-- **audit_log** — `id (uuid, pk)`, `tenant_id (fk)`, `actor_user_id (fk)`, `action`, `entity_type`, `entity_id`, `before (jsonb)`, `after (jsonb)`, `created_at` — **append-only**
+- **audit_log** — `id (uuid, pk)`, `tenant_id (nullable, no fk)`, `actor_user_id (nullable, fk → users)`, `actor_role (nullable)`, `table_name`, `row_id (uuid)`, `action (enum)`, `payload (jsonb: {before, after})`, `created_at` — **append-only**. Reconciled to the shipped schema at step 7b; see ADR-011 (one `payload` column, redaction allowlist), ADR-013 (why the three nullables) and ADR-015 (`table_name`/`row_id` rather than `entity_type`/`entity_id`).
 
 **Design rules:**
 
