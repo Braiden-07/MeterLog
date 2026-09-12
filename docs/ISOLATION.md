@@ -625,7 +625,7 @@ Asserted on `42501` **and** `permission denied for table maintenance_records`, e
 
 ### And the matrix extended itself
 
-The isolation matrix generates **20 cases across four tables**, up from 15 at phase 3d and from zero before step 6 — five per table, automatically, because the registry's key set is asserted equal to the catalog's in both directions ([`every tenant-scoped table has an isolation fixture, and vice versa`](../apps/api/test/db/isolation.spec.ts#L85), registry at [`ISOLATION_FIXTURES`](../apps/api/test/db/helpers.ts#L376)). The fourth table required no new harness mechanism, which is the point of having built the contract for two write shapes at phase 1.
+The isolation matrix generates **20 cases across four tables**, up from 15 at phase 3d and from zero before step 6 — five per table, automatically, because the registry's key set is asserted equal to the catalog's in both directions ([`every tenant-scoped table has an isolation fixture, and vice versa`](../apps/api/test/db/isolation.spec.ts#L85), registry at [`ISOLATION_FIXTURES`](../apps/api/test/db/helpers.ts#L396)). The fourth table required no new harness mechanism, which is the point of having built the contract for two write shapes at phase 1.
 
 ### A postscript worth more than the table it came from
 
@@ -766,9 +766,109 @@ Six, up from five, with the allowlist extended in the same PR ([`EXPECTED_DEFINE
 
 ### What 7a does not prove
 
-The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L506) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L666)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
+The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L506) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
 
 Hash-chaining is deferred, and ADR-010 records why as engineering rather than scope. What immutability-by-grant does **not** give, stated plainly: it defends against the application and against anyone holding only the app role's credentials. It does **not** defend against the migration/owner role or a cluster superuser, who can `ALTER TABLE`. Tamper-evidence against a privileged operator is what a chain buys, and that threat model is not v1.0's.
+
+---
+
+## 7i. Finding 11 — the trail made readable, and the role that would have shipped locked out
+
+Step 7a proved capture at the database layer. It proved nothing about **who may read**, because nothing could read. 7b builds `GET /audit`, enforces the gate ADR-012 recorded, and proves the module's premise end-to-end.
+
+### The test this module would have shipped broken without
+
+`PROJECT_BRIEF` names three roles (:28) and says the trail is "viewable by **admin/auditor**" (:263). So the gate is `@RequiresRole('admin', 'auditor')`.
+
+**Every RBAC negative in the suite passes identically against an admin-only implementation.** Technician 403, non-member 403, cross-tenant empty — all of them hold whether or not auditors are admitted. A module gated `@RequiresRole('admin')` would have a **completely green suite** and a real defect: the auditor role, which exists for little else, would collapse into a technician who cannot write.
+
+The only thing that catches it is the **auditor positive** ([`AUDITOR reads the trail`](../apps/api/test/api/audit-read.spec.ts#L146)), and it is asserted non-vacuously — the auditor must see rows, not merely fail to be refused. Mutation 01 of the sweep narrows the gate to admin-only and reddens exactly that test and the capstone's auditor face, and nothing else.
+
+This is also the **only test in the whole suite that distinguishes an auditor from a read-only technician.** Every other endpoint deliberately treats them alike — `AssetsController` carries a note saying its reads are ungated on purpose, because an auditor must see the same asset rows everyone else does. The auditor's distinguishing capability is this one endpoint.
+
+### Two 403s, one shape — and a third that is not
+
+The read-back for this phase asked for "the exact status and body a non-member fails closed with", to be matched rather than invented. Matching it turned out to require splitting a case the question assumed was single, and the test was red until it did.
+
+| state                                                             | code                     | which layer refused                          |
+| ----------------------------------------------------------------- | ------------------------ | -------------------------------------------- |
+| technician in the workspace                                       | `403 FORBIDDEN_ROLE`     | the role gate                                |
+| **settled** no-workspace (OPEN-2: zero live memberships)          | `403 FORBIDDEN_ROLE`     | the role gate, via its `!role` arm           |
+| **first request after a revoke**, session still naming the tenant | `403 MEMBERSHIP_REVOKED` | the per-request re-verify, _before_ the gate |
+
+The third is the one a plain "non-member is refused" test walks into. A session issued **before** the revoke still names tenant A, so the interceptor's re-verify (step 3) runs first, finds no live membership, answers `MEMBERSHIP_REVOKED` — **and clears the session's active tenant on the way out.** Only the _next_ request is in the settled state the OPEN-2 resolution describes. The suite asserts both faces in sequence ([`NON-MEMBER is refused with the SAME shape`](../apps/api/test/api/audit-read.spec.ts#L187)).
+
+**Why the sameness of the first two is load-bearing.** A caller in the no-workspace state cannot distinguish "this workspace exists and I am merely the wrong role in it" from "I have no workspace at all". Splitting them into `NO_ACTIVE_WORKSPACE` and `FORBIDDEN_ROLE` would read as a usability improvement and would rebuild the enumeration oracle ADR-006's `MB002` was flattened to prevent — §7d's finding, arriving through a different door. `MEMBERSHIP_REVOKED` is not the same leak: it is reachable only by a session that already held the membership, so it tells its holder something they knew.
+
+### Isolation is the policy, and the test proves it is the policy
+
+`AuditService.list` carries **no `tenant_id` predicate**. The query runs on the request transaction where the interceptor set `app.current_tenant`, and the canonical policy scopes it. A redundant application-layer filter would not strengthen isolation — it would make a policy regression **invisible**, because the filter would keep returning correct rows after the thing that actually protects the data stopped working.
+
+That claim is checked rather than asserted. Sweep mutation 11 replaces the policy with `USING (true)` and reddens **three** tests — the cross-tenant money negative, bootstrap invisibility, and the capstone's cross-tenant face ([`an admin of B reading the trail sees NOTHING of A`](../apps/api/test/api/audit-read.spec.ts#L253)). With a redundant predicate in the service, all three would have stayed green.
+
+The money negative is asserted as "**none of A's rows**" rather than "empty", because tenant B has its own bootstrap membership row — an emptiness assertion would be checking the wrong thing and would fail for the right reason at the wrong moment.
+
+### Bootstrap rows: invisible by construction, proven non-vacuously (ADR-013)
+
+`register_tenant` writes a `users` row before anyone is authenticated. `users` has no `tenant_id` (ADR-006 §2) and no tenant context exists yet, so the audit row's `tenant_id` is legitimately **NULL** — the same rule as `actor_user_id` and `actor_role`, all three meaning a pre-authentication bootstrap action.
+
+`NULL = <anything>` is NULL, so such a row matches **no** tenant policy and is invisible to every application read, permanently. Its only access path is direct database access as the owner.
+
+**The proof establishes the positive first**, because "a tenant read returns zero bootstrap rows" passes just as happily when no bootstrap row was ever written — the `readWorkspaces` insensitivity lesson, and §8's standing rule that **zero rows is not an error and is not evidence either**. So: read as the migration role, assert such rows exist and `count > 0`, assert they are `user.created` with a NULL actor — _then_ assert the tenant-scoped read returns none ([`the owner sees bootstrap rows`](../apps/api/test/api/audit-read.spec.ts#L289)). The tenant's own trail still records the bootstrap through the `membership.created` row, which carries a real tenant, so nothing is lost from the tenant's point of view.
+
+A **system pseudo-tenant** was the rejected alternative, and it loses twice: it puts a row in `tenants` that is not a tenant, and it only achieves its goal by creating a cross-tenant read path into the audit trail — weakening the exact guarantee this document exists to demonstrate.
+
+### The capstone — the premise, readable
+
+The module's reason for being, at the HTTP layer. A maintenance edit emits **no lifecycle event**, so a trail derived from `asset_events` is silent for that whole class of change. 7a proved the row is _written_; this proves it is _read_, by the right people and nobody else ([`an edit that emits NO lifecycle event is readable by admin and auditor`](../apps/api/test/api/audit-read.spec.ts#L332)), in four faces plus the gap itself:
+
+- the lifecycle log **did not move** — `asset_events` count unchanged across the edit;
+- **admin** sees the `maintenance.updated` row;
+- **auditor** sees it — the face an admin-only gate fails;
+- **technician** is refused outright;
+- **cross-tenant** admin gets `200` with an empty page — isolation refusing, not the gate.
+
+### Role-at-time, now visible
+
+`actor_role` is in the response DTO, and it is the one field on an audit row that **no other table can reconstruct**: joining to `memberships` at read time returns today's answer, or none once the membership is revoked. The HTTP proof mirrors 7a's database one — a technician records a reading, is promoted to admin, and the audit row still reads `technician` ([`carries the role held AT THE TIME`](../apps/api/test/api/audit-read.spec.ts#L406)). Sweep mutation 08 nulls the field and reddens it.
+
+### Pagination, and the tie that is routine here
+
+Keyset on `(created_at DESC, id DESC)`. **7b adds no DDL** — the supporting index shipped in 7a with `id` deliberately included, and Postgres scans a btree backwards for the descending order.
+
+The composite cursor is not defensive: **one logical mutation fires several triggers in one transaction**, so rows sharing a `created_at` to the microsecond are routine on this table rather than a designed-in quirk of one table. Registering an asset writes `assets` plus two genesis `asset_events` rows, all at the same transaction timestamp.
+
+So the boundary is proven **directly** rather than inferred ([`THE BOUNDARY CASE`](../apps/api/test/api/audit-read.spec.ts#L548)): the test first asserts a same-timestamp group actually exists — otherwise the case it exists for does not occur — then walks the entire trail one row at a time, so a page boundary falls between _every_ adjacent pair including inside the tied group, and asserts the walk equals a single-page read with no repeats. Mutation 03 drops the `id` tiebreak and reddens it alone.
+
+### No bad request may answer as an empty 200
+
+Third appearance of the family (it bit the `UPDATE` case; OPEN-9's hard delete inherits it), so ADR-014 pre-decides every shape: unknown `action` → 400 (closed enum), unknown parameter → 400 (`forbidNonWhitelisted`), `rowId` without `tableName` → 400 (class-level cross-field validator — no per-field decorator can see a sibling), malformed cursor → 400, `limit` non-numeric or `< 1` → 400. The **only** legitimate empty 200 is a well-formed filter matching nothing.
+
+**The one deliberate exception is the oversized `limit`, which is CLAMPED to 200 and returns 200 OK.** A rejected oversized request leaves the caller no forward path; a clamped one returns rows _and_ a cursor. The envelope reports the **effective** limit, which is both how a client learns the cap and the only thing the clamp test can read — without it the assertion could not tell "clamped" from "there were only that many rows". This diverges from the rest of the API, where `PaginationQuery` carries `@Max` and rejects; ADR-014 records the divergence rather than letting it be discovered.
+
+**There is no `GET /audit/:id`.** The brief specifies only the collection, and the drill-down it anticipates is `?tableName=&rowId=`. The reasoning is recorded so it stays pre-decided: under RLS a cross-tenant row is simply _invisible_, so a naive `findOne` returns **success with nothing** rather than a refusal. Such an endpoint must be a hard 404 — the same trap, a fourth time.
+
+### The sweep
+
+**11 mutations; 10 red, and the eleventh green on purpose.**
+
+| mutation                                    | what reddened                                                                        |
+| ------------------------------------------- | ------------------------------------------------------------------------------------ |
+| gate narrowed to **admin-only**             | the auditor positive, and the capstone's auditor face — **nothing else**             |
+| role gate removed entirely                  | technician, non-member, and the capstone                                             |
+| keyset loses the `id` tiebreak              | the boundary case, alone                                                             |
+| oversized `limit` no longer clamped         | the clamp test                                                                       |
+| `rowId` without `tableName` allowed         | its 400                                                                              |
+| `action` no longer a closed enum            | its 400                                                                              |
+| `actor_role` nulled in the response         | role-at-time over HTTP                                                               |
+| `AUDIT_ACTIONS` drops a value the enum has  | the vocabulary-equality assertion                                                    |
+| a `DELETE` route added to the audit segment | both route-inventory guards                                                          |
+| `audit_log` policy → `USING (true)`         | the money negative, bootstrap invisibility, **and** the capstone's cross-tenant face |
+| **(control)** a no-op edit to the service   | **nothing — as intended**                                                            |
+
+The control is there because a sweep that reddens on everything proves as little as one that reddens on nothing; it is the guard on the guard.
+
+**The first row is the one worth keeping.** Exactly one mutation is invisible to every negative in the file and visible only to a positive — which is the argument for writing the positive at all.
 
 ---
 
@@ -804,9 +904,11 @@ This list is kept aligned with the enumerated **Open items register** in [`DECIS
 - **`maintenance_records` is SOFT-DELETE ONLY, and hard delete is deferred (OPEN-9).** v1.0 has no way to destroy a maintenance record: the app role holds no `DELETE` privilege, proven by the `permission denied` negative in §7g and pinned by catalog assertion 14. The deferral is deliberate rather than unfinished — **a destructive operation must not predate the audit trail that makes it accountable**, because a purged row with no `audit_log` entry leaves no trace of itself, of who removed it, or of what it said. When hard delete lands it lands behind audit, and it inherits the question of what a purge writes there ([ADR-008](DECISIONS.md)).
 - **A green generic matrix is still not evidence for a table registered as bespoke.** `users`, `tenants` and `memberships` are excluded by declaration, and the exclusion is accounted for by the registry-equality check so it cannot be mistaken for an oversight ([helpers.ts:132](../apps/api/test/db/helpers.ts#L132)). Their coverage is the bespoke dual-axis suite (§3), not the 15 generated cases.
 - **Invited users cannot log in yet (OPEN-7).** `invite_member` creates an identity whose password hash is a sentinel that matches nothing, so an invited person can neither sign in nor register their own organisation (the email is taken). This is a **known, scheduled, temporary** state, not a hidden one: the set-password / invite-token flow is the first slice of step 8, with a hard deadline of step 10 (before deploy, the only people it can lock out are test fixtures), and it is enforced by a Definition-of-Done checkbox rather than by a comment ([PROJECT_BRIEF.md:266](PROJECT_BRIEF.md#L266)) because markers drift and checklists block. Reasoning in [DECISIONS.md:269](DECISIONS.md#L269).
-- **Audit CAPTURE exists as of step 7a; the READ SURFACE does not (step 7b).** The rest of this bullet is the step-6 statement it replaces, kept because the distinction it draws is still the one that matters.
+- **The audit module is COMPLETE as of step 7b — captured (§7h) and readable (§7i).** This bullet previously said the read surface did not exist; it does now, so what remains unproven is stated instead.
 
-  What landed: a `SECURITY DEFINER` trigger on six tables writes an `audit_log` row for every one of the eleven mutation types, with actor and **role-at-time-of-action** on each (§7h). What has NOT landed: `GET /audit`, the admin/auditor RBAC gate on it, and the HTTP-level isolation proof. So **"the trail is captured" is true, and "the trail is readable by the people entitled to read it" is not yet** — the rows exist and only the migration role and a tenant-scoped `SELECT` can reach them.
+  **What the module does NOT yet have.** No frontend consumes `GET /audit` (step 8), so the auditor journey is proven by acceptance test rather than by use. No retention or partitioning exists — ADR-012 prices `audit_log` at roughly 2x reading volume and marks the growth curve as an accepted v1.0 cost, not a solved one. Hash-chaining is deferred (ADR-010), so the trail is tamper-**resistant** against the application and anyone holding only the app role's credentials, and **not** tamper-evident against the migration role or a superuser.
+
+  **And one property is deliberately unreachable rather than untested:** bootstrap audit rows carry a NULL tenant and are invisible to every application read, permanently (ADR-013, §7i). They are readable only by direct database access. That is the designed answer, not a gap — but a reader who expects `GET /audit` to show everything in the table should meet it here.
 
 - **The lifecycle log is NOT the audit trail, and neither derives from the other.** This is the step-6 claim most open to being misread, so it is stated flatly: `asset_events` records what happened to a physical **asset**; `audit_log` records who changed which **record**, with before/after. Neither derives from the other — a bulk import produces lifecycle events with no user-facing mutation, and correcting a typo in `location` produces an audit row with **no lifecycle event at all**. That `PATCH` case is the one Phase 3 mutation for which `audit_log` would be the only record, and it is invisible in the event log today.
 
@@ -826,11 +928,11 @@ This list is kept aligned with the enumerated **Open items register** in [`DECIS
 cp .env.example .env      # then set SESSION_SECRET
 docker compose up -d      # Postgres 16 + Redis 7
 npm install && npm run db:migrate
-npm run test              # 319 tests
+npm run test              # 337 tests
 npm run docs:check        # the citation guard (its own CI step)
 ```
 
-**Local evidence, `feat/step7a-audit-capture`, on a FRESH database, verbatim:**
+**Local evidence, `feat/step7b-audit-read`, verbatim:**
 
 ```
  ✓ test/db/isolation.spec.ts (42 tests)
@@ -842,7 +944,8 @@ npm run docs:check        # the citation guard (its own CI step)
  ✓ test/api/maintenance.spec.ts (22 tests)
  ✓ test/api/assets-read.spec.ts (21 tests)
  ✓ test/api/memberships.spec.ts (19 tests)
- ✓ test/db/audit.spec.ts (17 tests)
+ ✓ test/db/audit.spec.ts (18 tests)
+ ✓ test/api/audit-read.spec.ts (17 tests)
  ✓ test/db/catalog-rls.spec.ts (17 tests)
  ✓ test/db/interceptor.spec.ts (15 tests)
  ✓ test/db/auth-definer.spec.ts (12 tests)
@@ -853,11 +956,11 @@ npm run docs:check        # the citation guard (its own CI step)
  ✓ test/api/revocation.spec.ts (3 tests)
  ✓ src/health/health.controller.spec.ts (1 test)
 
- Test Files  19 passed (19)
-      Tests  319 passed (319)
+ Test Files  20 passed (20)
+      Tests  337 passed (337)
 ```
 
-`audit.spec.ts` is the step-7a gate (§7h) — capture, immutability, role-at-time, the system actor, redaction and DB-layer isolation on the trail. `catalog-rls.spec.ts` went from 15 to 17: assertion **16** (a trigger-returning definer function must be attached) and assertion **17** (no audit allowlist admits `password_hash`, and the trigger is attached exactly where ADR-012 says).
+`audit-read.spec.ts` is the step-7b gate (§7i) — the admin/auditor enforcement, the HTTP-layer isolation and bootstrap-invisibility proofs, the maintenance-edit capstone and the pagination boundary. `audit.spec.ts` is the step-7a gate (§7h) — capture, immutability, role-at-time, the system actor, redaction and DB-layer isolation on the trail. `catalog-rls.spec.ts` went from 15 to 17: assertion **16** (a trigger-returning definer function must be attached) and assertion **17** (no audit allowlist admits `password_hash`, and the trigger is attached exactly where ADR-012 says).
 
 `membership-writes.spec.ts` is the §7a backstop suite — the one that calls the definer functions directly, with no HTTP anywhere in the process. `step6-acceptance.spec.ts` is the §8.3 capstone, now covering all four domain tables in one scenario. Of `isolation.spec.ts`'s tests, **20 are generated** by the catalog-driven matrix across the four domain tables (§7f, §7g); it ran 6 before step 6 and 15 at phase 3d.
 

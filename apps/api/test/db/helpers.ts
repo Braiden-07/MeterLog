@@ -182,6 +182,26 @@ export const ISOLATION_BESPOKE_TABLES: readonly string[] = [
   // Its coverage is the bespoke DB-layer suite in `audit.spec.ts`, which seeds
   // the audit rows the only way anything can — by performing real mutations and
   // letting the trigger write them.
+  //
+  // STEP 7B ADDS A SECOND, INDEPENDENT REASON, and it is the stronger of the two:
+  // `audit_log` legitimately contains rows with a **NULL `tenant_id`**. The
+  // `user.created` row written during `register_tenant` has no tenant available
+  // from either source — `users` carries no `tenant_id` (ADR-006 §2) and the
+  // insert happens before any tenant context exists — so ADR-013 pins those rows
+  // as pre-authentication bootstrap records that match no tenant policy and are
+  // invisible to every application read, permanently.
+  //
+  // The generic matrix cannot express that. Its contract is "one row belonging to
+  // `ctx.tenantId`", and a table whose row set includes rows belonging to NO
+  // tenant has a property the matrix has no case for — it would assert tenant B
+  // sees zero of tenant A's rows and say nothing at all about the rows that
+  // belong to neither. The bespoke suite carries the NULL-tenant assertion
+  // instead, non-vacuously: it establishes on the migration role that such rows
+  // EXIST before asserting the tenant-scoped read returns none of them.
+  //
+  // Either reason alone would justify the exclusion. Both are recorded because a
+  // future change that removes one — say, granting the app role INSERT — must not
+  // read as license to move the table back into the matrix.
   'audit_log',
 ];
 

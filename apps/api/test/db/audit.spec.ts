@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import type { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
+import { AUDIT_ACTIONS } from '../../src/audit/audit-actions';
+
 import {
   appClient,
   capturePgFailure,
@@ -662,6 +664,41 @@ describe('audit capture at the database layer (step 7 phase 7a)', () => {
   // =========================================================================
   // 6. TENANT ISOLATION ON audit_log, AT THE DATABASE LAYER
   // =========================================================================
+  // =========================================================================
+  // THE ACTION VOCABULARY — the TS mirror must equal the database enum
+  // =========================================================================
+  describe('the action vocabulary', () => {
+    it('AUDIT_ACTIONS equals the public.audit_action enum, in both directions', async () => {
+      // ADDED AT STEP 7B, because 7b gave the list a second consumer and a second
+      // copy is a chance to drift.
+      //
+      // The same fourteen values are the Postgres enum, the read filter's
+      // accepted input, the OpenAPI enum and the response type. The drift is
+      // silent in the worst direction: a value present in the database but
+      // missing from `AUDIT_ACTIONS` makes rows carrying it **unfilterable while
+      // still being returned**, so `GET /audit?action=...` would quietly answer a
+      // narrower question than the caller asked — and nothing would be red.
+      //
+      // Asserted in BOTH directions, like the fixture registry: a value only in
+      // the enum is the unfilterable case above; a value only in TypeScript is a
+      // filter the database can never match, which 400s nothing and returns
+      // nothing forever.
+      const rows = await migrator.$queryRawUnsafe<{ value: string }[]>(
+        `SELECT e.enumlabel AS value
+           FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+           JOIN pg_namespace n ON n.oid = t.typnamespace
+          WHERE n.nspname = 'public' AND t.typname = 'audit_action'
+          ORDER BY e.enumsortorder`,
+      );
+
+      const inDatabase = rows.map((r) => r.value);
+      // Non-vacuity: an empty result would make the comparison below trivially
+      // true if the constant were also empty, and would mean the type is missing.
+      expect(inDatabase.length).toBe(14);
+      expect([...inDatabase].sort()).toEqual([...AUDIT_ACTIONS].sort());
+    });
+  });
+
   describe('tenant isolation', () => {
     it('M, admin of BOTH tenants and active in A, sees only A audit rows', async () => {
       // The isolation matrix extended to the trail. Read as the APP role here,
