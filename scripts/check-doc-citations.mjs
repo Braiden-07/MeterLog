@@ -216,7 +216,31 @@ function main() {
         if (literals.length === 0) continue;
 
         const haystack = haystackFor(lines, from, highest);
-        const missing = literals.filter((literal) => !haystack.includes(literal));
+
+        // A link whose ENTIRE text is a record id — `[ADR-012](DECISIONS.md#L491)`
+        // — is pointing at that record's HEADING, so it is checked against heading
+        // lines only, not against any mention in the window.
+        //
+        // WHY THIS IS TIGHTER AND WHY IT HAD TO BE. A document that discusses its
+        // own record ids mentions them in prose constantly, so the plain
+        // substring check matches a passing reference and reports green. That
+        // happened, live, while writing step 7a: an `[ADR-012]` anchor drifted 15
+        // lines when content was inserted above it, and the window happened to
+        // contain the words "ADR-012's scope" four lines away. Path and line were
+        // still valid, so checks 1 and 2 saw nothing either — the citation was
+        // wrong and every check passed.
+        //
+        // Restricting to headings removes the coincidence: prose mentions a
+        // record, a heading DECLARES it, and a record-id link means the latter.
+        const headingOnly = /^[A-Z]{2,6}-?\d{2,4}$/.test(linkText.trim());
+        const headings = headingOnly
+          ? haystack
+              .split('\n')
+              .filter((l) => l.trimStart().startsWith('#'))
+              .join('\n')
+          : haystack;
+
+        const missing = literals.filter((literal) => !headings.includes(literal));
         contentChecked += 1;
 
         if (missing.length > 0) {

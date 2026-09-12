@@ -719,7 +719,7 @@ A [`GLOBAL SCAN`](../apps/api/test/db/audit.spec.ts#L609) backs it up across eve
 
 ### What the layers caught, and the guard that fired on its own
 
-The sweep ran **18 mutations against the database and the harness; all 18 reddened at least one test.** (Four more were run against the citation guard itself — see §10 — for **22 in total**, which is the number `PROGRESS.md` quotes. Stated both ways on purpose: this phase corrected two stale counts that had drifted between documents, and a third would be careless.) The ones worth naming:
+The sweep ran **18 mutations against the database and the harness; all 18 reddened at least one test.** (Five more were run against the citation guard itself — see §10 — for **23 in total**, which is the number `PROGRESS.md` quotes. Stated both ways on purpose: this phase corrected two stale counts that had drifted between documents, and a third would be careless.) The ones worth naming:
 
 | mutation                                                            | what reddened                                                                                       |
 | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -766,7 +766,7 @@ Six, up from five, with the allowlist extended in the same PR ([`EXPECTED_DEFINE
 
 ### What 7a does not prove
 
-The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L491) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L666)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
+The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L506) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L666)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
 
 Hash-chaining is deferred, and ADR-010 records why as engineering rather than scope. What immutability-by-grant does **not** give, stated plainly: it defends against the application and against anyone holding only the app role's credentials. It does **not** defend against the migration/owner role or a cluster superuser, who can `ALTER TABLE`. Tamper-evidence against a privileged operator is what a chain buys, and that threat model is not v1.0's.
 
@@ -884,14 +884,19 @@ Every `file#Lnn` link in this document is checked by `npm run docs:check`, which
 
 **Checks 1 and 2 catch only deletions and truncations.** A citation that slides twenty lines because someone added an import passes both of them every time. The content check is the one that earns line-level precision, and it is affordable because this document already cites tests by their `it(...)` name.
 
-Held to the same standard as everything else here, it was swept too — four mutations, four red:
+Held to the same standard as everything else here, it was swept too — five mutations, five red:
 
-| mutation                                             | caught by                             |
-| ---------------------------------------------------- | ------------------------------------- |
-| repoint a citation at a non-existent file            | check 1                               |
-| push a line number past the end of the file          | check 2                               |
-| slide an anchor 20 lines (path and line still valid) | **check 3** — neither 1 nor 2 notices |
-| slide an `ADR-009` anchor within `DECISIONS.md`      | check 3, via the record-id rule       |
+| mutation                                                         | caught by                             |
+| ---------------------------------------------------------------- | ------------------------------------- |
+| repoint a citation at a non-existent file                        | check 1                               |
+| push a line number past the end of the file                      | check 2                               |
+| slide an anchor 20 lines (path and line still valid)             | **check 3** — neither 1 nor 2 notices |
+| slide an `ADR-009` anchor within `DECISIONS.md`                  | check 3, via the record-id rule       |
+| point a record-id link at a PROSE MENTION instead of its heading | check 3, via the heading-only rule    |
+
+**The fifth row is there because the guard produced a FALSE NEGATIVE and it is recorded rather than quietly patched.** Inserting the full redaction allowlist into ADR-011 pushed ADR-012's heading down fifteen lines, so the `[ADR-012]` link — anchored at `DECISIONS.md` line 491 — was left pointing at a `- **Consequences:**` bullet belonging to a different ADR. Path and line were both still valid, so checks 1 and 2 saw nothing — **and check 3 passed too**, because the five-line window happened to contain the words "ADR-012's scope" in prose four lines away. Every check green, citation wrong.
+
+The fix is a tightening rather than a wider net: **a link whose entire text is a record id is checked against HEADING lines only.** A document that discusses its own record ids mentions them in prose constantly; prose _mentions_ a record, a heading _declares_ it, and `[ADR-012]` means the latter. Re-anchored to :506, and the mutation that reproduces the false negative — pointing the link at the prose line — is now red.
 
 **It found two real drifts on its first runs, unprompted**: the citation for the citext case-insensitivity regression guard (§4) — the test this document and `CLAUDE.md` both call load-bearing — had slid six lines past its `it(...)`, and an `ADR-006` anchor had drifted. Both were re-anchored, and phase 4's six file-level links were then restored to line level, which was only safe once the guard existed. The guard's own first version reported every mutation as passing, because the reporter interleaves ANSI codes inside the summary line and defeated a regex; the sweep harness now reads exit codes. **A sweep harness that cannot fail is worth exactly as much as a test that cannot fail.**
 

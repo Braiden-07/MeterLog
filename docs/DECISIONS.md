@@ -471,6 +471,21 @@ The cost is honest: every new tenant-scoped table now requires a fixture before 
   - **A delete action for soft-deletes.** Because v1.0 has no hard delete, a removal arrives as an `UPDATE` writing `deleted_at`; the trigger classifies it as the table's delete action rather than as a generic update, so the trail reads as what happened rather than as what SQL was issued.
   - **REDACTION IS ENFORCED BY THE TRIGGER, NOT DOCUMENTED.** An explicit **per-table column ALLOWLIST** is carried in the trigger, passed as the trigger's argument at attach time, and every diff is built by filtering `to_jsonb(NEW)`/`to_jsonb(OLD)` through it. `users` allows `id, email, created_at, updated_at, deleted_at` and therefore **denies `password_hash`**.
 
+- **THE COMPLETE ALLOWLIST, AS ATTACHED.** Written out here rather than left to be read back from `pg_trigger.tgargs`, because step 7b's read surface has to know exactly which columns a diff can ever contain, and re-deriving it from the catalog is how two sources of truth start.
+
+  | audited table         | allowlisted columns                                                                                      | withheld            |
+  | --------------------- | -------------------------------------------------------------------------------------------------------- | ------------------- |
+  | `users`               | `id, email, created_at, updated_at, deleted_at`                                                          | **`password_hash`** |
+  | `memberships`         | `id, user_id, tenant_id, role, created_at, updated_at, deleted_at`                                       | —                   |
+  | `assets`              | `id, tenant_id, serial_number, type, status, location, installed_at, created_at, updated_at, deleted_at` | —                   |
+  | `asset_events`        | `id, tenant_id, asset_id, event_type, payload, created_by, created_at`                                   | —                   |
+  | `readings`            | `id, tenant_id, asset_id, value, unit, read_at, created_by, created_at`                                  | —                   |
+  | `maintenance_records` | `id, tenant_id, asset_id, description, performed_at, created_by, created_at, updated_at, deleted_at`     | —                   |
+
+  **`users` is the only row with a withheld column, and that is a fact about the schema rather than about the policy.** `password_hash` is the one secret in the database; every other table is allowlisted to its full column set. The allowlist is written out in full anyway — for `readings` as much as for `users` — because the mechanism must be uniform for the `users` case to be anything other than a special case somebody remembered. The day a second secret lands, it lands in a table that already has an explicit list to be left out of.
+
+  **This table is the authoritative copy.** It is asserted against the live catalog by catalog assertion 17, which pins both halves: that the trigger is attached to exactly these six tables (ADR-012's scope), and that no attachment's argument admits `password_hash`. A change to either must be made in migration SQL and will turn CI red until this table is updated to match.
+
 - **Why an allowlist and not a denylist.** A denylist naming `password_hash` is correct today and wrong the first time a column is added. `users` gaining a `totp_secret`, or a future set-password flow (OPEN-7) gaining a reset token, would start leaking on the day the column landed, with no diff to review and nothing red. **An allowlist fails closed on exactly that change**: the new column is absent from the diff until someone deliberately adds it, and the addition is a reviewed edit in migration SQL. This is the `APPEND_ONLY_TABLES` argument applied to columns — a property held by omission is one refactor away from ending.
 
 - **Consequences:**
@@ -523,6 +538,32 @@ The cost is honest: every new tenant-scoped table now requires a fixture before 
 - **Decision — volume: accepted, priced, and recorded rather than discovered.** `readings` is the highest-cardinality table in the schema by a wide margin, and uniform auditing therefore makes **`audit_log` the largest table in the database, growing at roughly 2× reading volume** — one audit row per reading, plus the rest of the surface. That is an accepted v1.0 cost.
 
   **Retention and partitioning are recorded here as a future marker** so the growth curve is a known accepted cost rather than a step-10 discovery. The shape when it is needed: `audit_log` is append-only and always queried with a tenant and a time range, which is the textbook case for `PARTITION BY RANGE (created_at)` — detaching an old partition becomes the retention policy, and no row is ever updated across a partition boundary. Nothing about the v1.0 schema forecloses it. What **would** foreclose it is a hash chain (ADR-010), whose ordering dependency crosses partitions — so if both are ever wanted, partitioning is decided first.
+
+- **THE ACTION VOCABULARY, WRITTEN OUT — this is the list step 7b filters and groups by.** Stated explicitly so the read surface, its DTO and its OpenAPI enum can be built from one place instead of re-derived from the migration or from the eleven-row table above.
+
+  | #   | `audit_action` value      | table                 | fired by                                                                      |
+  | --- | ------------------------- | --------------------- | ----------------------------------------------------------------------------- |
+  | 1   | `user.created`            | `users`               | `invite_member` (new identity); `register_tenant` (founder)                   |
+  | 2   | `membership.created`      | `memberships`         | `invite_member`; `register_tenant` (first admin)                              |
+  | 3   | `membership.role_changed` | `memberships`         | `change_member_role`                                                          |
+  | 4   | `membership.revoked`      | `memberships`         | `revoke_member`                                                               |
+  | 5   | `membership.updated`      | `memberships`         | **nothing today** — the total-function fallback, see below                    |
+  | 6   | `asset.created`           | `assets`              | `POST /assets`                                                                |
+  | 7   | `asset.updated`           | `assets`              | `PATCH /assets/:id` — **the metadata edit that emits no lifecycle event**     |
+  | 8   | `asset.status_changed`    | `assets`              | `POST /assets/:id/events` (the transition engine)                             |
+  | 9   | `asset.decommissioned`    | `assets`              | `DELETE /assets/:id` — the soft delete                                        |
+  | 10  | `asset_event.created`     | `asset_events`        | the genesis pair, and every transition and decommission                       |
+  | 11  | `reading.created`         | `readings`            | `POST /assets/:id/readings`                                                   |
+  | 12  | `maintenance.created`     | `maintenance_records` | `POST /maintenance-records`                                                   |
+  | 13  | `maintenance.updated`     | `maintenance_records` | `PATCH /maintenance-records/:id` — **the edit that emits no lifecycle event** |
+  | 14  | `maintenance.deleted`     | `maintenance_records` | `DELETE /maintenance-records/:id` — the soft delete                           |
+
+  **Reading the two tables together.** The eleven rows above are the named _mutation types_ — what a person did. These fourteen are the _action values_ a row can carry — what the trigger saw. They differ by three, and the difference is not bookkeeping:
+  - **A status transition and a decommission each write TWO rows** (#8 or #9, plus #10), because one user action mutates two tables. `asset_event.created` is therefore not an eleventh mutation; it is the second half of two of them.
+  - **`user.created` (#1) has no row of its own in the eleven** because creating an identity is part of `invite_member` rather than a mutation a user performs on its own. It is audited because `users` is the only table carrying a secret, which is what makes ADR-011's redaction provable.
+  - **`membership.updated` (#5) is unreachable today**, and deliberately in the enum anyway — see the consequence below.
+
+  **For 7b specifically:** #7 and #13 are the two actions with **no corresponding `asset_events` row**, so they are the ones a reader coming from the lifecycle log will not expect to find and the ones the capstone should exercise. And **#5 appearing in real data is a signal, not noise** — it means a membership write path was added without extending this vocabulary.
 
 - **Consequences:**
   - **The `action` enum carries fourteen values over the eleven named mutations.** The extra three are `user.created` (the identity write inside `invite_member`/`register_tenant`), `asset_event.created` (the `asset_events` row that accompanies creation, transition and decommission), and `membership.updated` — a **total-function fallback** for a `memberships` `UPDATE` that changes neither `role` nor `deleted_at`. No such path exists today. It is in the enum rather than left to fall through because the alternative is silently mislabelling a future write as `membership.role_changed`, and a mislabelled audit row is worse than an ugly one.
