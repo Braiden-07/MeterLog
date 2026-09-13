@@ -1,6 +1,6 @@
 # PERF.md — measured performance decisions
 
-> Index and query decisions proven with `EXPLAIN ANALYZE` against a real dataset, before and after. Required by `PROJECT_BRIEF.md` §5 (:150) and §13 (:279): _"Prove at least one index decision with `EXPLAIN ANALYZE` and note the before/after in docs."_
+> Index and query decisions proven with `EXPLAIN ANALYZE` against a real dataset, before and after. Required by `PROJECT_BRIEF.md` §5 (:151) and §13 (:280): _"Prove at least one index decision with `EXPLAIN ANALYZE` and note the before/after in docs."_
 >
 > Numbers here are from local Postgres 16 (docker), warm cache. They are for **comparing plans**, not for quoting as production latency — Render's disks and cache behaviour differ. The plan **shape** is what transfers.
 
@@ -8,7 +8,7 @@
 
 ## 1. `readings_asset_id_read_at_idx` — the asset time-series read
 
-**Decision under test:** `CREATE INDEX readings_asset_id_read_at_idx ON public.readings (asset_id, read_at)`, named explicitly by `PROJECT_BRIEF.md` §5 (:148).
+**Decision under test:** `CREATE INDEX readings_asset_id_read_at_idx ON public.readings (asset_id, read_at)`, named explicitly by `PROJECT_BRIEF.md` §5 (:149).
 
 **Why this one.** `readings` is the only genuinely hot table in v1.0 — append-only, unbounded growth, one row per meter per reading interval — and the query it exists for (`GET /assets/:id/readings`, Phase 3) is the one a reviewer would actually hit. It is also the index whose absence is least obvious from a correctness test: every isolation and append-only assertion passes identically with or without it.
 
