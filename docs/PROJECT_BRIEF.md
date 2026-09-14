@@ -129,15 +129,16 @@ NestJS API (Railway/Render)
 
 ## 5. Data Model
 
-Core tables (illustrative — refine during design phase, log schema decisions):
+**Authority.** This section owns the **table set** and each table’s **purpose and grain**. It does **not** own columns: those belong to the governing decision named on each row, and [`DECISIONS.md`](DECISIONS.md) is the schema log where changes to them are recorded. Design is complete for all eight tables, so the earlier “illustrative — refine during design phase” framing is retired — nothing here is a sketch, and nothing here restates a column list. **A column list in two places is a column list that will disagree**, which is exactly what happened to `users` and `audit_log` before this section was converted to pointers.
 
-- **tenants** — `id (uuid, pk)`, `name`, `created_at`, `updated_at`, `deleted_at (nullable, soft delete)`
-- **users** — `id (uuid, pk)`, `tenant_id (fk → tenants)`, `email (unique per tenant)`, `password_hash`, `role (enum: admin|technician|auditor)`, `created_at`, `updated_at`, `deleted_at`
-- **assets** — `id (uuid, pk)`, `tenant_id (fk)`, `serial_number`, `type`, `status (enum: installed|active|maintenance|decommissioned)`, `location`, `installed_at`, `created_at`, `updated_at`, `deleted_at`
-- **asset_events** — `id (uuid, pk)`, `tenant_id (fk)`, `asset_id (fk)`, `event_type (enum)`, `payload (jsonb)`, `created_by (fk → users)`, `created_at` — **append-only**, no updates/deletes
-- **readings** — `id (uuid, pk)`, `tenant_id (fk)`, `asset_id (fk)`, `value (numeric)`, `unit`, `read_at`, `created_by (fk)`, `created_at`
-- **maintenance_records** — `id (uuid, pk)`, `tenant_id (fk)`, `asset_id (fk)`, `description`, `performed_at`, `created_by (fk)`, `created_at`, `updated_at`
-- **audit_log** — `id (uuid, pk)`, `tenant_id (nullable, no fk)`, `actor_user_id (nullable, fk → users)`, `actor_role (nullable)`, `table_name`, `row_id (uuid)`, `action (enum)`, `payload (jsonb: {before, after})`, `created_at` — **append-only**. Reconciled to the shipped schema at step 7b; see ADR-011 (one `payload` column, redaction allowlist), ADR-013 (why the three nullables) and ADR-015 (`table_name`/`row_id` rather than `entity_type`/`entity_id`).
+- **tenants** — an organisation; the tenancy root. One row per customer. Its key IS the tenant, so its RLS policy is keyed on `id` rather than a `tenant_id`. Columns: see [ADR-004](DECISIONS.md#L110).
+- **users** — a person. **Pure identity**: globally unique email, and deliberately **no `tenant_id` and no `role` column** — both live on `memberships`. One row per human, shared across every workspace they belong to. Columns: see [ADR-006](DECISIONS.md#L275).
+- **assets** — a tracked physical device. One row per asset, soft-deleted; `status` advances only through the transition engine. Columns: see [ADR-007](DECISIONS.md#L314) and the lifecycle contract in [`ARCHITECTURE.md`](ARCHITECTURE.md) §9.2.
+- **asset_events** — the lifecycle log. One row per state transition, **append-only**. Columns: see [ADR-007](DECISIONS.md#L314); the append-only declaration and its enforcing grant live in [`CLAUDE.md`](../CLAUDE.md).
+- **readings** — meter readings. One row per reading, **append-only**; a correction is a new row, never an edit. Columns: see [ADR-007](DECISIONS.md#L314) and the append-only declaration in [`CLAUDE.md`](../CLAUDE.md).
+- **maintenance_records** — work performed on an asset. One row per visit; the one **mutable** child, soft-delete only. Columns: see [ADR-008](DECISIONS.md#L354).
+- **audit_log** — the mutation trail. One row per mutated row per mutation, **append-only** and written only by a `SECURITY DEFINER` trigger. Columns: see [ADR-009](DECISIONS.md#L390) and [ADR-011](DECISIONS.md#L464).
+- **memberships** — grants one user one role in one tenant; the join the whole two-axis isolation model rests on, and **where `role` lives**. One row per (user, tenant). Introduced by ADR-006 at step 4 and missing from this list ever since, which is the gap this conversion closes. Listed last rather than beside `users` so the seven rows above keep the line numbers that applied migration comments cite by number. Columns: see [ADR-006](DECISIONS.md#L275).
 
 **Design rules:**
 
