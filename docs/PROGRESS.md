@@ -916,3 +916,49 @@ Fixed by schema-qualifying the operator, `u.email OPERATOR(public.=) p_email` �
 **Blockers**
 
 - None. Deferred to their build-order step: GitHub repo creation and branch protection (§9), Render plan-tier selection (ADR-003), Sentry DSN and uptime monitor (§10).
+
+---
+
+## Step 8, first slice — OPEN-7: the invited-user set-password / invite-token flow
+
+**Status: complete, at the PR. Not merged. Step 9 not started.**
+
+Closes the dead-end `invite_member` has carried since step 5: an invited person could not log in (sentinel hash) and could not register their own organisation (email taken). Full reasoning in **ADR-016**; OPEN-7 is marked DONE in the register.
+
+### What shipped
+
+- **`users.password_set_at timestamptz NULL`** — the pending predicate. **No DEFAULT clause**, and the absence is the mechanism: invite-created rows are pending by default with no change to `invite_member`. Floored by **catalog assertion 19**, proven to red against a simulated `SET DEFAULT now()`.
+- **Backfill: blanket `now()`.** There is no provenance predicate to key on — verified live, register and invite write identical argon2id hashes at identical params, identical `created_at`/`updated_at`, and audit logs *both* as `user.created`. Direction chosen on asymmetry of error: blanket NULL would make every pre-existing account mintable for a takeover token; blanket `now()` risks a recoverable availability failure. Touches zero rows today; written as the rule governing the first real deploy.
+- **`register_tenant` sets `password_set_at = now()` explicitly.** The backfill fixes history; this fixes the future. Without it every future founder is born pending and invite-overwriteable.
+- **`invite_tokens`** — SHA-256 at rest (never the plaintext), single-use, 72h TTL, superseded on re-read. The app role holds **nothing** on it: no grant, no policy.
+- **`set_password`** (7th definer fn, pre-auth) and **`list_pending_invites`** (8th, admin-scoped, mints on read).
+- **`user.password_set` audit action** — `users` UPDATE became reachable for the first time; without this the first password set would have logged `user.created` with an empty diff.
+- **`user_created` stripped at the wire**; invite response byte-identical across both branches.
+
+### Three defects found that were not in the plan
+
+1. **The `users` column grants were never actually asserted.** Two migrations describe the `password_hash` withholding as "asserted in CI". It was not — assertions 6 and 9 use `has_table_privilege`, which is blind to column grants. Demonstrated: `GRANT SELECT (password_hash) ... TO meterlog_app` passed the entire suite green. **Catalog assertion 18** now pins the set as an equality for both roles and hardens `password_hash` retroactively.
+
+2. **Login was not timing-uniform, and had not been since step 4.** The failure block ran the dummy verify *unconditionally* after a short-circuiting `&&`, so an unknown email cost ONE argon2 verify and a wrong password cost TWO — a reproducible ~2x existence oracle inside the construction built to prevent it. `ISOLATION.md` §8 claimed the opposite; corrected there. Fixed by making the dummy the `else` of the real verify.
+
+3. **`audit_capture` mislabelled the newly-reachable `users` UPDATE** as `user.created` with an empty payload.
+
+### Two claims of mine that mutation testing disproved
+
+- **The expiry-ordering claim.** The migration comment asserted that checking expiry after the consume made expiry distinguishable from replay. A mutant folding it into the consume predicate **passed the test unchanged** — the RAISE unwinds either way, so the designs are observably identical. Comment corrected to say it is a legibility choice; the tests now assert the real discriminators (which live in the table, not the function).
+- **The first timing test was decoration.** Relative thresholds (within 4x, spread under 3x) **passed with a real hazard installed**. Recalibrated against a measured argon2 verify plus a measured noise floor; it then caught the hazard at 1.09x a verify — and caught defect 2 above.
+
+### One thing the grant does NOT cover — carried forward
+
+The column grant and RLS both block a *direct* login-path read of `password_set_at` (a 500, not an oracle). **`login_lookup` is `SECURITY DEFINER` and bypasses both.** Adding `password_set_at` to its `RETURNS TABLE` is a two-line, reasonable-looking change that hands the flag to login with nothing in the way. The timing test is the **only** cover for that path — recorded in `CLAUDE.md` under test-suite invariants so it is not deleted as flaky.
+
+### Verification
+
+Migration applied to a **dropped-and-recreated schema** (the CI path), not just incrementally. Both new assertions proven in both directions. Every negative carries a disambiguated failure reason: custom SQLSTATEs (`SP001`/`SP002`/`SP003`) that nothing else in the cluster raises, or a paired positive proving the table/row exists so a `42501` cannot be mistaken for absence.
+
+### Blockers / notes for the author
+
+- **`PROJECT_BRIEF.md` §12 DoD checkbox — "Invited users can set a password and log in; no invite creates an unreachable account" — is now satisfied but NOT ticked.** `PROJECT_BRIEF.md` is author-owned (CLAUDE.md), so the box is left for you.
+- **Accepted residual (v1.0):** invite timing still distinguishes create-identity from attach-membership. Authenticated, rate-limited admin; leaks existence-anywhere only. The BullMQ mailer in stretch scope erases it once invite becomes fire-and-return.
+- **OPEN-9** (hard delete) still deferred.
+- **Cold-start flake:** one full-suite run failed 16 tests on the very first run after `docker compose up`, with an 88s collect phase; every subsequent run was clean. Not retry-masked (vitest sets only timeouts; the workflow has no retry or continue-on-error), and healthchecks already gate the services. Prime suspect remains the postgres-container false-green — `pg_isready` passing against the temporary initdb server before the real one restarts. If it recurs, **capture the raw failure text**: that hypothesis predicts a connection-reset or "database system is starting up" error, not a timeout, and the two are indistinguishable in a summary.

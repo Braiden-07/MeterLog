@@ -694,7 +694,11 @@ describe('audit capture at the database layer (step 7 phase 7a)', () => {
       const inDatabase = rows.map((r) => r.value);
       // Non-vacuity: an empty result would make the comparison below trivially
       // true if the constant were also empty, and would mean the type is missing.
-      expect(inDatabase.length).toBe(14);
+      // 14 at step 7a; 15 since step 8 added `user.password_set` (ADR-016). The
+      // count is a hardcoded non-vacuity floor on purpose — it is what makes this
+      // a REVIEWED edit rather than a list that silently tracks whatever the enum
+      // happens to hold.
+      expect(inDatabase.length).toBe(15);
       expect([...inDatabase].sort()).toEqual([...AUDIT_ACTIONS].sort());
     });
   });

@@ -83,12 +83,42 @@ export const RLS_EXEMPT_TABLES: readonly string[] = ['_prisma_migrations'];
  * Both assertions were already written; the trail simply became their fourth
  * subject.
  */
+/*
+ * `invite_tokens` JOINED AT STEP 8 (OPEN-7), and it is the first entry that is
+ * NOT app-readable — which is why assertion 10 gains its first carve-out here.
+ *
+ * The other four are definer-reachable AND readable by the app role: that pairing
+ * is what makes assertions 9 and 10 mean something together (9 says the app role
+ * cannot write them, 10 says 9 is not satisfied by a table nobody can touch).
+ * `invite_tokens` holds credentials, so the app role is granted NOTHING on it at
+ * all — no SELECT, no write, no policy. A stolen app-role connection cannot
+ * enumerate live tokens or read a hash.
+ *
+ * So assertion 10 excludes it, and — because a carve-out must never become a
+ * hiding place — assertion 18 replaces the cover by asserting the app role holds
+ * ZERO privileges here. "Not readable" is pinned as the property rather than
+ * tolerated as an exception. Same shape as assertion 12's carve-out for
+ * `audit_capture` being backed by assertion 16.
+ */
 export const DEFINER_ACCESSIBLE_TABLES: readonly string[] = [
   'tenants',
   'users',
   'memberships',
   'audit_log',
+  'invite_tokens',
 ];
+
+/**
+ * Definer-reachable tables the app role must NOT be able to read — the exclusion
+ * list for catalog assertion 10.
+ *
+ * Declared rather than derived, for the `appWrites` reason: deriving it from
+ * `has_table_privilege` would make assertion 10 assert whatever the grants happen
+ * to be, which catches nothing by construction. A table added here is a reviewed
+ * decision that the app role is blind to it, and assertion 18 then holds it to
+ * that in the opposite direction.
+ */
+export const APP_UNREADABLE_DEFINER_TABLES: readonly string[] = ['invite_tokens'];
 
 /**
  * The complete set of SECURITY DEFINER functions. Each is a deliberate,
@@ -135,6 +165,25 @@ export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = [
   // one trigger, so the carve-out cannot become a way to keep an unreachable
   // definer function nobody notices.
   'audit_capture',
+  // STEP 8 (OPEN-7) adds the seventh and eighth, and they split ADR-006 §7's
+  // standing rule cleanly between them — which is the useful thing to notice
+  // about the pair rather than the count.
+  //
+  // `set_password` is EXEMPT from rule (a), on the same ground `register_tenant`
+  // is: it runs PRE-AUTHENTICATION. There is no session and no active tenant, so
+  // "is the caller an admin of the active tenant" is undefined, not skipped. Its
+  // authorisation is the invite token — 244 bits, single-use, 72h, SHA-256 at
+  // rest — checked in the body, plus a monotonic guard that permits only the
+  // placeholder -> real transition so it can never overwrite a usable password.
+  //
+  // `list_pending_invites` is fully BOUND by rule (a) and (b): it acts for an
+  // authenticated admin, so it checks live-admin-of-active-tenant explicitly and
+  // takes the tenant from `app.current_tenant` rather than a parameter. It has to
+  // be a definer function for a reason that looks like a mere read: the pending
+  // predicate is `users.password_set_at`, which is withheld from `meterlog_app`
+  // by column grant, so an app-role query naming it fails `permission denied`.
+  'set_password',
+  'list_pending_invites',
 ];
 
 /**
@@ -203,6 +252,21 @@ export const ISOLATION_BESPOKE_TABLES: readonly string[] = [
   // future change that removes one — say, granting the app role INSERT — must not
   // read as license to move the table back into the matrix.
   'audit_log',
+  // STEP 8 (OPEN-7). Excluded for the STRONGEST form of the second reason above:
+  // the generic matrix seeds through the app role, and the app role holds no
+  // privilege of ANY kind on `invite_tokens` — not even SELECT. Its INSERT case
+  // asserts an RLS `WITH CHECK` rejection and explicitly asserts `permission
+  // denied` ABSENT, so a fixture here would fail about GRANTS while claiming to
+  // be about isolation, and the only way to make it pass would be to grant the
+  // app role access to a credential table.
+  //
+  // Its tenant-scoping is proven instead by `set-password.spec.ts`, which drives
+  // the two definer functions directly as `meterlog_app` with the GUCs set by
+  // hand — the `membership-writes.spec.ts` standard of proof, and mandatory for
+  // the same reason: these functions' tenant scoping is enforced by their bodies
+  // alone, because `invite_tokens_definer` is `USING (true) WITH CHECK (true)`
+  // and constrains nothing.
+  'invite_tokens',
 ];
 
 /**

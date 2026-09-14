@@ -1,7 +1,7 @@
 /**
  * THE AUDIT ACTION VOCABULARY — the single source, mirrored from ADR-012.
  *
- * Fourteen values over the eleven named mutation types. The three that are not
+ * Fifteen values over the twelve named mutation types. The four that are not
  * one-to-one with a mutation are worth knowing before reading the list:
  *
  *   * `asset_event.created` is the SECOND HALF of two mutations, not a mutation
@@ -14,8 +14,16 @@
  *   * `membership.updated` is a total-function fallback in the trigger and is
  *     UNREACHABLE today. Its appearance in real data is a signal that a
  *     membership write path was added without extending this vocabulary.
+ *   * `user.password_set` (step 8, OPEN-7) is the FIRST value that can never
+ *     appear in a response from this API, and that is by design rather than an
+ *     oversight. `set_password` is token-authenticated and pre-session, so the
+ *     trigger finds no actor and no tenant and writes NULL for both — ADR-013's
+ *     bootstrap class, which matches no tenant policy and is readable only by
+ *     direct database access. It is in this list anyway because the list is
+ *     asserted set-equal to the database enum in both directions; omitting it
+ *     would turn a deliberate invisibility into a failing test. See ADR-016.
  *
- * WHY THIS FILE EXISTS RATHER THAN AN INLINE LIST IN THE DTO. The same fourteen
+ * WHY THIS FILE EXISTS RATHER THAN AN INLINE LIST IN THE DTO. The same fifteen
  * values are the Postgres `audit_action` enum, the filter's accepted input, the
  * OpenAPI enum and the response type. Four copies is three chances to drift, and
  * the drift would be silent in the worst direction: a value missing from the DTO
@@ -32,6 +40,7 @@
  */
 export const AUDIT_ACTIONS = [
   'user.created',
+  'user.password_set',
   'membership.created',
   'membership.role_changed',
   'membership.revoked',

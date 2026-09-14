@@ -1,5 +1,6 @@
 import { Algorithm, hash as argonHash, verify as argonVerify } from '@node-rs/argon2';
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -34,6 +35,17 @@ export interface Identity {
  * would silently never fire and turn a 409 into a 500 (ARCHITECTURE §16.2).
  */
 const UNIQUE_VIOLATION = '23505';
+
+/**
+ * SQLSTATEs raised by `set_password` (`20260915000000`, ADR-016).
+ *
+ * Custom codes for the reason the step-5 functions use custom codes: `42501` is
+ * what Postgres itself raises for a plain table-privilege denial, so a handler
+ * keyed on it would fire for a misconfigured GRANT that never reached the
+ * function body — a mapping that looks right and proves nothing.
+ */
+const INVALID_TOKEN = 'SP001';
+const PASSWORD_ALREADY_SET = 'SP002';
 
 /**
  * The single source of truth for password-hashing cost (ADR-001, argon2id).
@@ -116,15 +128,38 @@ export class AuthService {
     >(`SELECT id, password_hash, deleted_at FROM public.login_lookup($1::citext)`, input.email);
 
     // One generic failure for every reason, so the endpoint cannot be used to
-    // enumerate accounts. The hash is still verified when no user was found, so
-    // the response time does not answer the question either.
-    const ok =
-      credential !== undefined &&
-      credential.deleted_at === null &&
-      (await verifyQuietly(credential.password_hash, input.password));
-
-    if (!ok || !credential) {
+    // enumerate accounts — and EXACTLY ONE argon2 verify on every path, so the
+    // response time cannot answer the question either.
+    //
+    // THE `else` IS LOAD-BEARING AND WAS A REAL BUG UNTIL STEP 8. This block
+    // previously computed `ok` as a short-circuiting `&&` chain and then ran the
+    // dummy verify UNCONDITIONALLY inside the failure branch. That gave:
+    //
+    //   unknown email   -> chain short-circuits, dummy verify        = 1 verify
+    //   soft-deleted    -> chain short-circuits, dummy verify        = 1 verify
+    //   wrong password  -> REAL verify, then ALSO the dummy verify   = 2 verifies
+    //
+    // — a reproducible ~2x split between "this address exists" and "it does
+    // not", which is precisely the user-enumeration oracle the dummy verify was
+    // introduced to close. It was measured, not theorised: the step-8 login
+    // triple showed the unknown-email branch consistently at half the cost of the
+    // other two across six runs. `ISOLATION.md` §8 claimed the two branches cost
+    // the same; they did not.
+    //
+    // So the dummy is now the ELSE of the real verify rather than an addition to
+    // it. Every path through this block performs one verify and no path performs
+    // two. Do not "simplify" this back into a single boolean chain.
+    let verified = false;
+    if (credential !== undefined && credential.deleted_at === null) {
+      verified = await verifyQuietly(credential.password_hash, input.password);
+    } else {
+      // No real hash was available to check, so spend the equivalent work. The
+      // target is derived from ARGON2_OPTIONS, never a literal, so tuning the
+      // cost cannot silently make this branch cheaper than the one above.
       await argonVerify(await dummyVerifyTarget(), input.password).catch(() => false);
+    }
+
+    if (!verified || !credential) {
       throw new UnauthorizedException({
         error: { code: 'INVALID_CREDENTIALS', message: 'Email or password is incorrect.' },
       });
@@ -160,6 +195,71 @@ export class AuthService {
         workspaces,
       },
     };
+  }
+
+  // --------------------------------------------------------- set password
+  /**
+   * Redeem an invite token and set the account's first password (OPEN-7,
+   * ADR-016). Closes the dead-end `invite_member` has created since step 5.
+   *
+   * RUNS PRE-AUTHENTICATION, like `register`, and for the same structural reason:
+   * the caller cannot log in yet — that is the entire problem being solved. The
+   * token is the authentication. Everything that makes that safe lives in the
+   * `set_password` definer function and is proven there, not here:
+   * single-use consume, 72h TTL, SHA-256 at rest, and a monotonic guard that
+   * permits only the placeholder -> real transition so a valid token can never
+   * overwrite a usable password.
+   *
+   * DELIBERATELY DOES NOT LOG THE USER IN. Same call as `register`: the flow
+   * stays single-purpose and the client posts to `/auth/login` afterwards. It
+   * also keeps this endpoint from having to mint a session for an identity whose
+   * workspaces it has not resolved.
+   *
+   * The hash is computed here, at `ARGON2_OPTIONS`, for the reason ADR-006 §7
+   * gives about the invite sentinel: argon2 cannot be computed in SQL, and a
+   * second call site that omitted the options would inherit library defaults that
+   * agree with production only by coincidence.
+   */
+  async setPassword(input: { token: string; password: string }): Promise<void> {
+    const passwordHash = await argonHash(input.password, ARGON2_OPTIONS);
+
+    try {
+      await this.prisma.$queryRawUnsafe(
+        `SELECT public.set_password($1::text, $2::text)`,
+        input.token,
+        passwordHash,
+      );
+    } catch (error) {
+      const code = sqlState(error);
+
+      // SP001 covers unknown, forged, expired AND already-consumed, as ONE code.
+      // That collapsing happens in the function body on purpose — the token is a
+      // bearer secret, and telling a caller that a token is "expired" rather than
+      // "unknown" confirms it was once real. Preserved here rather than
+      // re-expanded: this handler must not become the place the oracle reopens.
+      if (code === INVALID_TOKEN) {
+        throw new BadRequestException({
+          error: {
+            code: 'INVALID_TOKEN',
+            message: 'That invitation link is invalid or has expired. Ask an admin for a new one.',
+          },
+        });
+      }
+
+      // SP002 is safe to distinguish precisely because reaching it requires
+      // already holding a VALID token, so it discloses nothing the caller did not
+      // have. 409 rather than 400: the request was well-formed, the state was not.
+      if (code === PASSWORD_ALREADY_SET) {
+        throw new ConflictException({
+          error: {
+            code: 'PASSWORD_ALREADY_SET',
+            message: 'That account already has a password. Sign in, or reset it instead.',
+          },
+        });
+      }
+
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------------- switch
@@ -248,6 +348,14 @@ async function readWorkspaces(tx: Prisma.TransactionClient, userId: string): Pro
     userId,
   );
   return rows.map((r) => ({ tenantId: r.tenant_id, name: r.name, role: r.role }));
+}
+
+/** Prisma surfaces a raised SQLSTATE structurally as `meta.code` (never message text). */
+function sqlState(error: unknown): string | undefined {
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    return (error.meta as { code?: string } | undefined)?.code;
+  }
+  return undefined;
 }
 
 function isUniqueViolation(error: unknown): boolean {

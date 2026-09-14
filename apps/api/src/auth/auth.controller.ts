@@ -10,7 +10,7 @@ import {
   SessionService,
 } from '../common/session/session.service';
 import { AuthService, Identity } from './auth.service';
-import { LoginDto, RegisterDto, SwitchTenantDto } from './dto/auth.dto';
+import { LoginDto, RegisterDto, SetPasswordDto, SwitchTenantDto } from './dto/auth.dto';
 
 /** Cookie attributes. `httpOnly` is the point: script must never reach the id. */
 function cookieOptions(): {
@@ -57,6 +57,26 @@ export class AuthController {
     const { cookie, identity } = await this.auth.login(dto);
     response.cookie(SESSION_COOKIE, cookie, cookieOptions());
     return identity;
+  }
+
+  /**
+   * NO `@RequiresSession()`, and that is the whole point rather than an omission:
+   * the caller is someone who CANNOT log in yet. The token is the authentication
+   * and it is verified inside the `set_password` definer function (OPEN-7,
+   * ADR-016).
+   *
+   * 204 rather than 200-with-a-body: there is nothing to return that the caller
+   * does not already know, and returning the user id or email would turn a
+   * pre-auth endpoint into a lookup for anyone holding a token.
+   */
+  @Post('set-password')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary:
+      'Redeem an invite token and set the account first password. 400 for an invalid or expired token; 409 if the account already has one.',
+  })
+  async setPassword(@Body() dto: SetPasswordDto): Promise<void> {
+    await this.auth.setPassword(dto);
   }
 
   @Post('switch')

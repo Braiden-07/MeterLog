@@ -113,23 +113,11 @@ describe('revocation over HTTP, driven by a real revoke (step-5 phase 3)', () =>
       .expect(201);
     const adminCookie = await login('admin@acme.test');
 
-    const invited = await http()
-      .post('/api/v1/users')
-      .set('Cookie', adminCookie)
-      .send({ email: 'm@acme.test', role: 'technician' })
-      .expect(201);
-    const membershipId: string = invited.body.membershipId;
-
-    // The invited identity carries the sentinel hash and cannot authenticate, by
-    // design (ADR-006 §7). Give M a usable credential the only way available
-    // until the set-password flow lands: copy the admin's hash as the migration
-    // role. This is fixture plumbing, not a product path.
-    await migrator.$executeRawUnsafe(
-      `UPDATE public.users SET password_hash =
-         (SELECT password_hash FROM public.users WHERE email = 'admin@acme.test'::citext)
-       WHERE email = 'm@acme.test'::citext`,
+    const { membershipId, cookie: mCookie } = await inviteAndActivate(
+      adminCookie,
+      'm@acme.test',
+      'technician',
     );
-    const mCookie = await login('m@acme.test');
 
     // --- request 1: M works, and we learn which backend served it ---
     const first = await http().get('/api/v1/users').set('Cookie', mCookie).expect(200);
@@ -178,23 +166,14 @@ describe('revocation over HTTP, driven by a real revoke (step-5 phase 3)', () =>
       .expect(201);
     const adminCookie = await login('admin@acme.test');
 
-    const invited = await http()
-      .post('/api/v1/users')
-      .set('Cookie', adminCookie)
-      .send({ email: 'm@acme.test', role: 'technician' })
-      .expect(201);
-    await migrator.$executeRawUnsafe(
-      `UPDATE public.users SET password_hash =
-         (SELECT password_hash FROM public.users WHERE email = 'admin@acme.test'::citext)
-       WHERE email = 'm@acme.test'::citext`,
+    const { membershipId, cookie: mCookie } = await inviteAndActivate(
+      adminCookie,
+      'm@acme.test',
+      'technician',
     );
-    const mCookie = await login('m@acme.test');
 
     await http().get('/api/v1/auth/me').set('Cookie', mCookie).expect(200);
-    await http()
-      .delete(`/api/v1/users/${invited.body.membershipId}`)
-      .set('Cookie', adminCookie)
-      .expect(204);
+    await http().delete(`/api/v1/users/${membershipId}`).set('Cookie', adminCookie).expect(204);
 
     await http().get('/api/v1/auth/me').set('Cookie', mCookie).expect(403);
 
@@ -212,16 +191,9 @@ describe('revocation over HTTP, driven by a real revoke (step-5 phase 3)', () =>
       .expect(201);
     const adminCookie = await login('admin@acme.test');
 
-    const invited = await http()
-      .post('/api/v1/users')
-      .set('Cookie', adminCookie)
-      .send({ email: 'm@acme.test', role: 'technician' })
-      .expect(201);
+    const { membershipId } = await inviteAndActivate(adminCookie, 'm@acme.test', 'technician');
 
-    await http()
-      .delete(`/api/v1/users/${invited.body.membershipId}`)
-      .set('Cookie', adminCookie)
-      .expect(204);
+    await http().delete(`/api/v1/users/${membershipId}`).set('Cookie', adminCookie).expect(204);
 
     const me = await http().get('/api/v1/auth/me').set('Cookie', adminCookie).expect(200);
     expect(me.body.activeWorkspace).toMatchObject({ name: 'Acme Metering', role: 'admin' });
@@ -230,6 +202,57 @@ describe('revocation over HTTP, driven by a real revoke (step-5 phase 3)', () =>
     expect(list.body).toHaveLength(1);
     expect(list.body[0].email).toBe('admin@acme.test');
   });
+
+  /**
+   * Invite someone and activate them THROUGH THE PRODUCT — invite, read the
+   * pending list for the minted token, redeem it, log in.
+   *
+   * STEP 8 REPLACED THE FIXTURE THAT USED TO LIVE HERE, and the replacement is
+   * the point rather than a tidy-up. Until OPEN-7 landed, these tests gave the
+   * invitee a usable credential by copying the admin's `password_hash` as the
+   * MIGRATION ROLE — plumbing that existed only because no product path could do
+   * it, and which each call site apologised for in a comment. That path now
+   * exists, so the fixture uses it and the apology is deleted.
+   *
+   * It also returns the membership id, which the invite response no longer
+   * carries (ADR-016: `userCreated` and its companions came off the wire). Read
+   * from `GET /users` — which is exactly the argument for dropping them being
+   * safe: the invitee is a member of the caller's tenant either way, so the id
+   * was always readable here and nothing was hidden by returning it.
+   */
+  async function inviteAndActivate(
+    adminCookie: string,
+    email: string,
+    role: string,
+  ): Promise<{ membershipId: string; cookie: string }> {
+    await http()
+      .post('/api/v1/users')
+      .set('Cookie', adminCookie)
+      .send({ email, role })
+      .expect(201);
+
+    const pending = await http()
+      .get('/api/v1/users/pending')
+      .set('Cookie', adminCookie)
+      .expect(200);
+    const invite = (pending.body as { email: string; token: string }[]).find(
+      (p) => p.email === email,
+    );
+    if (!invite) throw new Error(`${email} did not appear in the pending-invite list`);
+
+    await http()
+      .post('/api/v1/auth/set-password')
+      .send({ token: invite.token, password: PASSWORD })
+      .expect(204);
+
+    const list = await http().get('/api/v1/users').set('Cookie', adminCookie).expect(200);
+    const member = (list.body as { email: string; membershipId: string }[]).find(
+      (m) => m.email === email,
+    );
+    if (!member) throw new Error(`${email} is not in the member list after invite`);
+
+    return { membershipId: member.membershipId, cookie: await login(email) };
+  }
 
   async function deletedAt(membershipId: string): Promise<Date | null> {
     const [row] = await migrator.$queryRawUnsafe<{ deleted_at: Date | null }[]>(

@@ -21,6 +21,24 @@ export interface Member {
 }
 
 /**
+ * A pending invite, with its freshly minted plaintext token (OPEN-7, ADR-016).
+ *
+ * `token` is the ONLY place the plaintext ever exists outside the invitee's link
+ * — the table stores a SHA-256 hash — so this response is not cacheable and must
+ * not be logged. It is returned to a tenant admin reading their own workspace,
+ * and to nobody else.
+ */
+export interface PendingInvite {
+  membershipId: string;
+  userId: string;
+  email: string;
+  role: string;
+  invitedAt: Date;
+  token: string;
+  expiresAt: Date;
+}
+
+/**
  * SQLSTATEs raised by the step-5 definer functions
  * (`20260909000000_membership_write_functions`).
  *
@@ -40,6 +58,16 @@ const NOT_ADMIN = 'MB001';
 const MEMBERSHIP_NOT_FOUND = 'MB002';
 const LAST_ADMIN = 'MB003';
 const UNIQUE_VIOLATION = '23505';
+
+/**
+ * `list_pending_invites`'s admin refusal (`20260915000000`, ADR-016). A SEPARATE
+ * code from `MB001` even though both mean "not a live admin of the active
+ * tenant", because they come from different function bodies — and the step-5
+ * lesson is exactly that two layers answering identically are two layers you
+ * cannot tell apart when one of them breaks. Mapped to the same 403 / `NOT_ADMIN`
+ * envelope, so the API contract stays uniform while the source stays legible.
+ */
+const PENDING_NOT_ADMIN = 'SP003';
 
 @Injectable()
 export class MembershipsService {
@@ -100,11 +128,7 @@ export class MembershipsService {
    * The invited account is therefore deliberately unusable until a set-password
    * flow lands in a later step — the known, recorded dead-end in DECISIONS.
    */
-  async invite(input: { email: string; role: string }): Promise<{
-    membershipId: string;
-    userId: string;
-    userCreated: boolean;
-  }> {
+  async invite(input: { email: string; role: string }): Promise<void> {
     const { tx } = requireRequestContext();
     const sentinel = await argonHash(randomUUID(), ARGON2_OPTIONS);
 
@@ -118,11 +142,30 @@ export class MembershipsService {
         sentinel,
       );
       if (!row) throw new Error('invite_member returned no row');
-      return {
-        membershipId: row.membership_id,
-        userId: row.user_id,
-        userCreated: row.user_created,
-      };
+
+      // `user_created` IS READ AND THEN DROPPED ON THE FLOOR, DELIBERATELY.
+      //
+      // The function still returns it and its signature is deliberately
+      // untouched — the flag is what distinguishes "created a pending identity,
+      // which needs a token" from "attached a membership to someone who already
+      // has a usable password, which must NOT get one". That branch is real and
+      // it lives here, in the server.
+      //
+      // WHAT IT MUST NEVER DO IS REACH THE RESPONSE. `userCreated` was on the
+      // wire until step 8, and it is an account-existence oracle for any tenant
+      // admin: invite an address, read the flag, learn whether that person holds
+      // an account ANYWHERE in the system — across every tenant, including ones
+      // the caller cannot see. The invite response is now uniform for both
+      // branches (see the controller), and this is the line where the flag stops.
+      //
+      // Token issuance is NOT done here. It happens on the pending-invites read,
+      // because the token is hashed at rest and therefore cannot be re-displayed
+      // later — so it is minted when it is about to be shown, and never returned
+      // from this endpoint. An existing credentialled user is pending-false, so
+      // they never appear in that read and never get a token; that is the same
+      // predicate this flag describes, enforced where it matters rather than
+      // trusted from here.
+      void row.user_created;
     } catch (error) {
       throw translate(error, {
         [UNIQUE_VIOLATION]: () =>
@@ -133,6 +176,59 @@ export class MembershipsService {
             },
           }),
       });
+    }
+  }
+
+  /**
+   * Pending invites for the ACTIVE workspace, each with a freshly minted
+   * redemption token (OPEN-7, ADR-016).
+   *
+   * MINT-ON-READ IS FORCED BY THE STORAGE DECISION, not chosen for convenience.
+   * Tokens are hashed at rest with SHA-256, so the server holds no plaintext it
+   * could re-display. Every read therefore issues a NEW token and supersedes the
+   * prior live one for that invite, which also makes re-invite this same call
+   * with no special case: a still-pending person whose token expired is simply
+   * listed again and handed a new one.
+   *
+   * IT IS A DEFINER CALL EVEN THOUGH IT READS. The pending predicate is
+   * `users.password_set_at`, withheld from `meterlog_app` by column grant so the
+   * login path cannot branch on it (ADR-006 §7 hazard (ii)); an app-role query
+   * naming that column fails `permission denied`. The tenant scoping and the
+   * admin check are both enforced in the function body, because
+   * `invite_tokens_definer` is `USING (true) WITH CHECK (true)` and constrains
+   * nothing — the DECISION B consequence, restated for a new function.
+   *
+   * ANTI-ENUMERATION IS DONE BY ISOLATION. The caller sees only their own
+   * tenant's pending invites, so there is no cross-tenant address space to walk
+   * and nothing to sign — the same reason the audit cursor is unsigned.
+   */
+  async pendingInvites(): Promise<PendingInvite[]> {
+    const { tx } = requireRequestContext();
+
+    try {
+      const rows = await tx.$queryRawUnsafe<
+        {
+          membership_id: string;
+          user_id: string;
+          email: string;
+          role: string;
+          invited_at: Date;
+          token: string;
+          expires_at: Date;
+        }[]
+      >(`SELECT * FROM public.list_pending_invites()`);
+
+      return rows.map((r) => ({
+        membershipId: r.membership_id,
+        userId: r.user_id,
+        email: r.email,
+        role: r.role,
+        invitedAt: r.invited_at,
+        token: r.token,
+        expiresAt: r.expires_at,
+      }));
+    } catch (error) {
+      throw translate(error);
     }
   }
 
@@ -203,6 +299,7 @@ function translate(error: unknown, extra: Record<string, () => Error> = {}): Err
 
   switch (code) {
     case NOT_ADMIN:
+    case PENDING_NOT_ADMIN:
       return new ForbiddenException({
         error: {
           // NOT the gate's `FORBIDDEN_ROLE` — see the note above. Same status,
