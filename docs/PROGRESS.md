@@ -5,8 +5,10 @@
 
 ## Status
 
-- **Current milestone:** v0.1 — auth & tenancy foundation
-- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy), 5 (RBAC + membership management) and 6 (domain entities) **complete and merged**. **Step 7 (audit module) COMPLETE — 7a (capture, merged as PR #15) and 7b (the read surface) — so `audit_log`, the brief's fifth and final table, is built, captured, immutable by grant and readable by admin/auditor.** The v1.0 schema is complete. OPEN-4 and OPEN-6 **DONE**. Next: **step 8** — OPEN-7, the set-password / invite-token flow; OPEN-9 (hard delete) remains deferred and is now unblocked.
+- **Current milestone:** v0.9 — backend feature-complete for v1.0; frontend, e2e and deploy outstanding
+- **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy), 5 (RBAC + membership management) and 6 (domain entities) **complete and merged**. **Step 7 (audit module) COMPLETE — 7a (capture, merged as PR #15) and 7b (the read surface) — so `audit_log`, the brief's fifth and final table, is built, captured, immutable by grant and readable by admin/auditor.** The v1.0 schema is complete at **eight core tables**, plus `invite_tokens` as an implementation table (§5). **The OPEN-7 slice is COMPLETE AND MERGED** — invited users can set a password and log in (PR #19, `39eb741`), and `login_lookup`'s result signature is pinned (PR #20, `07bee36`). OPEN-4, OPEN-6 and OPEN-7 **DONE**; OPEN-9 (hard delete) remains deferred and its audit gate is now satisfied; OPEN-10, OPEN-11 and OPEN-12 enrolled at the post-step-8 reconciliation.
+- **Next: the FRONTEND slice (`PROJECT_BRIEF` §11 step 8)** — auth pages, asset list and detail, record reading / maintenance, the audit view, admin user management. `apps/web` is still the scaffold. Take the tenant-isolation parts first: ADR-006 §9 already scopes the workspace switcher and requires the TanStack Query cache to be keyed by active `tenant_id` (or reset on switch), because RLS protects the database and the browser cache does not know tenants exist.
+- **A NUMBERING DIVERGENCE, RECORDED SO THE NEXT READER IS NOT MISLED.** “Step 8” in this file means two different things. `PROJECT_BRIEF` §11 step 8 is the **frontend**; the Open items register scheduled **OPEN-7** into the step-8 slot and called it the “first slice”, and the two sections appended at the foot of this file drop the `(§11 step N)` tag every earlier entry carries. So repo-“step 8” (OPEN-7, shipped) is **not** brief-§11-step-8 (frontend, not started). History is not renumbered — that would invalidate every entry that cites a step by number — it is disambiguated here.
 - **Blockers:** —
 - **Standing deployment risk (read before step 10):** locally and in CI the migration role is the cluster bootstrap **superuser**; on Render it is not. A superuser satisfies `pg_has_role` unconditionally and bypasses RLS, so a whole class of privilege defect is **invisible in both environments where the tests run** and appears for the first time against Render — green CI does not cover it. Concretely: `ALTER FUNCTION ... OWNER TO meterlog_definer` needs _membership_ in that role, and Postgres matches RLS policy roles by **membership**, so a migration role left inside `meterlog_definer` silently acquires every `TO meterlog_definer USING (true)` policy on every identity table — the FORCE-RLS bypass the three-role model exists to prevent, reintroduced through role membership. `20260908000000_auth_definer_functions` grants that membership only if missing and **revokes it again**; do not collapse that into a standing grant. It is also the **first migration that would have failed on Render**. Checklist in [`ARCHITECTURE.md` §16.1](./ARCHITECTURE.md).
 
@@ -921,7 +923,7 @@ Fixed by schema-qualifying the operator, `u.email OPERATOR(public.=) p_email` �
 
 ## Step 8, first slice — OPEN-7: the invited-user set-password / invite-token flow
 
-**Status: complete, at the PR. Not merged. Step 9 not started.**
+**Status: COMPLETE AND MERGED — PR #19, `39eb741`.** (This line read “complete, at the PR. Not merged” until the post-step-8 reconciliation, which is how long a status line written at the gate survives being true.)
 
 Closes the dead-end `invite_member` has carried since step 5: an invited person could not log in (sentinel hash) and could not register their own organisation (email taken). Full reasoning in **ADR-016**; OPEN-7 is marked DONE in the register.
 
@@ -967,7 +969,7 @@ Migration applied to a **dropped-and-recreated schema** (the CI path), not just 
 
 ## Step 8 close-out — `login_lookup`'s result signature pinned (ADR-017)
 
-**Status: at the PR. Not merged. Step 8 is now complete; step 9 not started.**
+**Status: MERGED — PR #20, `07bee36`. The OPEN-7 slice is complete.** The frontend (`PROJECT_BRIEF` §11 step 8) is the next slice and is not started; see the numbering note in Status.
 
 Test-file and docs only — no migration, no `src`, no API surface. `login_lookup` itself is untouched; what changes is that its shape is now asserted.
 

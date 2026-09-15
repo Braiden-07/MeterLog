@@ -58,6 +58,12 @@ This introduces a **two-axis RLS model** — one axis keyed on the acting user (
 
 **Attribution FKs unchanged in shape.** `created_by`, `actor_user_id`, etc. continue to reference **`users.id`** (the person). The tenant is already on each row via `tenant_id`, so person-level attribution plus the row's tenant is sufficient. If the _role at the time of action_ is worth auditing, capture it in the `audit_log.after`/payload rather than adding a membership FK to every table — **OPEN-4**.
 
+> **Label reconciliation — “Variant C” is the attribution rule in the paragraph above, and this ADR never named it that.** Two applied migrations attribute to the person and cite the rule as `ADR-006 §2, “Variant C”` — `20260911000000_domain_readings` on `readings.created_by`, and `20260913000000_domain_maintenance_records` on `maintenance_records.created_by`. The **rule** they describe is exactly this one and is correct: a `users` row carries no `tenant_id`, so the row's own `tenant_id` plus the person is sufficient attribution, and no membership FK is added to any table. The **label** is not: the string “Variant C” appears nowhere in this ADR, so a reader who meets it in a migration and greps for it here finds nothing and cannot tell whether they are missing a section or reading a stale name.
+>
+> **It is also a name this document uses for something else.** §3 and §7 run **DECISION A / B / C** for the membership-WRITE design — B chosen, C (a role term in an RLS policy) rejected outright. A reader who resolves “Variant C” against the only lettered alternatives in the file lands on the **rejected** option, attached to two live migrations. That is worse than an unresolvable label.
+>
+> **Recorded here rather than corrected there, and that is forced.** Both migrations are applied and their checksums are immutable, so the comment cannot be edited without invalidating them — the same constraint under which `20260915000000` notes that “the correction lives in this block rather than in them”. This paragraph is the resolution the citation needs, so the grep now lands. **Any new citation of this rule should name it “ADR-006 §2 attribution”, not “Variant C”.**
+
 ### 3. RLS model — two axes
 
 Two request-scoped GUCs, both set by the interceptor inside the per-request transaction (extending ADR-004's single-GUC design):
