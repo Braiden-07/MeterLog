@@ -925,4 +925,93 @@ describe('RLS catalog coverage', () => {
     );
     expect(present.map((r) => r.relname)).toEqual([...APP_UNREADABLE_DEFINER_TABLES].sort());
   });
+
+  it("21. login_lookup's RESULT SIGNATURE is exactly the identity columns", async () => {
+    // STEP 8 CLOSE-OUT (ADR-017). THE FLOOR UNDER THE ONE PATH THE GRANT CANNOT
+    // REACH.
+    //
+    // Assertions 18-20 pin the column grants, and they are real: `meterlog_app`
+    // holds no privilege on `users.password_set_at`, so the login path cannot
+    // read it, and RLS would return zero rows anyway because login runs
+    // pre-session with no GUCs set. A direct read from the login path produces a
+    // 500, not an oracle. Both were verified live at step 8.
+    //
+    // **NEITHER DEFENCE REACHES INSIDE A SECURITY DEFINER FUNCTION.** `login_lookup`
+    // runs as `meterlog_definer`, which holds table-wide SELECT on `users`, and
+    // it is exempt from the app-role policies. So adding `password_set_at` to its
+    // `RETURNS TABLE` hands the pending flag straight to the login path with no
+    // grant and no policy in the way — a two-line change that looks entirely
+    // reasonable, touches no grant, and reds none of 18-20. It was verified by
+    // mutation at step 8: the pending branch dropped to ~15ms against ~43ms for
+    // the others, an excess of 1.09x an argon2 verify.
+    //
+    // A GRANT FLOOR CANNOT COVER A DEFINER FUNCTION'S RETURN. The only structural
+    // thing that can is the function's own result signature, so that is what this
+    // pins — as an EQUALITY against the live-verified string, not a "does not
+    // contain password_set_at" denylist. Equality is the point: a denylist catches
+    // the column we thought of, while ANY new column on this function's return is
+    // an unreviewed widening of what the pre-authentication path can see.
+    //
+    // WHY IDENTITY-ONLY IS THE RIGHT SHAPE. `login_lookup` answers exactly one
+    // question — "is there an account for this address, and what do I verify a
+    // password against" — so it returns the row id, the hash to verify, and
+    // `deleted_at` (returned rather than filtered on, because distinguishing "no
+    // such account" from "deactivated" is the caller's decision; login answers
+    // both with the same generic failure). Anything describing account STATE
+    // rather than identity is, by construction, something the login path could
+    // branch on, and ADR-006 §7 hazard (ii) is that any such branch is a timing
+    // oracle.
+    //
+    // NOT FOLDED INTO ASSERTION 4, deliberately. Assertion 4 is documented as a
+    // SUBSET check — "a listed function that does not exist yet is only a
+    // declaration" — and this is an EQUALITY on one specific function. Putting an
+    // equality inside an assertion whose contract says one-directional would make
+    // that docstring wrong, which is the exact defect class this step has been
+    // about. Separate assertion, separate failure message, same query shape.
+    //
+    // SCOPED TO login_lookup ONLY. Generalizing the signature pin to all seven
+    // definer functions is the better end state and is recorded as a forward
+    // marker in ADR-017 rather than done here — it requires deciding the expected
+    // signature for each, including `audit_capture`, whose trigger-function shape
+    // already forced assertion 12 to be narrowed once.
+    const rows = await db.$queryRawUnsafe<
+      { function_name: string; result_signature: string; is_definer: boolean }[]
+    >(`
+      SELECT p.proname               AS function_name,
+             pg_get_function_result(p.oid) AS result_signature,
+             p.prosecdef             AS is_definer
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname = 'login_lookup'
+      ORDER BY 1
+    `);
+
+    // Non-vacuity, and it is load-bearing here: an equality over an empty result
+    // set passes trivially, so a renamed or dropped `login_lookup` would satisfy
+    // the check below while the thing being pinned no longer existed. The
+    // `readWorkspaces` lesson — zero rows is not evidence.
+    expect(rows, 'login_lookup is missing, or is overloaded — either is a reviewed change').toHaveLength(
+      1,
+    );
+
+    // The premise, stated rather than assumed. This assertion exists BECAUSE the
+    // function is definer-rights; if it ever became invoker-rights the column
+    // grant would start applying and the security argument would change shape,
+    // which is a decision to make deliberately, not to discover.
+    expect(rows[0]?.is_definer, 'login_lookup must remain SECURITY DEFINER (ADR-006 §6)').toBe(true);
+
+    // The pin. This string is the LIVE signature read back from the catalog, not
+    // a transcription: Postgres renders the type as `timestamp with time zone`,
+    // never the `timestamptz` alias, and a hand-written expectation using the
+    // alias would fail against a perfectly correct database.
+    expect(
+      rows[0]?.result_signature,
+      'login_lookup\'s return shape changed. It is the ONE path into the pre-authentication ' +
+        'login flow that the column grants (assertions 18-20) and RLS cannot reach, because a ' +
+        'SECURITY DEFINER function reads `users` as meterlog_definer under its own policy. ' +
+        'Adding a column here — `password_set_at` above all — gives the login path something to ' +
+        'branch on, and ADR-006 §7 hazard (ii) is that such a branch is a remotely observable ' +
+        'user-enumeration oracle. If this change is intended, it needs an ADR, not a passing test.',
+    ).toBe('TABLE(id uuid, password_hash text, deleted_at timestamp with time zone)');
+  });
 });

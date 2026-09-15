@@ -751,6 +751,8 @@ A second trap was hit while writing it: **`information_schema` is privilege-filt
 
   **So the timing test is not a backstop for that path; it is the only cover.** Recorded plainly because the natural reading of “the grant is the floor” is that the test is redundant, and for the definer path it is the reverse. The two defences cover different routes to the same hazard, and neither subsumes the other.
 
+  > **SUPERSEDED AT THE STEP-8 CLOSE-OUT BY [ADR-017](#adr-017--login_lookups-result-signature-is-pinned-because-a-grant-floor-cannot-reach-inside-a-definer-function).** The sentence above was true when written and is no longer: catalog assertion 21 now pins `login_lookup`'s result signature as an equality, so a column added to its `RETURNS TABLE` reds deterministically on a catalog read. **The paragraph is left as written rather than rewritten** — it is the record of what was true at the time, and this marker is where the present state lives, the same convention ADR-015's note uses. What carries forward unchanged is the *reasoning*: the grant floor genuinely cannot reach inside a definer function, which is precisely why the signature pin had to be built. The timing test is retained for the class the signature pin cannot see — a change in the **verify path** rather than in the **returned columns**.
+
 ### The second floor: login was NOT timing-uniform, and had not been since step 4
 
 **This was found by the new test, not by review, and it is the most consequential thing in this entry.**
@@ -795,3 +797,54 @@ A reproducible **~2x split between "this address exists" and "it does not"** —
   - **A `?pending=true` filter on `GET /users` instead of a separate route** — rejected. A query parameter that flips a response from "readable by every member" to "admin-only, contains credentials" puts two authorization rules on one route and is one forgotten guard away from leaking.
   - **Distinguishing expired from unknown tokens in the error** — rejected. It confirms to a caller that a token was once real, an oracle over the token space. One code, `SP001`, for all four failure modes; the MB002 reasoning applied to tokens.
   - **Admitting `password_set_at` to the audit allowlist** — rejected, keeping ADR-011's fail-closed default for a new column adjacent to a credential. The action name, `row_id` and `created_at` already carry every fact the diff would have.
+
+## ADR-017 — `login_lookup`'s result signature is pinned, because a grant floor cannot reach inside a definer function
+
+- **Date:** 2026-09-15
+- **Status:** Accepted
+- **Closes:** the last piece of step 8. ADR-016 left this hazard covered by measurement alone; this covers it structurally.
+- **Context:** ADR-016 added `users.password_set_at` and built catalog assertions 18–20 to pin the `users` column grants as an equality, so that `password_set_at` — like `password_hash` before it — is unreadable by `meterlog_app`. ADR-006 §7 hazard (ii) is the reason: anything that lets the login path branch on account state is a **remotely observable user-enumeration oracle**, and the argon2 equalisation exists precisely to prevent a branch that costs nothing.
+
+  **Both defences were verified live, and both are real.** The app role holds no privilege on the column, and RLS returns zero rows in the login path anyway, because login runs pre-session with no GUCs set and no `users` policy matches. An `if (invitePending) return early` that reads the column directly produces a **500, not an oracle**.
+
+  **Neither defence reaches inside a `SECURITY DEFINER` function, and that gap was demonstrated rather than theorised.** `login_lookup` runs as `meterlog_definer`, which holds table-wide `SELECT` on `users`, and it is exempt from the app-role policies by construction. So adding `password_set_at` to its `RETURNS TABLE` hands the pending flag straight to the login path with no grant and no policy in the way. At step 8 that mutation was run: the pending branch dropped to ~15ms against ~43ms for the others, an excess of **1.09x an argon2 verify** against a 0.22ms noise floor. **It touched no grant and reddened none of assertions 18–20.**
+
+  ADR-016 recorded the consequence honestly — that the timing test was the only cover for that path. That is a real guard, and it is retained. It is also the wrong *kind* of guard to be alone: it is a measurement, on a shared runner, of a property that ought to be a catalog fact.
+
+- **Decision:** **Pin `login_lookup`'s result signature as an equality, in catalog assertion 21.**
+
+  The expected signature is the live-verified string, read back from `pg_get_function_result` rather than transcribed:
+
+  ```
+  TABLE(id uuid, password_hash text, deleted_at timestamp with time zone)
+  ```
+
+  Note the rendering: Postgres emits `timestamp with time zone`, never the `timestamptz` alias. A hand-written expectation using the alias fails against a perfectly correct database, which is why the pin was taken from the catalog and not from the migration source.
+
+- **Consequences:**
+
+  - **Why identity-only is the right shape, stated so the pin is a decision rather than a snapshot.** `login_lookup` answers exactly one question: *is there an account for this address, and what do I verify a password against?* It returns the row `id`, the `password_hash` to verify, and `deleted_at` — the last returned rather than filtered on, because distinguishing "no such account" from "deactivated account" is the caller's decision (login answers both with the same generic failure, but the distinction is worth logging). **Anything describing account STATE rather than identity is, by construction, something the login path could branch on.** That is the whole of hazard (ii).
+
+  - **Equality, not a denylist.** The assertion does not check "the signature does not contain `password_set_at`". A denylist catches the column we happened to think of; an equality catches **any** new column, because any new column on this function's return is an unreviewed widening of what the pre-authentication path can see. Same reasoning that made assertion 18 an equality rather than "password_hash is absent".
+
+  - **Proven in both directions, and the side-by-side is the argument for the assertion existing at all.** Widening `login_lookup` to return `password_set_at` reds assertion 21 — **while assertion 18 stays green**. That pair is the gap, demonstrated: the grant floor is structurally blind to a definer function's return, and only the signature pin sees it. Reverting restores green, and the restored signature is byte-identical to the pin.
+
+  - **A literal rolled-back transaction could not be used, and the substitute is stronger.** The test connects separately from the session performing the mutation, so uncommitted DDL is invisible to it — the widening has to commit to be observable at all. The revert is therefore done by dropping the schema and re-running every migration, which proves the restored function matches the committed migration exactly rather than merely undoing an edit.
+
+  - **Non-vacuity is load-bearing here specifically.** An equality over an empty result set passes trivially, so a renamed or dropped `login_lookup` would satisfy the check while the thing being pinned no longer existed. The assertion requires exactly one row first; proven by renaming the function away and confirming it fails on that guard rather than silently passing. Zero rows is not evidence — the same lesson as `readWorkspaces`, ADR-013's bootstrap proof, and assertion 17's attachment list.
+
+  - **The premise is asserted, not assumed.** Assertion 21 also requires `prosecdef` to remain true. This assertion exists *because* the function is definer-rights; if it ever became invoker-rights the column grant would start applying and the security argument would change shape — a decision to make deliberately, not to discover.
+
+  - **NOT folded into assertion 4, deliberately.** Assertion 4 is documented as a **subset** check — "a listed function that does not exist yet is only a declaration" — and this is an **equality** on one specific function. Putting an equality inside an assertion whose contract says one-directional would make that docstring wrong, which is the exact defect class step 8 has been about. Separate assertion, separate failure message, same `pg_proc` query shape.
+
+  - **The timing test is RETAINED, and its recorded justification is corrected rather than left to rot.** `CLAUDE.md` described it as the only cover for this hazard. That was true when written and is now false, and a note describing a superseded state is the defect this step exists to prevent. The split is now recorded accurately: **assertion 21 sees the returned columns; it cannot see the verify path.** A change that skips or short-circuits an argon2 verify adds no column and passes assertion 21 untouched — and that is not hypothetical, it is precisely what the step-8 defect was (one verify for an unknown email, two for a wrong password). That class is only observable by measuring. A structural pin and a behavioural measurement, failing for different reasons, is the design.
+
+  - **Test-only change.** No migration, no API surface, no `src/`. `login_lookup` is untouched; what changes is that its shape is now asserted.
+
+- **FORWARD MARKER — generalize the signature pin to all seven definer functions.** Pinning one function's result is the narrow fix for the hazard OPEN-7 opened. The better end state is that **every** `SECURITY DEFINER` function's result signature is pinned, because every one of them is an enumerated hole in the isolation boundary and every one of them returns data across it. That is deliberately **not** folded into OPEN-7's closure: it requires deciding and justifying the expected signature for each of the seven, and `audit_capture` is not merely more of the same — it is a **trigger function**, returning `trigger`, and its shape already forced assertion 12 to be narrowed once and assertion 16 to be written as the replacement cover. A generalized pin needs that case designed, not pattern-matched. **Owed by:** whichever future phase next touches the definer set.
+
+- **Alternatives considered:**
+  - **Rely on the timing test alone** — the status quo ADR-016 recorded. Rejected: it makes a catalog fact depend on a wall-clock measurement taken on a shared CI runner, and it fails slowly and probabilistically where a structural check fails immediately and deterministically. Retained as a second layer for the class it uniquely covers, not as the primary.
+  - **Withhold `SELECT (password_set_at)` from `meterlog_definer`** — would break `set_password`'s monotonic guard and `list_pending_invites`'s pending predicate, both of which must read the column. The definer needs it; what must not happen is that it *returns* it to the login path.
+  - **A denylist check ("no state columns in the signature")** — rejected above. It requires enumerating in advance every column that counts as state, which is the open-ended half of the problem.
+  - **Fold it into assertion 4** — rejected above: it would contradict assertion 4's documented subset contract.

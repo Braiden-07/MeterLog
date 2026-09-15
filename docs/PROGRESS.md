@@ -962,3 +962,54 @@ Migration applied to a **dropped-and-recreated schema** (the CI path), not just 
 - **Accepted residual (v1.0):** invite timing still distinguishes create-identity from attach-membership. Authenticated, rate-limited admin; leaks existence-anywhere only. The BullMQ mailer in stretch scope erases it once invite becomes fire-and-return.
 - **OPEN-9** (hard delete) still deferred.
 - **Cold-start flake:** one full-suite run failed 16 tests on the very first run after `docker compose up`, with an 88s collect phase; every subsequent run was clean. Not retry-masked (vitest sets only timeouts; the workflow has no retry or continue-on-error), and healthchecks already gate the services. Prime suspect remains the postgres-container false-green — `pg_isready` passing against the temporary initdb server before the real one restarts. If it recurs, **capture the raw failure text**: that hypothesis predicts a connection-reset or "database system is starting up" error, not a timeout, and the two are indistinguishable in a summary.
+
+---
+
+## Step 8 close-out — `login_lookup`'s result signature pinned (ADR-017)
+
+**Status: at the PR. Not merged. Step 8 is now complete; step 9 not started.**
+
+Test-file and docs only — no migration, no `src`, no API surface. `login_lookup` itself is untouched; what changes is that its shape is now asserted.
+
+### Why
+
+ADR-016's assertions 18–20 pin the `users` column grants, and they work: `meterlog_app` cannot read `password_set_at`, and RLS returns zero rows in the login path anyway. **Neither reaches inside a `SECURITY DEFINER` function.** `login_lookup` reads `users` as `meterlog_definer` under its own policy, so adding `password_set_at` to its `RETURNS TABLE` hands the pending flag to the pre-authentication login path with no grant and no policy in the way — the ADR-006 §7 hazard (ii) enumeration oracle, reachable by a two-line change that reds nothing.
+
+### What shipped
+
+**Catalog assertion 21** pins the result signature as an equality against the live-verified string:
+
+```
+TABLE(id uuid, password_hash text, deleted_at timestamp with time zone)
+```
+
+Taken from `pg_get_function_result`, not transcribed — Postgres renders `timestamp with time zone`, never the `timestamptz` alias, so a hand-written expectation would have failed against a correct database.
+
+Equality rather than a denylist: a denylist catches the column we thought of, while *any* new column on this function's return is an unreviewed widening of what the pre-auth path can see.
+
+### Proven
+
+| State | Assertion 21 | Assertion 18 |
+|---|---|---|
+| clean | green | green |
+| `login_lookup` widened with `password_set_at` | **red** | **green** |
+| reverted (schema dropped, all migrations re-run) | green | green |
+| `login_lookup` renamed away | **red** (non-vacuity) | — |
+
+The middle row is the whole argument: the grant floor is structurally blind to a definer function's return, and only the signature pin sees it.
+
+A literal rolled-back transaction was not usable — the test connects separately, so uncommitted DDL is invisible to it and the widening must commit to be observable. The revert is done by dropping the schema and re-running every migration, which proves the restored function matches the committed migration exactly.
+
+### The timing test is retained, and its justification corrected
+
+`CLAUDE.md` recorded the timing test as the *only* cover for this hazard. True when written, false now — and a note describing a superseded state is the defect this whole step has been about. It now records three layers and what each uniquely covers: **assertion 21 sees the returned columns; it cannot see the verify path.** A change that skips or short-circuits an argon2 verify adds no column and passes assertion 21 untouched — which is exactly what the step-8 defect was (one verify for an unknown email, two for a wrong password). ADR-016's superseded sentence is left as written with a supersession marker beside it, per ADR-015's convention.
+
+### Forward marker
+
+**Generalize the signature pin to all seven definer functions.** The better end state, deliberately not folded into OPEN-7's closure: it needs the expected signature decided and justified for each, and `audit_capture` is not more of the same — it is a trigger function whose shape already forced assertion 12 to be narrowed and assertion 16 to be written as the replacement cover. Owed by whichever future phase next touches the definer set.
+
+### Notes
+
+- Citations: **0 re-anchored.** The change is a single append-only hunk at line 928 (`@@ -927,0 +928,89 @@`, zero modifications above it); the highest inbound citation to that file is L486. Verified structurally, not by arithmetic.
+- **Out of scope, logged for step 9:** the `actions/checkout@v4` / `setup-node@v4` deprecation in `ci.yml`.
+- OPEN-9 (hard delete) still deferred.
