@@ -171,10 +171,25 @@ describe('memberships API (step-5 phase 2 — RBAC)', () => {
         .send({ email: 'newcomer@acme.test', role: 'technician' })
         .expect(201);
 
-      expect(res.body.userCreated).toBe(true);
+      // STEP 8: `userCreated` is no longer on the wire — it was an
+      // account-existence oracle over the WHOLE system, not just this tenant
+      // (ADR-016). The effect it used to report is asserted against the database
+      // instead, which is stronger evidence anyway: the identity exists, it is
+      // pending, and the membership is attached.
+      expect(res.body).toEqual({ message: 'Invitation sent.' });
       expect(await membershipOf('newcomer@acme.test', tenantId)).toMatchObject({
         role: 'technician',
       });
+
+      const [created] = await migrator.$queryRawUnsafe<{ pending: boolean }[]>(
+        `SELECT (password_set_at IS NULL) AS pending FROM public.users
+          WHERE email = 'newcomer@acme.test'::citext`,
+      );
+      expect(created, 'no identity was created for the unknown email').toBeDefined();
+      expect(
+        created?.pending,
+        'an invite-created identity must be PENDING — that is what makes it eligible for a token',
+      ).toBe(true);
     });
 
     it('invites an EXISTING email: attaches a membership to the same person', async () => {
@@ -189,7 +204,11 @@ describe('memberships API (step-5 phase 2 — RBAC)', () => {
         .send({ email: 'multi@beta.test', role: 'auditor' })
         .expect(201);
 
-      expect(res.body.userCreated, 'a duplicate identity was created').toBe(false);
+      // STEP 8: the response is now IDENTICAL to the unknown-email case above —
+      // same body, same 201 — which is the uniformity property itself, asserted
+      // here rather than described. "A duplicate identity was not created" is
+      // asserted against the database below, where it always belonged.
+      expect(res.body).toEqual({ message: 'Invitation sent.' });
       expect(await membershipOf('multi@beta.test', acme)).toMatchObject({ role: 'auditor' });
 
       // One human, two memberships — and the original one is untouched.
@@ -197,6 +216,19 @@ describe('memberships API (step-5 phase 2 — RBAC)', () => {
         `SELECT count(*)::int AS n FROM public.users WHERE email = 'multi@beta.test'::citext`,
       );
       expect(count!.n).toBe(1);
+
+      // AND THE CREDENTIAL IS UNTOUCHED. This is the property that makes inviting
+      // an existing address safe: it must not reset their password, and it must
+      // not make them pending (which would make them mintable for a token). The
+      // invite path is never a password-reset path (ADR-016).
+      const [person] = await migrator.$queryRawUnsafe<{ pending: boolean }[]>(
+        `SELECT (password_set_at IS NULL) AS pending FROM public.users
+          WHERE email = 'multi@beta.test'::citext`,
+      );
+      expect(
+        person?.pending,
+        'inviting an existing credentialled user must NOT make them pending',
+      ).toBe(false);
     });
 
     it('changes a role', async () => {

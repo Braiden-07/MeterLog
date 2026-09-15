@@ -100,32 +100,46 @@ describe('audit read surface (step-7 phase 7b)', () => {
   }
 
   /**
-   * Invites a member and gives them a usable password.
+   * Invites a member and gives them a usable password, THROUGH THE PRODUCT.
    *
-   * The hash copy is the standing workaround for OPEN-7: `invite_member` writes a
-   * SENTINEL argon2 hash that authenticates against nothing, so an invited person
-   * cannot log in until the set-password flow lands at step 8. Copying the
-   * admin's hash is how every API suite here creates a non-admin session, and it
-   * is a fixture device, not a product path.
+   * STEP 8 REPLACED THE HASH COPY THIS USED TO DO. The old fixture copied the
+   * admin's `password_hash` as the migration role, because `invite_member` writes
+   * a sentinel that authenticates against nothing and OPEN-7 left no path back.
+   * The docblock here said "until the set-password flow lands at step 8" — it has
+   * landed, so this now invites, reads the minted token from the pending-invite
+   * list, redeems it, and logs in.
+   *
+   * `adminEmail` is retained in the signature and deliberately unused: the admin
+   * whose hash was being copied is no longer relevant, but the parameter keeps
+   * every call site unchanged and the diff honest about what actually changed.
    */
   async function addMember(
     adminCookie: string,
-    adminEmail: string,
+    _adminEmail: string,
     email: string,
     role: 'admin' | 'technician' | 'auditor',
   ): Promise<{ cookie: string; userId: string }> {
-    const res = await http()
+    await http()
       .post('/api/v1/users')
       .set('Cookie', adminCookie)
       .send({ email, role })
       .expect(201);
-    await migrator.$executeRawUnsafe(
-      `UPDATE public.users SET password_hash =
-         (SELECT password_hash FROM public.users WHERE email = $2) WHERE email = $1`,
-      email,
-      adminEmail,
+
+    const pending = await http()
+      .get('/api/v1/users/pending')
+      .set('Cookie', adminCookie)
+      .expect(200);
+    const invite = (pending.body as { email: string; token: string; userId: string }[]).find(
+      (p) => p.email === email,
     );
-    return { cookie: await login(email), userId: res.body.userId ?? res.body.id };
+    if (!invite) throw new Error(`${email} did not appear in the pending-invite list`);
+
+    await http()
+      .post('/api/v1/auth/set-password')
+      .send({ token: invite.token, password: PASSWORD })
+      .expect(204);
+
+    return { cookie: await login(email), userId: invite.userId };
   }
 
   const registerAsset = async (cookie: string): Promise<string> => {

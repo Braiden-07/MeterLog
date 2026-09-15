@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   APPEND_ONLY_TABLES,
+  APP_UNREADABLE_DEFINER_TABLES,
   DEFINER_WRITTEN_APPEND_ONLY_TABLES,
   SOFT_DELETE_ONLY_TABLES,
   DEFINER_ACCESSIBLE_TABLES,
@@ -191,7 +192,7 @@ describe('RLS catalog coverage', () => {
     ).toEqual([]);
   });
 
-  it('6. meterlog_definer holds UPDATE on memberships and NOTHING else beyond it', async () => {
+  it('6. meterlog_definer holds table-level UPDATE on exactly memberships and invite_tokens', async () => {
     // The definer policy is deliberately broad (FOR ALL ... USING (true) WITH
     // CHECK (true)) so registration's INSERTs are not denied. What keeps that
     // safe is the grant: table privileges are checked before policies, so a
@@ -212,10 +213,33 @@ describe('RLS catalog coverage', () => {
     // produced without an HTTP guard in front of them.
     //
     // So the assertion is narrowed to an EQUALITY on the exact new shape, never
-    // relaxed to "has some grants". Still no UPDATE on `users` or `tenants` (no
-    // function edits an identity or an organisation — invite only INSERTs a users
-    // row), and still no DELETE, TRUNCATE or REFERENCES anywhere at all. The next
-    // grant that widens this by one privilege fails here.
+    // relaxed to "has some grants". Still no DELETE, TRUNCATE or REFERENCES
+    // anywhere at all.
+    //
+    // WIDENED AGAIN AT STEP 8 (OPEN-7) to admit `invite_tokens:UPDATE`. The
+    // consume (`SET consumed_at = now() WHERE ... AND consumed_at IS NULL`) and
+    // the supersession on mint are both UPDATEs. Still an equality.
+    //
+    // ===== READ THIS BEFORE TRUSTING THIS ASSERTION =========================
+    // THIS ASSERTION IS BLIND TO COLUMN-LEVEL GRANTS, and step 8 is where that
+    // stopped being academic. `has_table_privilege` reports only TABLE-wide
+    // privileges. Verified live: with
+    //   GRANT UPDATE (password_hash, password_set_at) ON public.users TO meterlog_definer
+    // in place — which is exactly what step 8 grants — this assertion still
+    // returns ['invite_tokens:UPDATE', 'memberships:UPDATE'] and PASSES.
+    //
+    // So the sentence this comment used to carry, "the next grant that widens
+    // this by one privilege fails here", was only ever true of table-level
+    // grants. The definer's UPDATE on `users` is real, is column-limited, and is
+    // invisible here. The same blindness applies to assertion 9 on the app-role
+    // side, which is why the `password_hash` withholding went unasserted from
+    // step 4 until step 8.
+    //
+    // **Assertion 18 is what actually pins the column grants**, as an equality
+    // over `information_schema.column_privileges`. This assertion covers the
+    // table-level axis and says so; 18 covers the column axis. Neither subsumes
+    // the other, and a reader who takes this one for total coverage is reading
+    // the guarantee this project shipped without for four steps.
     const rows = await db.$queryRawUnsafe<{ table_name: string; privilege: string }[]>(`
       SELECT c.relname AS table_name, priv AS privilege
       FROM pg_class c
@@ -227,7 +251,10 @@ describe('RLS catalog coverage', () => {
       ORDER BY 1, 2
     `);
 
-    expect(rows.map((r) => `${r.table_name}:${r.privilege}`)).toEqual(['memberships:UPDATE']);
+    expect(rows.map((r) => `${r.table_name}:${r.privilege}`)).toEqual([
+      'invite_tokens:UPDATE',
+      'memberships:UPDATE',
+    ]);
   });
 
   it('7. the runtime role is restricted and is not the migration role', async () => {
@@ -353,12 +380,25 @@ describe('RLS catalog coverage', () => {
     ).toEqual([]);
   });
 
-  it('10. the app role can still READ every identity table', async () => {
+  it('10. the app role can still READ every identity table (except the declared-unreadable ones)', async () => {
     // Pairs with 9. On its own, assertion 9 is satisfied by a table the app role
     // cannot touch at all, which would be fail-closed but broken. `users` is
     // column-granted (password_hash withheld), so table-level has_table_privilege
     // reports false for it — the read check must be column-aware or it would force
     // the column grant to be widened to satisfy the test.
+    //
+    // NARROWED AT STEP 8 (OPEN-7), deliberately and with a replacement. The
+    // premise above — definer-reachable implies app-readable — held for the first
+    // four entries and does not hold for `invite_tokens`, which holds credentials
+    // and grants the app role NOTHING. Forcing it to satisfy this assertion would
+    // mean granting an app role SELECT on a token table to make a test pass, the
+    // same trap as granting TRUNCATE to fix a teardown.
+    //
+    // The exclusion is DECLARED (`APP_UNREADABLE_DEFINER_TABLES`), not derived
+    // from the live grants — deriving it would make this assert whatever the
+    // grants happen to be. And it is paired with assertion 18, which asserts the
+    // app role holds ZERO privileges on those tables, so the carve-out cannot
+    // become a way to keep a quietly-readable credential table nobody checks.
     const rows = await db.$queryRawUnsafe<{ table_name: string; readable: boolean }[]>(
       `
       SELECT c.relname AS table_name,
@@ -377,6 +417,15 @@ describe('RLS catalog coverage', () => {
 
     expect(rows.map((r) => r.table_name)).toEqual([...DEFINER_ACCESSIBLE_TABLES].sort());
     for (const row of rows) {
+      if (APP_UNREADABLE_DEFINER_TABLES.includes(row.table_name)) {
+        // The carve-out asserts the OPPOSITE rather than skipping: a declared
+        // unreadable table that becomes readable fails here, not silently.
+        expect(
+          row.readable,
+          `${row.table_name} is declared app-unreadable but the app role can read a column of it`,
+        ).toBe(false);
+        continue;
+      }
       expect(row.readable, `${row.table_name} must be readable by the app role`).toBe(true);
     }
   });
@@ -687,5 +736,193 @@ describe('RLS catalog coverage', () => {
       argless,
       `audit trigger attached with no column allowlist: ${argless.join(', ')}`,
     ).toEqual([]);
+  });
+
+  it('18. the users COLUMN-grant set is exactly pinned, for both roles', async () => {
+    // STEP 8 (OPEN-7). THE LOGIN-INVISIBILITY FLOOR — and the first assertion in
+    // this suite that looks at column-level privileges at all.
+    //
+    // WHY IT HAD TO BE WRITTEN, stated plainly because the gap it closes was
+    // believed to be already closed. `password_hash` has been withheld from
+    // `meterlog_app` by column grant since step 4, and 20260907000000 describes
+    // that withholding as "asserted in CI". IT WAS NOT. Assertions 6 and 9 are
+    // both built on `has_table_privilege`, which reports only TABLE-wide
+    // privileges and is blind to column grants. Verified live against this
+    // database before this assertion existed:
+    //
+    //   GRANT SELECT (password_hash) ON public.users TO meterlog_app;
+    //     -> assertion 9 passes, assertion 10 passes, whole suite green,
+    //        and the app role can read every password hash in the system.
+    //
+    //   GRANT UPDATE (password_hash, password_set_at) ON public.users TO meterlog_definer;
+    //     -> assertion 6 still returns exactly its expected list and passes.
+    //
+    // So from step 4 until now, the single most sensitive column grant in the
+    // schema could have been widened in one line with nothing turning red. Step 8
+    // adds `password_set_at` to that same withheld set — the login path must fail
+    // `permission denied` if it ever names the column, which is the DB floor under
+    // ADR-006 §7's hazard (ii) — so the floor had to become real.
+    //
+    // EQUALITY, NOT SUBSET, in both directions. A subset check ("password_hash is
+    // absent from the app grant") would pass while some other column was quietly
+    // added, and would say nothing about the definer side. The sets below are the
+    // complete, reviewed answer to "who may touch which column of `users`".
+    // READ FROM pg_catalog, NOT information_schema, AND THE DIFFERENCE IS A TRAP
+    // THIS ASSERTION FELL INTO ON ITS FIRST RUN. The `information_schema` views
+    // are PRIVILEGE-FILTERED: they show only rows the CONNECTING role has some
+    // privilege on. This suite connects as `meterlog_app`, so
+    // `information_schema.column_privileges` showed only the app role's own
+    // grants and `information_schema.columns` could not see `password_set_at` at
+    // all — the very column being pinned was invisible to the pin. The assertion
+    // would have "passed" over a set it could not observe.
+    //
+    // `has_column_privilege(role, ...)` answers about ANY role from any
+    // connection, and it reports EFFECTIVE access — column-level grants and
+    // table-level grants that reach the column alike. Effective access is the
+    // property worth pinning; an ACL read would miss a table-level grant covering
+    // a column.
+    const rows = await db.$queryRawUnsafe<
+      { grantee: string; privilege_type: string; cols: string }[]
+    >(`
+      SELECT g.grantee, p.priv AS privilege_type,
+             string_agg(a.attname, ',' ORDER BY a.attname) AS cols
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+      CROSS JOIN unnest(ARRAY['meterlog_app','meterlog_definer']) AS g(grantee)
+      CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','REFERENCES']) AS p(priv)
+      WHERE n.nspname = 'public' AND c.relname = 'users'
+        AND has_column_privilege(g.grantee, c.oid, a.attnum, p.priv)
+      GROUP BY g.grantee, p.priv
+      ORDER BY 1, 2
+    `);
+
+    const actual = Object.fromEntries(
+      rows.map((r) => [`${r.grantee}:${r.privilege_type}`, r.cols]),
+    );
+
+    expect(
+      actual,
+      'the users column-grant set has changed — see ADR-016 before widening it',
+    ).toEqual({
+      // THE APP ROLE READS IDENTITY, NEVER CREDENTIALS. `password_hash` and
+      // `password_set_at` are both absent, and both absences are load-bearing:
+      // the first keeps hashes out of reach of every authenticated request, the
+      // second keeps the login path structurally unable to branch on pending
+      // status (ADR-006 §7 hazard (ii)). Login runs as `meterlog_app`; a
+      // reference to either column fails 42501, loudly, rather than working.
+      'meterlog_app:SELECT': 'created_at,deleted_at,email,id,updated_at',
+
+      // The definer reads everything — it must, to verify a password hash at
+      // login and to evaluate the pending predicate. Table-level, so a new column
+      // joins it automatically; that is why step 8 needed no new SELECT grant.
+      'meterlog_definer:SELECT':
+        'created_at,deleted_at,email,id,password_hash,password_set_at,updated_at',
+      'meterlog_definer:INSERT':
+        'created_at,deleted_at,email,id,password_hash,password_set_at,updated_at',
+
+      // AND THE NARROW ONE. `set_password` writes exactly these two columns, so
+      // the grant says exactly these two. `email` and `deleted_at` stay unwritable
+      // by every role in the system, which is what stops a future edit to
+      // set_password's body from becoming an identity-takeover or account-deletion
+      // primitive. It is also what makes `user.password_set` an exhaustive label
+      // for any `users` UPDATE rather than a guess — see 20260915000000 §7.
+      'meterlog_definer:UPDATE': 'password_hash,password_set_at',
+    });
+  });
+
+  it('19. users.password_set_at has NO column default', async () => {
+    // STEP 8 (OPEN-7). Floors an invariant that is invisible in the schema as a
+    // presence and only visible as an ABSENCE — the shape CLAUDE.md's append-only
+    // declaration exists to refuse leaving implicit.
+    //
+    // NULL means "pending". A new `users` row written by `invite_member` gets NULL
+    // and is therefore pending BY DEFAULT, with no change to `invite_member` at
+    // all. `register_tenant` is the branch that says otherwise, explicitly.
+    //
+    // `DEFAULT now()` is the obvious tidy, and it would be a SILENT re-entry into
+    // OPEN-7's dead-end: every invited user would look credentialled the moment
+    // they were created, `list_pending_invites` would return nothing, no token
+    // would ever be minted, and the invited person would be unreachable again —
+    // with every existing test still green, because nothing else in the suite
+    // looks at this column's default. That is the whole reason this assertion is
+    // a test and not a comment in the migration.
+    // pg_catalog, not information_schema.columns — see assertion 18's note. The
+    // app role holds no privilege on this column, so information_schema cannot
+    // see it from this connection and the assertion would have been vacuous.
+    const [row] = await db.$queryRawUnsafe<{ has_default: boolean; default_expr: string | null }[]>(`
+      SELECT a.atthasdef AS has_default,
+             pg_get_expr(d.adbin, d.adrelid) AS default_expr
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+      LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+      WHERE n.nspname = 'public' AND c.relname = 'users' AND a.attname = 'password_set_at'
+    `);
+
+    expect(row, 'users.password_set_at is missing entirely').toBeDefined();
+    expect(
+      row?.has_default,
+      `users.password_set_at must have NO default — NULL is the pending predicate (ADR-016). Found: ${row?.default_expr}`,
+    ).toBe(false);
+  });
+
+  it('20. the app role holds ZERO privileges on every declared-unreadable table', async () => {
+    // STEP 8 (OPEN-7). The replacement cover for assertion 10's carve-out, and the
+    // reason that carve-out is not a hiding place.
+    //
+    // Assertion 10 stops demanding that `invite_tokens` be app-readable. On its
+    // own that is a hole: a table could be dropped into
+    // `APP_UNREADABLE_DEFINER_TABLES` and quietly granted whatever it liked. This
+    // asserts the strong property instead — the app role holds NOTHING on it. Not
+    // SELECT, not INSERT, not UPDATE, not DELETE, not TRUNCATE, not REFERENCES,
+    // and not on any single column.
+    //
+    // `invite_tokens` holds redemption credentials. Combined with the absence of
+    // any app-role policy, the app role is refused twice over — the DECISION B
+    // shape applied to a credential table — so a stolen app-role connection cannot
+    // enumerate live tokens, read a hash, or mint one.
+    const rows = await db.$queryRawUnsafe<{ table_name: string; privilege: string }[]>(
+      `
+      SELECT c.relname AS table_name, priv AS privilege
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES']) AS priv
+      WHERE n.nspname = 'public'
+        AND c.relkind = 'r'
+        AND c.relname = ANY ($1::text[])
+        AND (
+          has_table_privilege('meterlog_app', c.oid, priv)
+          -- Column-aware too. Assertion 18's whole lesson is that a table-level
+          -- check alone would miss a column grant, and missing one here would mean
+          -- a readable token table reported as unreadable.
+          OR EXISTS (
+            SELECT 1 FROM pg_attribute a
+            WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+              AND priv IN ('SELECT','INSERT','UPDATE','REFERENCES')
+              AND has_column_privilege('meterlog_app', c.oid, a.attnum, priv)
+          )
+        )
+      ORDER BY 1, 2
+    `,
+      APP_UNREADABLE_DEFINER_TABLES as string[],
+    );
+
+    expect(
+      rows.map((r) => `${r.table_name}:${r.privilege}`),
+      'the app role holds a privilege on a table declared unreadable to it',
+    ).toEqual([]);
+
+    // Non-vacuity: an empty declaration list would make the check above pass while
+    // asserting nothing, the `readWorkspaces` lesson. The list must be non-empty
+    // and every entry must actually exist as a table.
+    expect(APP_UNREADABLE_DEFINER_TABLES.length).toBeGreaterThan(0);
+    const present = await db.$queryRawUnsafe<{ relname: string }[]>(
+      `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = ANY ($1::text[])
+        ORDER BY 1`,
+      APP_UNREADABLE_DEFINER_TABLES as string[],
+    );
+    expect(present.map((r) => r.relname)).toEqual([...APP_UNREADABLE_DEFINER_TABLES].sort());
   });
 });

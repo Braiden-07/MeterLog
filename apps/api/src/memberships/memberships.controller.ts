@@ -15,7 +15,7 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { RequiresRole } from '../common/auth/requires-role.decorator';
 import { RequiresSession } from '../common/auth/requires-session.decorator';
 import { ChangeMemberRoleDto, InviteMemberDto } from './dto/memberships.dto';
-import { Member, MembershipsService } from './memberships.service';
+import { Member, MembershipsService, PendingInvite } from './memberships.service';
 
 /**
  * The Users module is a MEMBERSHIPS module in substance (ADR-006 §7): the
@@ -56,17 +56,66 @@ export class MembershipsController {
     return this.memberships.list();
   }
 
+  /**
+   * THE RESPONSE IS UNIFORM ACROSS BOTH INVITE BRANCHES — identical body,
+   * identical 201 — and that uniformity is a security property, not tidiness.
+   *
+   * Until step 8 this returned `{ membershipId, userId, userCreated }`.
+   * `userCreated` is an ACCOUNT-EXISTENCE ORACLE: any tenant admin could invite
+   * an address, read the flag, and learn whether that person holds an account
+   * ANYWHERE in the system — including in tenants the caller cannot see and has
+   * no relationship with. The membership model is precisely what makes that
+   * cross-tenant: `users` is global identity (ADR-006 §2), so "already exists"
+   * is a fact about the whole system rather than about this workspace.
+   *
+   * `membershipId` and `userId` are dropped with it. Neither leaks on its own —
+   * the invitee is a member of the caller's tenant either way, so both are
+   * readable from `GET /users` immediately afterwards — but a body that varies
+   * in SHAPE between branches invites exactly the kind of client that starts
+   * depending on the difference. One body, one status, no branch.
+   *
+   * The residual timing difference (create-identity + membership costs more than
+   * a membership insert alone) is accepted for v1.0 and recorded in ADR-016: the
+   * caller is an authenticated, rate-limited admin, and what leaks is
+   * existence-anywhere rather than anything tenant-scoped. The BullMQ mailer in
+   * stretch scope erases it for free by making invite fire-and-return.
+   */
   @Post()
   @RequiresRole('admin')
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({
     summary:
-      'Invite someone to the active workspace. An existing email attaches a new membership; a new one creates the identity too.',
+      'Invite someone to the active workspace. The response is identical whether or not the email already had an account.',
   })
-  async invite(
-    @Body() dto: InviteMemberDto,
-  ): Promise<{ membershipId: string; userId: string; userCreated: boolean }> {
-    return this.memberships.invite(dto);
+  async invite(@Body() dto: InviteMemberDto): Promise<{ message: string }> {
+    await this.memberships.invite(dto);
+    return { message: 'Invitation sent.' };
+  }
+
+  /**
+   * Pending invites for the active workspace, each with a freshly minted token.
+   *
+   * ADMIN-GATED, unlike `GET /` — and the asymmetry is deliberate. The member
+   * list is open to every member by decision (ADR-006 §3, co-member visibility);
+   * this one hands out redemption credentials, so it carries `@RequiresRole` at
+   * the gate AND an independent live-admin check inside
+   * `list_pending_invites` — the two-layer shape the step-5 write endpoints use,
+   * with the same rule that neither layer may be relaxed on the strength of the
+   * other.
+   *
+   * Placed under `/users/pending` rather than as a `?pending=true` filter on the
+   * list: a query parameter that changes a response from "public to the tenant"
+   * to "admin-only, contains secrets" is one forgotten guard away from leaking,
+   * and it would put two different authorization rules on one route.
+   */
+  @Get('pending')
+  @RequiresRole('admin')
+  @ApiOperation({
+    summary:
+      'List pending invites for the active workspace, minting a fresh redemption token for each. Admin only.',
+  })
+  async pending(): Promise<PendingInvite[]> {
+    return this.memberships.pendingInvites();
   }
 
   @Patch(':id')
