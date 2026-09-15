@@ -16,13 +16,16 @@
  * making the guarantee mechanical, which is the only basis on which line-level
  * citation is honest.
  *
- * THE THREE CHECKS, AND WHY THE THIRD IS THE ONE THAT MATTERS.
+ * THE FOUR CHECKS, AND WHY THE LAST TWO ARE THE ONES THAT MATTER.
  *
  *   1. The target path resolves.
  *   2. Every line number is within the target file's length.
  *   3. CONTENT. Where the link TEXT contains a quoted string or an
  *      identifier-shaped token, that literal must appear in the target file
  *      within PROXIMITY lines of the anchor.
+ *   4. LABEL. Where the link TEXT itself carries a `:<line>` reference — the
+ *      `file.ts:132` / `:158` form this repo writes constantly — that number
+ *      must equal the anchor it is attached to.
  *
  * Checks 1 and 2 catch deletions and truncations only. A citation that slides
  * twenty lines because somebody added an import passes both of them, every time
@@ -30,6 +33,29 @@
  * now. Check 3 is the one that catches the slide, and it is affordable precisely
  * because the docs ALREADY cite tests by their `it(...)` name in the link text.
  * It asserts, mechanically, the thing the author was already asserting by hand.
+ *
+ * CHECK 4 CLOSES A GAP THE OTHER THREE ARE STRUCTURALLY BLIND TO, and it is the
+ * cheapest check here: it touches no file at all. Checks 1-3 all validate the
+ * ANCHOR — the `#L267` half, which is what the reader's browser follows. Nothing
+ * ever read the LABEL — the `PROJECT_BRIEF.md:266` half, which is what the
+ * reader's EYE follows. So the two halves of one citation could disagree, and did:
+ *
+ *   [PROJECT_BRIEF.md:266](PROJECT_BRIEF.md#L267)
+ *
+ * The anchor was right (:267 is the DoD checkbox); the label said 266, and CI was
+ * green because no check had ever read the label. A reader quoting that citation
+ * into a review, or grepping `sed -n '266p'`, lands one line off and finds a
+ * different checkbox. The document reads as precise and is not.
+ *
+ * It is a PURE STRING COMPARISON — both halves are inside the link, so there is
+ * no filesystem access and nothing to cache. That also means it stays correct when
+ * the target file is unreadable for any other reason, which is why it runs before
+ * the path check rather than after.
+ *
+ * EQUALITY, NOT PROXIMITY. Check 3 deliberately allows a PROXIMITY window because
+ * a prose citation legitimately points a line or two into a block. A label has no
+ * such excuse: it is the same citation's own other half, written by the same hand
+ * in the same breath, so anything but equality is drift.
  *
  * Run: `npm run docs:check`. Wired into CI as its OWN step, so a failure reads
  * as "citation drift" rather than as a buried test failure.
@@ -60,6 +86,57 @@ const PROXIMITY = 5;
 
 /** `[text](path#L12)` and `[text](path#L12-L34)`. */
 const CITATION = /\[([^\]]*)\]\(([^)\s#]+)#L(\d+)(?:-L(\d+))?\)/g;
+
+/**
+ * A `:<line>` or `:<from>-<to>` reference inside the human-visible LABEL.
+ *
+ * This repo writes labels in exactly two shapes and both end in this form:
+ * `helpers.ts:132`, `migration.sql:22-33`, `interceptor:74-95`, `ADR-006:291`,
+ * and the bare continuation `:158` that follows a full citation to the same file.
+ *
+ * NO NEGATIVE LOOKBEHIND ON THE COLON, and the first draft had one. Guarding
+ * against a clock-like `12:30` by refusing a digit before the colon looked free
+ * and was not: `ADR-006:291` has a digit before its colon too, so the guard
+ * silently skipped one of the very citations it exists to check. The guard was
+ * blind on its first run and reported green for that link. Dropping the
+ * lookbehind recovers it and — verified against the whole corpus at the time,
+ * 96 label-bearing citations — introduces no false positive, because a link
+ * LABEL in this repo is a citation label, not prose carrying times or ratios.
+ *
+ * That is the lesson this file already teaches about content checks, applied to
+ * itself: a narrowing added for a hazard nobody has met, which quietly removes
+ * a case somebody has, is a worse trade than the false positive it avoided.
+ *
+ * The optional `L` in the range tail accepts `:74-L95` as well as `:74-95`; both
+ * spellings mean the same thing and neither should be a failure.
+ */
+const LABEL_REF = /:(\d+)(?:\s*-\s*L?(\d+))?(?!\d)/g;
+
+/**
+ * Pull every line reference out of a link label.
+ *
+ * EVERY reference found must match the anchor, not just the last one. The
+ * tempting alternative — check only the trailing `<name>:<line>`, since that is
+ * where this repo puts it — would let a label carrying two references have one
+ * of them rot silently, which is the exact shape of defect this check exists to
+ * end. A label that genuinely needs to mention a different line belongs in its
+ * own citation, where it gets checked like everything else.
+ *
+ * Returns `[]` for a label with no reference at all (most of them), which is not
+ * a failure: a label reading `` `EXPECTED_DEFINER_FUNCTIONS` `` claims a literal,
+ * not a line, and check 3 is what holds it to that.
+ */
+function labelRefsFrom(linkText) {
+  const refs = [];
+  for (const m of linkText.matchAll(LABEL_REF)) {
+    refs.push({
+      from: Number(m[1]),
+      to: m[2] === undefined ? undefined : Number(m[2]),
+      text: m[0].trim(),
+    });
+  }
+  return refs;
+}
 
 /**
  * Literals worth checking, pulled out of the link TEXT.
@@ -163,6 +240,7 @@ function main() {
   const failures = [];
   let checked = 0;
   let contentChecked = 0;
+  let labelChecked = 0;
 
   for (const doc of docs) {
     const docPath = join(DOCS_DIR, doc);
@@ -179,6 +257,28 @@ function main() {
 
         const where = `${relative(REPO_ROOT, docPath)}:${docLine}`;
         const cite = `[${linkText}](${rawTarget}#L${rawFrom}${rawTo ? `-L${rawTo}` : ''})`;
+
+        // ---- 4. the LABEL agrees with its own anchor ----------------------
+        // Runs FIRST because it is pure string work on the two halves of this
+        // link: no file is read, so it stays meaningful even when the target
+        // below turns out not to resolve. A label and an anchor that disagree
+        // are a defect regardless of what the target says.
+        const labelRefs = labelRefsFrom(linkText);
+        let labelDrifted = false;
+        for (const ref of labelRefs) {
+          if (ref.from === from && ref.to === to) continue;
+          labelDrifted = true;
+          failures.push({
+            where,
+            cite,
+            why:
+              `label says ${ref.text} but the anchor points at ` +
+              `L${from}${to === undefined ? '' : `-L${to}`} \u2014 the reader's eye and the ` +
+              `reader's browser would land on different lines`,
+          });
+        }
+        if (labelRefs.length > 0) labelChecked += 1;
+        if (labelDrifted) continue;
 
         // ---- 1. the target path resolves -----------------------------------
         const targetPath = resolve(DOCS_DIR, rawTarget);
@@ -266,14 +366,18 @@ function main() {
     console.error(
       'A citation that points at the wrong line is worse than a vague one: it reads as\n' +
         'precise and spends the reader’s trust. Re-anchor it, or widen the link text to\n' +
-        'stop claiming a literal it no longer points at.\n',
+        'stop claiming a literal it no longer points at.\n\n' +
+        'For a LABEL failure the fix is never to delete the number from the label: that\n' +
+        'trades a visible disagreement for an invisible one. Re-anchor by LANDING \u2014 open\n' +
+        'the line, confirm it is what the citation claims \u2014 then set both halves to it.\n',
     );
     process.exit(1);
   }
 
   console.log(
     `docs citations OK — ${checked} line-level citations across ${docs.length} files ` +
-      `(${contentChecked} carried a literal and were content-checked).`,
+      `(${contentChecked} carried a literal and were content-checked; ` +
+      `${labelChecked} carried a line reference in the label and were checked against their anchor).`,
   );
 }
 
