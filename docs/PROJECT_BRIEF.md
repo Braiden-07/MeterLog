@@ -260,8 +260,8 @@ Follow SDLC phases; work in small PRs. Log decisions as you go.
 
 ## 12. Definition of Done (v1.0)
 
-- [ ] Tenant isolation enforced by RLS and proven by an integration test (A can't see B).
-- [ ] Three roles with enforced permissions; 403 paths tested.
+- [x] Tenant isolation enforced by RLS and proven by an integration test (A can't see B).
+- [x] Three roles with enforced permissions; 403 paths tested.
 - [ ] Audit log written on every core mutation; viewable by admin/auditor.
 - [ ] All essential endpoints implemented with validation, pagination, error envelope, OpenAPI docs.
 - [ ] Frontend covers all essential journeys.
