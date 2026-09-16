@@ -174,7 +174,7 @@ WHERE u.email OPERATOR(public.=) p_email
 
 — [migration.sql:62](../apps/api/prisma/migrations/20260908000000_auth_definer_functions/migration.sql#L62)
 
-Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:132](DECISIONS.md#L132)) so the next definer function comparing an extension type does not walk back into it.
+Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:136](DECISIONS.md#L136)) so the next definer function comparing an extension type does not walk back into it.
 
 **Step 5 is where that amendment earned its keep.** The three membership-write functions are schema-qualified on _every_ operator — `OPERATOR(public.=)` for citext, `OPERATOR(pg_catalog.=)` for uuid and enum — rather than only on the one comparison that had already burned the project. In `invite_member` the consequence of getting it wrong would have been subtler than the original: a case-different existing address would miss the lookup, the create branch would fire, and the case-**insensitive** unique index would refuse it — an invite that cannot succeed for a person who is already in the system.
 
@@ -426,7 +426,7 @@ Beta unchanged:
 admin@beta.test = admin
 ```
 
-Byte-identical. Recorded in ADR-006 §7 as a design rule with the refactor that would reopen it named explicitly ([ADR-006:291](ADR-006-membership-model.md#L291)) — a "make the error messages more helpful" pass that splits them into `403` when the caller is not an admin of the target's tenant and `404` when the row is absent. That reads as better API design, reviews as a usability fix, and **the distinction it adds _is_ the oracle**. Held by [`a nonexistent-but-well-formed membership id is indistinguishable from B's`](../apps/api/test/api/memberships.spec.ts#L420), and by a mutation in the step-5 sweep that performs exactly that split and must redden a test — because an anti-enumeration claim with no negative behind it is not a claim this project ships.
+Byte-identical. Recorded in ADR-006 §7 as a design rule with the refactor that would reopen it named explicitly ([ADR-006:297](ADR-006-membership-model.md#L297)) — a "make the error messages more helpful" pass that splits them into `403` when the caller is not an admin of the target's tenant and `404` when the row is absent. That reads as better API design, reviews as a usability fix, and **the distinction it adds _is_ the oracle**. Held by [`a nonexistent-but-well-formed membership id is indistinguishable from B's`](../apps/api/test/api/memberships.spec.ts#L420), and by a mutation in the step-5 sweep that performs exactly that split and must redden a test — because an anti-enumeration claim with no negative behind it is not a claim this project ships.
 
 **Finding 6 proper is about the layer above.** The HTTP write endpoints are admin-gated by `@RequiresRole('admin')` ([controller:60](../apps/api/src/memberships/memberships.controller.ts#L60)), enforced inside the interceptor at the point where the role has already been re-read from the database ([interceptor:153-182](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L153-L182)) — never in a `CanActivate` guard, because Nest runs guards _before_ interceptors. That was measured rather than assumed: such a guard, wired to a real route, **500s every request including the admin's**, because at guard time no request has a resolved context at all ([requires-role.decorator.ts:21](../apps/api/src/common/auth/requires-role.decorator.ts#L21)).
 
@@ -645,7 +645,7 @@ Step 7a built the audit **capture** mechanism and proved it at the database laye
 
 **Step 6 disproved it.** A maintenance edit emits **no lifecycle event at all**: correcting a description is not something that happened to the physical asset. The asset-metadata `PATCH` is the same shape (ARCHITECTURE §9.2). A derived trail is therefore silent for the entire class of change an auditor is most likely to be investigating — and silent without erroring, which is this document's recurring failure mode.
 
-So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L390)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
+So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L394)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
 
 ### The centerpiece — immutable by grant
 
@@ -660,7 +660,7 @@ psql:/tmp/neg.sql:9:  ERROR:  permission denied for table audit_log
 psql:/tmp/neg.sql:11: ERROR:  permission denied for table audit_log
 ```
 
-Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L438)).
+Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L442)).
 
 Two vacuity guards sit under it. The `ALTER` and `SUPPRESS` negatives assert the row **existed, was visible under that tenant, and is unchanged afterwards**, so neither can pass against an empty table. And a positive pairs with all three — the app role **can** read its own tenant's rows ([`the app role CAN read its own tenant rows`](../apps/api/test/db/audit.spec.ts#L335)) — because "cannot write" is otherwise satisfied by a table nobody can reach at all, which is fail-closed and broken.
 
@@ -711,7 +711,9 @@ The defence is a per-table column **allowlist**, carried as the trigger's argume
  maintenance_records | 'id,tenant_id,asset_id,description,performed_at,created_by,created_at,...'
 ```
 
-Allowlist rather than denylist, deliberately: a denylist naming `password_hash` is correct today and wrong the first time a column is added — a `totp_secret`, or the reset token OPEN-7's flow will need. **An allowlist fails closed on exactly that change.**
+Allowlist rather than denylist, deliberately: a denylist naming `password_hash` is correct today and wrong the first time a column is added — a `totp_secret`, or the pending-invite column OPEN-7's flow would need. **An allowlist fails closed on exactly that change.**
+
+> **AND THEN IT HAPPENED — recorded here because a prediction is only evidence once its outcome is written down.** Step 8 added `users.password_set_at`, the column this sentence anticipated, one migration later. The allowlist did exactly what it was built to do: the new column was excluded from every audit diff **by default**, without anyone editing the trigger, and admitting it was then considered and **rejected** on ADR-011's fail-closed default for a column adjacent to a credential (ADR-016). The visible consequence is that a `user.password_set` row carries `{}` on both sides of its diff — which loses nothing, because *who* is `row_id`, *what* is the action and *when* is `created_at`. A denylist would have admitted the column silently on the day it landed.
 
 **And the proof is non-vacuous, which is the part worth stating.** A redaction test is worth nothing if no fixture carries the secret: the source row would hold an empty hash, the audit row would lack it, and the assertion would pass just as happily against a trigger with the allowlist deleted. That is Finding 7's lesson — seven mutations passed against fixtures whose _data shape_ was the blind spot. So the test asserts the secret **is really there, in full, in the source row** before asserting its absence anywhere else ([`the SOURCE row genuinely carries the secret`](../apps/api/test/db/audit.spec.ts#L575)), and checks the audit row is not merely empty by asserting `email` and `id` _are_ present.
 
@@ -766,7 +768,7 @@ Six, up from five, with the allowlist extended in the same PR ([`EXPECTED_DEFINE
 
 ### What 7a does not prove
 
-The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L509) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
+The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L513) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
 
 Hash-chaining is deferred, and ADR-010 records why as engineering rather than scope. What immutability-by-grant does **not** give, stated plainly: it defends against the application and against anyone holding only the app role's credentials. It does **not** defend against the migration/owner role or a cluster superuser, who can `ALTER TABLE`. Tamper-evidence against a privileged operator is what a chain buys, and that threat model is not v1.0's.
 
@@ -872,6 +874,85 @@ The control is there because a sweep that reddens on everything proves as little
 
 ---
 
+## 7j. Finding 12 — the credential table, and isolation proven by an empty grant
+
+Step 8 added `invite_tokens`, and it is the only table in the schema the runtime role
+cannot touch **at all**. It also had no entry in this document until this reconciliation,
+which is the wrong silence: the table holding redemption credentials is the one a reader
+checks first.
+
+### Refused twice, and the second refusal is the load-bearing one
+
+Verified against a live database:
+
+| question                                         | answer                                  |
+| ------------------------------------------------ | --------------------------------------- |
+| `meterlog_app` table privileges on `invite_tokens` | **none** — not even `SELECT`           |
+| `meterlog_app` column privileges                 | **none**, on any column                 |
+| policies on the table                             | exactly one: `invite_tokens_definer`, `USING (true)`, `TO meterlog_definer` |
+| RLS enabled / forced                              | both `t`                                |
+
+So a stolen app-role connection cannot enumerate live tokens, cannot read a hash, and
+cannot mint one — and it fails on the **grant**, before any policy is consulted. The
+policy refusal underneath it is the second layer, not the first. This is DECISION B's
+shape — the one that made `meterlog_app` structurally incapable of writing `memberships`
+— applied to a table that holds credentials rather than roles.
+
+### What is NOT true here, stated because the table's columns invite the assumption
+
+**`invite_tokens` carries a `tenant_id`, and NO POLICY USES IT.** Its single policy is
+`USING (true)`. A reader who has internalised the canonical tenant-scoped policy from §2
+will assume this table is isolated the way the domain tables are, and it is not: there is
+no row-level tenant predicate on it anywhere.
+
+That is correct rather than a gap, and the reason is worth being precise about. A policy
+predicate isolates a table between roles that can *reach* the table. Nothing can reach this
+one except `meterlog_definer`, which is `NOLOGIN` and arrives only through two enumerated
+functions. **So the tenant scoping lives in the function body instead**, where
+`list_pending_invites` reads `app.current_tenant` into `v_tenant` and filters on it — and,
+structurally, `v_tenant` comes from the **GUC and never from a parameter**, so no caller
+can name a tenant they are not active in. The admin check (ADR-006 §7 rule (a)) sits ahead
+of it and fails closed on absent context.
+
+**The consequence for this document: `invite_tokens` is absent from the generic isolation
+matrix, and its absence is not an oversight.** The matrix drives an app-role client through
+read and write cases per table; against a table the app role holds nothing on, every case
+degrades to the same `permission denied` and proves only what the grant already says. There
+is no tenant-scoped read to test, because there is no tenant-scoped read.
+
+### The carve-out it forced, and why it is not a hiding place
+
+`invite_tokens` is definer-reachable, so it landed in `DEFINER_ACCESSIBLE_TABLES` — and
+immediately broke **catalog assertion 10**, whose premise was that a definer-reachable table
+is app-**readable**. That premise held for the first four entries and cannot hold for this
+one: satisfying it would mean granting the app role `SELECT` on a token table to make a test
+pass, the same trap as granting `TRUNCATE` to fix a teardown.
+
+The exclusion is **declared** in `APP_UNREADABLE_DEFINER_TABLES`, never derived from the live
+grants — deriving it would make assertion 10 assert whatever the grants happen to be, which
+catches nothing by construction. And it is paired with **assertion 20**, which asserts the
+**opposite property in the strong form**: zero privileges of any kind, table-level or
+column-level, on every table in that list. So a table cannot be parked in the carve-out and
+quietly granted something later; the carve-out asserts more than the rule it escapes, not
+less.
+
+Three assertions therefore hold this table down, and they hold different things: **6** pins
+the definer's table-level `UPDATE` set as an equality (`memberships` and `invite_tokens`,
+nothing else), **10** stops demanding a read that must not exist, and **20** pins the absence
+as a property rather than tolerating it as an exception.
+
+### What this does not prove
+
+The refusals above are structural — grants and policies read from the catalog, plus the
+function bodies. **The token's own secrecy properties are proven elsewhere and by different
+means:** SHA-256 at rest (so a dump yields no usable credential), single-use, 72h, and one
+error code `SP001` for unknown / forged / expired / consumed alike, so the error cannot
+confirm a token was once real. Those live in `test/db/set-password.spec.ts`, keyed on custom
+SQLSTATEs that nothing else in the cluster raises — deliberately, so a negative cannot be
+satisfied by a `42501` from a missing grant and mistaken for a body check that ran.
+
+---
+
 ## 8. Method — why the evidence is shaped the way it is
 
 The findings above share a cause: **a test that passes is not the same as a test that covers.** Several practices exist specifically to close that gap.
@@ -890,7 +971,7 @@ That distinction matters: an equivalent mutant is not a coverage hole, and prete
 
 **Two defects were found by building, and are recorded rather than quietly fixed.** A protected route with no session returned **500 instead of 401** — the right refusal for the wrong reason — and the first version of the test _asserted the 500_, documenting the defect instead of catching it. The obvious fix made it worse: a `CanActivate` guard rejected **every** request, because Nest runs guards _before_ interceptors, so the guard could not see a context the interceptor had not yet established. Found empirically, not by reasoning. The resolution puts the _declaration_ at the route as metadata and keeps the single _enforcement_ point inside the interceptor that already resolved the session ([`RequiresSession`](../apps/api/src/common/auth/requires-session.decorator.ts#L20), [interceptor:74-95](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L74-L95)). Step 5's role gate follows the identical shape for the identical reason ([requires-role.decorator.ts:50](../apps/api/src/common/auth/requires-role.decorator.ts#L50)) — and the hazard was re-measured rather than inherited on faith.
 
-**Timing as a boundary — CORRECTED AT STEP 8, because the claim this paragraph used to make was false.** It read: “The no-such-user login branch performs a real argon2 verify so it costs what the wrong-password branch costs.” It performed one, and the wrong-password branch performed **two** — the failure block computed `ok` as a short-circuiting `&&` chain and then ran the dummy verify *unconditionally*, so a found user paid a real verify AND the dummy while an unknown address paid only the dummy. That is a reproducible ~2x split between “this address exists” and “it does not”: the user-enumeration oracle the dummy verify exists to close, sitting inside the construction built to close it, since step 4. It was found by measurement, not review — the step-8 login-uniformity triple showed the unknown-email arm at roughly half the cost of the other two across six consecutive runs — and is fixed by making the dummy the `else` of the real verify rather than an addition to it, so every path performs exactly one. The lesson is the one this document keeps re-learning: an equalisation nobody measures is an assertion, not a property. The dummy hash is derived from the same exported parameters production uses The dummy hash is derived from the same exported parameters production uses ([auth.service.ts:52](../apps/api/src/auth/auth.service.ts#L52), [:290](../apps/api/src/auth/auth.service.ts#L290)), and a test **parses `m=`, `t=`, `p=`** out of both a dummy hash and a hash taken from the real registration path and asserts they agree ([auth.spec.ts:451](../apps/api/test/api/auth.spec.ts#L451)). Previously both call sites simply inherited library defaults — they agreed, but by coincidence rather than by construction, which is a drift vector regardless of whether the numbers match today. The same rule governs the sentinel hash step 5's invite writes for a new identity: derived from those parameters, never a literal, and asserted by parsing them back out ([membership-writes.spec.ts:784](../apps/api/test/db/membership-writes.spec.ts#L784)).
+**Timing as a boundary — CORRECTED AT STEP 8, because the claim this paragraph used to make was false.** It read: “The no-such-user login branch performs a real argon2 verify so it costs what the wrong-password branch costs.” It performed one, and the wrong-password branch performed **two** — the failure block computed `ok` as a short-circuiting `&&` chain and then ran the dummy verify *unconditionally*, so a found user paid a real verify AND the dummy while an unknown address paid only the dummy. That is a reproducible ~2x split between “this address exists” and “it does not”: the user-enumeration oracle the dummy verify exists to close, sitting inside the construction built to close it, since step 4. It was found by measurement, not review — the step-8 login-uniformity triple showed the unknown-email arm at roughly half the cost of the other two across six consecutive runs — and is fixed by making the dummy the `else` of the real verify rather than an addition to it, so every path performs exactly one. The lesson is the one this document keeps re-learning: an equalisation nobody measures is an assertion, not a property. The dummy hash is derived from the same exported parameters production uses ([auth.service.ts:52](../apps/api/src/auth/auth.service.ts#L52), [:290](../apps/api/src/auth/auth.service.ts#L290)), and a test **parses `m=`, `t=`, `p=`** out of both a dummy hash and a hash taken from the real registration path and asserts they agree ([auth.spec.ts:451](../apps/api/test/api/auth.spec.ts#L451)). Previously both call sites simply inherited library defaults — they agreed, but by coincidence rather than by construction, which is a drift vector regardless of whether the numbers match today. The same rule governs the sentinel hash step 5's invite writes for a new identity: derived from those parameters, never a literal, and asserted by parsing them back out ([membership-writes.spec.ts:784](../apps/api/test/db/membership-writes.spec.ts#L784)).
 
 ---
 
@@ -903,7 +984,11 @@ This list is kept aligned with the enumerated **Open items register** in [`DECIS
 - **The domain surface is FOUR tables. The brief's fifth is `audit_log`, and it is not a domain table.** Step 6 proved isolation for `assets` and its three children `asset_events`, `readings` and `maintenance_records` (§7f, §7g) — **4 of 4 v1.0 domain tables built and isolation-proven.** `PROJECT_BRIEF` §5 lists five tables in total; the fifth is `audit_log`, which belongs to step 7 and to the next bullet rather than to this surface. **So "the domain is isolated" is now true of the domain — and says nothing about the audit trail, which does not exist.**
 - **`maintenance_records` is SOFT-DELETE ONLY, and hard delete is deferred (OPEN-9).** v1.0 has no way to destroy a maintenance record: the app role holds no `DELETE` privilege, proven by the `permission denied` negative in §7g and pinned by catalog assertion 14. The deferral is deliberate rather than unfinished — **a destructive operation must not predate the audit trail that makes it accountable**, because a purged row with no `audit_log` entry leaves no trace of itself, of who removed it, or of what it said. When hard delete lands it lands behind audit, and it inherits the question of what a purge writes there ([ADR-008](DECISIONS.md)).
 - **A green generic matrix is still not evidence for a table registered as bespoke.** `users`, `tenants` and `memberships` are excluded by declaration, and the exclusion is accounted for by the registry-equality check so it cannot be mistaken for an oversight ([helpers.ts:132](../apps/api/test/db/helpers.ts#L132)). Their coverage is the bespoke dual-axis suite (§3), not the 15 generated cases.
-- **Invited users cannot log in yet (OPEN-7).** `invite_member` creates an identity whose password hash is a sentinel that matches nothing, so an invited person can neither sign in nor register their own organisation (the email is taken). This is a **known, scheduled, temporary** state, not a hidden one: the set-password / invite-token flow is the first slice of step 8, with a hard deadline of step 10 (before deploy, the only people it can lock out are test fixtures), and it is enforced by a Definition-of-Done checkbox rather than by a comment ([PROJECT_BRIEF.md:266](PROJECT_BRIEF.md#L267)) because markers drift and checklists block. Reasoning in [DECISIONS.md:269](DECISIONS.md#L269).
+- **~~Invited users cannot log in yet (OPEN-7).~~ CLOSED AT STEP 8 — struck, and what replaced it is below.** This bullet said an invited person could neither sign in nor register their own organisation. That has been false since `39eb741`: `password_set_at` is the pending predicate, `set_password` redeems a single-use 72h token, and the Definition-of-Done checkbox this bullet pointed at is now ticked ([PROJECT_BRIEF.md:268](PROJECT_BRIEF.md#L268)). Full reasoning in ADR-016.
+
+  **It is recorded as struck rather than deleted, and §9 is the section where that matters most.** This is the list a sceptical reader trusts by default — the one that says what the evidence does *not* cover — so a claim that rots here is the most expensive stale sentence in the repo, and the shape of the rot is worth keeping visible: it did not become wrong because someone edited it, it became wrong because someone **fixed the thing it described** and the register was not part of the fix.
+
+- **What OPEN-7 actually left behind — invite timing is still distinguishable (OPEN-10).** `POST /users` answers with a byte-identical body and status whether the invite created a new identity or attached a membership to an existing one — ADR-016 took the `user_created` flag off the wire because it was an account-existence oracle over **global** identity, readable by any tenant admin about a person in tenants they cannot see. What it does not equalise is **cost**: creating a `users` row plus a membership is measurably more work than inserting a membership alone, so the two branches remain separable by a stopwatch. **Accepted for v1.0, and accepted on a narrower ground than the login case** — this caller is authenticated and rate-limited, and what leaks is existence-anywhere rather than anything tenant-scoped, where the login oracle was reachable pre-authentication by anyone. **Unlike login, it is not measured by a test**, so it is an accepted residual rather than a proven bound. The BullMQ mailer in stretch scope erases it once invite becomes fire-and-return and the identity write happens after the response.
 - **The audit module is COMPLETE as of step 7b — captured (§7h) and readable (§7i).** This bullet previously said the read surface did not exist; it does now, so what remains unproven is stated instead.
 
   **What the module does NOT yet have.** No frontend consumes `GET /audit` (step 8), so the auditor journey is proven by acceptance test rather than by use. No retention or partitioning exists — ADR-012 prices `audit_log` at roughly 2x reading volume and marks the growth curve as an accepted v1.0 cost, not a solved one. Hash-chaining is deferred (ADR-010), so the trail is tamper-**resistant** against the application and anyone holding only the app role's credentials, and **not** tamper-evident against the migration role or a superuser.
