@@ -76,7 +76,37 @@ Writes carry **two independent checks**: the `@RequiresRole('admin')` gate below
 
 ## 5. Frontend structure
 
-Not yet built — the frontend slice (brief §11 step 8).
+`apps/web` — Next.js App Router. Slice 1 of the frontend slice (brief §11 step 8) builds auth, the workspace switcher and the tenant-keyed cache; the admin user-management slice and the domain slices add pages on top of this structure without changing it.
+
+```
+apps/web/
+├── app/
+│   ├── layout.tsx              one SessionProvider for the whole app
+│   ├── page.tsx                the bootstrap gate and its four states
+│   ├── login/ · register/      auth pages (register 201 does not sign in)
+│   └── set-password/           invite redemption, token read from the fragment
+├── components/                 client components only — app shell, switcher,
+│                               picker, the read-only assets list
+└── lib/
+    ├── api.ts                  relative-base client, ApiError, X-Expected-Tenant
+    ├── workspace-session.ts    the cache keys and the reset invariant
+    ├── workspace-session.spec.ts   the eviction negative
+    ├── session-context.tsx     QueryClient + retry/reset policy, React glue
+    ├── broadcast.ts            cross-tab reset propagation
+    └── forms.ts                request-body schemas, local by decision
+```
+
+**Transport: a same-origin proxy, in every environment.** The API client's base URL is the relative `/api/v1`, and `next.config.mjs` rewrites `/api/:path*` to the API origin. The browser therefore never addresses the API directly, the session cookie is first-party, and `SameSite=Lax` holds (ADR-001's amendment). The rewrite runs in dev too, deliberately: two localhost ports are same-site, so a direct dev client would work locally and fail only once deployed. No path translation is needed — the API already serves `/api/v1`.
+
+**Two key spaces.** `/auth/me` lives under a tenant-independent key and is the single source of truth for which workspace is active. Every tenant-scoped entry is prefixed `['tenant', tenantId]`, which is what lets one predicate cancel all in-flight tenant work and one assertion state that nothing of the previous tenant survives.
+
+**The switch is an invariant:** cancel in-flight tenant-scoped requests → clear the cache → seed the switch response as the new identity → bump the generation, which remounts the tenant subtree. The same reset runs on switch, login, logout and on either reset code, and `BroadcastChannel` propagates it to other tabs. A response that arrives after a reset compares its captured generation and is discarded rather than written. `apps/web/lib/workspace-session.spec.ts` is the proof, and `ISOLATION.md` §9 records what it does and does not cover.
+
+**Tenant data renders in client components only.** A server-rendered list would be held in the Next router cache, keyed by route rather than tenant — a second cache the reset cannot reach. That constraint is the reason, not a style preference.
+
+**Forms** use React Hook Form with Zod resolvers. The error envelope and role enum come from `@meterlog/shared`; login, register and set-password request bodies are declared locally, because the server is the sole authority and client validation is UX.
+
+**Error policy.** A 403 is never retried — `NO_ACTIVE_WORKSPACE` is durable, so retrying only spends round trips — and both reset codes discard the cache and return the app to the picker.
 
 ## 6. Data model
 
@@ -139,7 +169,7 @@ Role comes from `RequestContext.role` — the active membership's role, re-read 
 | `DELETE /users/:id`     | ✓     | 403        | 403     |
 | `GET /users/pending`    | ✓     | 403        | 403     |
 
-`GET /users/pending` was added at G2, transcribed from ADR-016's decision to give pending invites their own admin-only route because the response carries live credentials ([`?pending=true` (DECISIONS.md:816)](DECISIONS.md#L816)). Its shape changes with the pending split, OPEN-14.
+`GET /users/pending` was added at G2, transcribed from ADR-016's decision to give pending invites their own admin-only route because the response carries live credentials ([`?pending=true` (DECISIONS.md:818)](DECISIONS.md#L818)). Its shape changes with the pending split, OPEN-14.
 
 ### 9.1 Domain endpoints (recorded at step 6 Phase 1; enforced at Phase 3)
 
@@ -200,7 +230,7 @@ The invariant that forces it: **every status an asset has ever held must have an
 | ------------ | ----- | ---------- | ------- |
 | `GET /audit` | ✓     | 403        | ✓       |
 
-Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:556)](DECISIONS.md#L556)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:635)](DECISIONS.md#L635)).
+Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:558)](DECISIONS.md#L558)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:637)](DECISIONS.md#L637)).
 
 ### 9.4 Routes exempt from the active-workspace requirement (G2, OPEN-18)
 
@@ -220,11 +250,11 @@ None of these reads tenant data, and three of them are how a caller without a wo
 
 ## 10. Audit logging
 
-Lives in DECISIONS: [ADR-009](DECISIONS.md#L409) capture · [ADR-010](DECISIONS.md#L457) integrity · [ADR-011](DECISIONS.md#L483) payload and redaction · [ADR-012](DECISIONS.md#L528) scope, RBAC and volume · [ADR-013](DECISIONS.md#L599) bootstrap rows · [ADR-014](DECISIONS.md#L625) read surface · [ADR-015](DECISIONS.md#L702) column naming.
+Lives in DECISIONS: [ADR-009](DECISIONS.md#L411) capture · [ADR-010](DECISIONS.md#L459) integrity · [ADR-011](DECISIONS.md#L485) payload and redaction · [ADR-012](DECISIONS.md#L530) scope, RBAC and volume · [ADR-013](DECISIONS.md#L601) bootstrap rows · [ADR-014](DECISIONS.md#L627) read surface · [ADR-015](DECISIONS.md#L704) column naming.
 
 ## 11. API conventions
 
-Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:670)](PROGRESS.md#L670)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:232)](PROGRESS.md#L232); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L625).
+Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:670)](PROGRESS.md#L670)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:232)](PROGRESS.md#L232); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L627).
 
 ## 12. Error handling & logging
 
@@ -232,11 +262,11 @@ Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http
 
 ## 13. Configuration & secrets
 
-Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L129) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:110-113)](../.github/workflows/ci.yml#L110-L113)); production secrets in the §16.1 checklist below.
+Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L131) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:110-113)](../.github/workflows/ci.yml#L110-L113)); production secrets in the §16.1 checklist below.
 
 ## 14. Local development
 
-Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L278); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
+Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L280); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
 
 ## 15. CI/CD
 
