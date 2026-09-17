@@ -159,12 +159,12 @@ NestJS API (Railway/Render)
 
 Representative endpoints:
 
-- **Auth:** `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`
+- **Auth:** `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`, `POST /auth/set-password`, `POST /auth/switch`
 - **Users (admin):** `GET /users`, `POST /users` (invite), `PATCH /users/:id` (role), `DELETE /users/:id` (soft)
 - **Assets:** `GET /assets` (filter/sort/paginate), `POST /assets`, `GET /assets/:id`, `PATCH /assets/:id`, `DELETE /assets/:id` (soft)
 - **Asset events:** `GET /assets/:id/events`, `POST /assets/:id/events`
 - **Readings:** `GET /assets/:id/readings`, `POST /assets/:id/readings`
-- **Maintenance:** `GET /assets/:id/maintenance`, `POST /assets/:id/maintenance`
+- **Maintenance:** `GET /maintenance-records`, `POST /maintenance-records`, `GET /maintenance-records/:id`, `PATCH /maintenance-records/:id`, `DELETE /maintenance-records/:id`
 - **Audit (admin/auditor):** `GET /audit` (filter by entity, actor, date range, paginated)
 - **Health:** `GET /health` (for uptime monitoring)
 
@@ -262,7 +262,7 @@ Follow SDLC phases; work in small PRs. Log decisions as you go.
 
 - [x] Tenant isolation enforced by RLS and proven by an integration test (A can't see B).
 - [x] Three roles with enforced permissions; 403 paths tested.
-- [ ] Audit log written on every core mutation; viewable by admin/auditor.
+- [x] Audit log written on every core mutation; viewable by admin/auditor.
 - [ ] All essential endpoints implemented with validation, pagination, error envelope, OpenAPI docs.
 - [ ] Frontend covers all essential journeys.
 - [x] Invited users can set a password and log in; no invite creates an unreachable account.
