@@ -76,6 +76,8 @@ Writes carry **two independent checks**: the `@RequiresRole('admin')` gate below
 
 ## 5. Frontend structure
 
+Not yet built — the frontend slice (brief §11 step 8).
+
 ## 6. Data model
 
 ### 6.1 ERD
@@ -180,15 +182,27 @@ The invariant that forces it: **every status an asset has ever held must have an
 
 ## 10. Audit logging
 
+Lives in DECISIONS: [ADR-009](DECISIONS.md#L407) capture · [ADR-010](DECISIONS.md#L455) integrity · [ADR-011](DECISIONS.md#L481) payload and redaction · [ADR-012](DECISIONS.md#L526) scope, RBAC and volume · [ADR-013](DECISIONS.md#L597) bootstrap rows · [ADR-014](DECISIONS.md#L623) read surface · [ADR-015](DECISIONS.md#L700) column naming.
+
 ## 11. API conventions
+
+Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:670)](PROGRESS.md#L670)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:232)](PROGRESS.md#L232); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L623).
 
 ## 12. Error handling & logging
 
+Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14) — see §11. Logging: not yet built — PROJECT_BRIEF §11 step 10; [`nestjs-pino` (package.json:31)](../apps/api/package.json#L31) is installed and has no use in `apps/api/src`.
+
 ## 13. Configuration & secrets
+
+Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L127) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:110-113)](../.github/workflows/ci.yml#L110-L113)); production secrets in the §16.1 checklist below.
 
 ## 14. Local development
 
+Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L276); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
+
 ## 15. CI/CD
+
+CI: the rationale lives in the `ci.yml` comments — [`DO NOT RENAME THIS JOB` (ci.yml:19)](../.github/workflows/ci.yml#L19), [`Check doc citations` (ci.yml:87)](../.github/workflows/ci.yml#L87), [`Give the app role a password` (ci.yml:110-113)](../.github/workflows/ci.yml#L110-L113). CD: not yet built — PROJECT_BRIEF §11 step 10.
 
 ## 16. Deployment topology
 
@@ -250,5 +264,7 @@ curl -is https://<host>/api/v1/auth/login -H 'content-type: application/json'   
   **Why custom rather than the idiomatic standard codes.** `42501 insufficient_privilege` is the natural fit for `MB001` and is the wrong choice: Postgres raises `42501` itself for a plain table-privilege denial, so a test asserting it would pass just as happily against a misconfigured `GRANT` that never reached the function body — a green negative proving nothing. The same argument rules out `P0002` (plpgsql raises it for `SELECT … INTO STRICT`) and `23514` (a real `CHECK`). A code nothing else in the cluster can raise makes each refusal unambiguously attributable to the body check it came from. `MB002` deliberately covers "belongs to another tenant" and "does not exist" with **one** code, so the endpoint is not an oracle for membership ids the caller cannot see.
 
 ## 17. Observability
+
+Not yet built — PROJECT_BRIEF §11 step 10 (Sentry and uptime monitoring; structured logging is §12).
 
 ## 18. Known limitations
