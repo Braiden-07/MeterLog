@@ -4,8 +4,10 @@ import {
   ForbiddenException,
   Injectable,
   NestInterceptor,
+  RequestMethod,
   UnauthorizedException,
 } from '@nestjs/common';
+import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 import { Reflector } from '@nestjs/core';
 import { Observable, firstValueFrom, from } from 'rxjs';
 
@@ -15,6 +17,49 @@ import { REQUIRES_SESSION } from '../auth/requires-session.decorator';
 import { PrismaService, TRANSACTION_OPTIONS } from '../prisma/prisma.service';
 import { runWithRequestContext } from '../request-context/request-context';
 import { SESSION_COOKIE, SessionService } from '../session/session.service';
+
+/**
+ * The routes that do NOT require an active workspace — every other route does.
+ *
+ * DEFAULT-DENY, and the exemption is the thing written down (G2, OPEN-18). A route
+ * is tenant-scoped unless it appears here, so a new controller, a new handler on
+ * an exempt controller, or a renamed path all inherit the refusal rather than
+ * silently reaching a handler with no tenant context. ADR-006 §5 specified this
+ * 403 from the start; before this set existed, an un-gated read with no workspace
+ * reached RLS with no tenant GUC and answered `200 {"items":[]}` or `404`.
+ *
+ * Keyed on `METHOD /path` read from Nest's own route metadata, controller-relative
+ * (no `/api/v1` prefix) — the same construction `test/api/route-inventory.spec.ts`
+ * uses to enumerate routes. That spec asserts this set equal to the exempt-routes
+ * table in `ARCHITECTURE.md` §9, so an exemption cannot be added or dropped here
+ * without the documented matrix moving with it.
+ */
+export const WORKSPACE_EXEMPT_ROUTES: ReadonlySet<string> = new Set([
+  'POST /auth/register',
+  'POST /auth/login',
+  'POST /auth/set-password',
+  'POST /auth/switch',
+  'GET /auth/me',
+  'POST /auth/logout',
+  'GET /health',
+]);
+
+/**
+ * `METHOD /path` for a handler, or null when the route carries no Nest route
+ * metadata. Null is never exempt, so an unidentifiable route fails closed.
+ */
+export function routeKey(reflector: Reflector, handler: object, controller: object): string | null {
+  const base = reflector.get<string | undefined>(PATH_METADATA, controller as never);
+  const sub = reflector.get<string | undefined>(PATH_METADATA, handler as never);
+  const verb = reflector.get<RequestMethod | undefined>(METHOD_METADATA, handler as never);
+  if (base === undefined || sub === undefined || verb === undefined) return null;
+
+  const path = `/${[base, sub]
+    .map((p) => String(p).replace(/^\/|\/$/g, ''))
+    .filter(Boolean)
+    .join('/')}`;
+  return `${RequestMethod[verb]} ${path}`;
+}
 
 /**
  * The two-GUC request interceptor (ADR-004 + ADR-006 §4).
@@ -71,6 +116,11 @@ export class TenantContextInterceptor implements NestInterceptor {
       context.getClass(),
     ]);
 
+    // Default-deny: only a listed route may be served without an active workspace.
+    const exempt = WORKSPACE_EXEMPT_ROUTES.has(
+      routeKey(this.reflector, context.getHandler(), context.getClass()) ?? '',
+    );
+
     if (!session) {
       // No identity to scope by, so no transaction and no GUCs.
       //
@@ -79,6 +129,12 @@ export class TenantContextInterceptor implements NestInterceptor {
       // legitimately arrive without a session, while /auth/me and /auth/switch
       // cannot function without one. Routes say so with @RequiresSession().
       //
+      // A route that is NOT exempt is tenant-scoped, and a tenant-scoped route
+      // cannot be served without identity whatever its decorators say. Every
+      // such controller carries @RequiresSession() today; this makes forgetting
+      // it a 401 rather than an anonymous call into a handler that has no
+      // request context and 500s.
+      //
       // Enforced here rather than in a CanActivate guard because Nest runs guards
       // BEFORE interceptors — a guard cannot see a context this interceptor has
       // not established yet, and one written that way rejects every request.
@@ -86,12 +142,33 @@ export class TenantContextInterceptor implements NestInterceptor {
         context.getHandler(),
         context.getClass(),
       ]);
-      if (required || (requiredRoles && requiredRoles.length > 0)) {
+      if (!exempt || required || (requiredRoles && requiredRoles.length > 0)) {
         throw new UnauthorizedException({
           error: { code: 'UNAUTHENTICATED', message: 'Sign in to continue.' },
         });
       }
       return firstValueFrom(next.handle());
+    }
+
+    if (!session.activeTenantId && !exempt) {
+      // NO ACTIVE WORKSPACE on a tenant-scoped route (G2, ADR-006 §5).
+      //
+      // Refused here, before the transaction, the pipes, the role gate and the
+      // handler, so nothing in the answer can depend on the request: the same
+      // bytes for any id, well-formed or not. Letting it through would reach RLS
+      // with no tenant GUC and answer an empty page or a 404 — a false success a
+      // client caches, and the one a retry after MEMBERSHIP_REVOKED lands on.
+      //
+      // DISTINCT from FORBIDDEN_ROLE on purpose: "choose a workspace" and "you
+      // may not do this here" need different client responses. It reveals only
+      // the caller's own session state, which GET /auth/me already returns; the
+      // request names no workspace, so there is nothing to probe.
+      throw new ForbiddenException({
+        error: {
+          code: 'NO_ACTIVE_WORKSPACE',
+          message: 'Choose a workspace to continue.',
+        },
+      });
     }
 
     return this.prisma.$transaction(async (tx) => {
@@ -161,9 +238,10 @@ export class TenantContextInterceptor implements NestInterceptor {
       // would 500 on every gated route. See requires-role.decorator.ts — this is
       // the Phase 4 ordering defect one layer up, and it is not being repeated.
       //
-      // A null role means no active workspace (zero or several memberships, none
-      // selected). That fails the gate: there is no tenant in which the caller
-      // holds the required role, so the answer is 403, not "allow".
+      // A null role means no active workspace. On a tenant-scoped route that is
+      // refused above with NO_ACTIVE_WORKSPACE before this point is reached, so
+      // the `!role` arm now matters only for a role-gated route that is also
+      // exempt — none exists. It stays: a null role must never read as "allow".
       //
       // This is the OUTER of two checks. The definer function bodies re-check the
       // caller is a live admin of the active tenant, and that check is the one

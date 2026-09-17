@@ -1,10 +1,19 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import { INestApplication, RequestMethod } from '@nestjs/common';
 import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
-import { ModulesContainer } from '@nestjs/core';
+import { ModulesContainer, Reflector } from '@nestjs/core';
 import { Test } from '@nestjs/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { AppModule } from '../../src/app.module';
+import { REQUIRES_ROLE } from '../../src/common/auth/requires-role.decorator';
+import { REQUIRES_SESSION } from '../../src/common/auth/requires-session.decorator';
+import {
+  WORKSPACE_EXEMPT_ROUTES,
+  routeKey,
+} from '../../src/common/tenant-context/tenant-context.interceptor';
 import { APPEND_ONLY_TABLES, DEFINER_WRITTEN_APPEND_ONLY_TABLES, loadEnv } from '../db/helpers';
 
 /**
@@ -72,6 +81,8 @@ const MUTATING_METHODS = ['PATCH', 'PUT', 'DELETE'] as const;
 interface RouteInfo {
   method: string;
   path: string;
+  handler: object;
+  controller: object;
 }
 
 /**
@@ -112,7 +123,12 @@ function registeredRoutes(app: INestApplication): RouteInfo[] {
           .map((p) => p.replace(/^\/|\/$/g, ''))
           .filter(Boolean)
           .join('/')}`;
-        routes.push({ method: RequestMethod[verb] ?? String(verb), path });
+        routes.push({
+          method: RequestMethod[verb] ?? String(verb),
+          path,
+          handler: handler as object,
+          controller: type,
+        });
       }
     }
   }
@@ -234,5 +250,193 @@ describe('route inventory — no endpoint may mutate an append-only resource', (
         `${segment} exposes no POST`,
       ).toBe(true);
     }
+  });
+});
+
+/**
+ * THE §9 ROUTE/ROLE GUARD (G2, OPEN-18) — `ARCHITECTURE.md` §9 is the registry, the
+ * live routes are the catalog, and the two must agree in BOTH directions.
+ *
+ * Same shape as the isolation suite's fixture-registry check: a route with no row
+ * fails, a row with no route fails, and a row whose ✓/403 cells disagree with the
+ * route's `@RequiresRole` fails. The exempt-route table (§9.4) is asserted equal to
+ * the interceptor's `WORKSPACE_EXEMPT_ROUTES`, and its "Session required" column
+ * against `@RequiresSession`.
+ *
+ * WHY THE DOCUMENT IS READ, RATHER THAN A TYPESCRIPT COPY OF IT. A constant in this
+ * file would be checked against the code and never against §9, which is the gap
+ * this guard exists to close: the matrix a reader consults could drift from the
+ * routes with every test green. Parsing §9 makes a matrix edit and a decorator edit
+ * the same reviewed change, or a red one.
+ *
+ * It lands with G2 because G2 is the first change that moves the matrix: the
+ * default-deny exemption set is a new column of truth about every route.
+ */
+const ROLES = ['admin', 'technician', 'auditor'] as const;
+
+interface MatrixRow {
+  key: string;
+  allowed: string[];
+}
+
+interface ExemptRow {
+  key: string;
+  sessionRequired: boolean;
+}
+
+function readMatrix(): { roles: MatrixRow[]; exempt: ExemptRow[]; duplicates: string[] } {
+  const doc = readFileSync(resolve(__dirname, '../../../../docs/ARCHITECTURE.md'), 'utf8');
+  const lines = doc.split('\n');
+  const start = lines.findIndex((l) => l.startsWith('## 9.'));
+  const end = lines.findIndex((l, i) => i > start && l.startsWith('## 10.'));
+  if (start < 0 || end < 0) {
+    throw new Error('ARCHITECTURE.md §9 not found — the guard cannot read its registry');
+  }
+
+  const roles: MatrixRow[] = [];
+  const exempt: ExemptRow[] = [];
+  const seen = new Set<string>();
+  const duplicates: string[] = [];
+  let header: string[] | null = null;
+
+  const cells = (line: string): string[] =>
+    line
+      .trim()
+      .replace(/^\||\|$/g, '')
+      .split('|')
+      .map((c) => c.trim());
+
+  for (const line of lines.slice(start, end)) {
+    if (!line.trim().startsWith('|')) {
+      header = null;
+      continue;
+    }
+    const row = cells(line);
+    if (!header) {
+      header = row;
+      continue;
+    }
+    if (row.every((c) => /^-+$/.test(c))) continue;
+
+    const route = /^`(GET|POST|PUT|PATCH|DELETE) (\/[^`]*)`/.exec(row[0] ?? '');
+    if (!route) throw new Error(`§9 row does not start with a METHOD /path cell: ${line}`);
+    const key = `${route[1]} ${route[2]}`;
+    if (seen.has(key)) duplicates.push(key);
+    seen.add(key);
+
+    if (header[1] === 'admin' && header[2] === 'technician' && header[3] === 'auditor') {
+      const allowed = ROLES.filter((_, i) => {
+        const cell = row[i + 1];
+        if (cell !== '✓' && cell !== '403') throw new Error(`§9 cell must be ✓ or 403: ${line}`);
+        return cell === '✓';
+      });
+      roles.push({ key, allowed: [...allowed] });
+    } else if (header[0] === 'Exempt route') {
+      const cell = row[1];
+      if (cell !== 'yes' && cell !== 'no') {
+        throw new Error(`§9.4 session cell must be yes or no: ${line}`);
+      }
+      exempt.push({ key, sessionRequired: cell === 'yes' });
+    } else {
+      throw new Error(`unrecognised §9 table header: ${header.join(' | ')}`);
+    }
+  }
+  return { roles, exempt, duplicates };
+}
+
+describe('§9 route/role matrix — the document and the live routes agree in both directions', () => {
+  let app: INestApplication;
+  let routes: RouteInfo[];
+  let reflector: Reflector;
+  let matrix: ReturnType<typeof readMatrix>;
+
+  const keyOf = (r: RouteInfo): string => `${r.method} ${r.path}`;
+  const liveAllowed = (r: RouteInfo): string[] => {
+    const required = reflector.getAllAndOverride<string[] | undefined>(REQUIRES_ROLE, [
+      r.handler as never,
+      r.controller as never,
+    ]);
+    // No @RequiresRole: every role is served — the ✓ ✓ ✓ row.
+    return required && required.length > 0
+      ? ROLES.filter((role) => required.includes(role))
+      : [...ROLES];
+  };
+
+  beforeAll(async () => {
+    loadEnv();
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+    routes = registeredRoutes(app);
+    reflector = app.get(Reflector);
+    matrix = readMatrix();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('read a real matrix — not passing because it parsed nothing', () => {
+    expect(matrix.roles.length).toBeGreaterThan(10);
+    expect(matrix.exempt.length).toBeGreaterThan(0);
+    // Every registered route accounted for — no silent truncation of the parse.
+    expect(matrix.roles.length + matrix.exempt.length).toBe(routes.length);
+    expect(matrix.duplicates, 'a route appears in §9 more than once').toEqual([]);
+  });
+
+  it('the interceptor keys routes exactly as this guard enumerates them', () => {
+    // WORKSPACE_EXEMPT_ROUTES is matched on routeKey(); this guard matches on the
+    // enumerated method + path. If the two constructions ever diverged, §9.4 could
+    // agree with the set while the interceptor exempted something else.
+    for (const r of routes) {
+      expect(routeKey(reflector, r.handler, r.controller)).toBe(keyOf(r));
+    }
+  });
+
+  it('§9.4 equals the interceptor exempt set, and each row matches @RequiresSession', () => {
+    expect(matrix.exempt.map((r) => r.key).sort()).toEqual([...WORKSPACE_EXEMPT_ROUTES].sort());
+
+    for (const row of matrix.exempt) {
+      const live = routes.find((r) => keyOf(r) === row.key);
+      expect(live, `§9.4 lists ${row.key}, which is not a registered route`).toBeDefined();
+      const requiresSession = Boolean(
+        reflector.getAllAndOverride<boolean>(REQUIRES_SESSION, [
+          live!.handler as never,
+          live!.controller as never,
+        ]),
+      );
+      expect(requiresSession, `§9.4 "Session required" for ${row.key}`).toBe(row.sessionRequired);
+      // An exempt route with a role gate would be a contradiction: a role only
+      // exists inside a workspace.
+      expect(liveAllowed(live!), `${row.key} is exempt but role-gated`).toEqual([...ROLES]);
+    }
+  });
+
+  it('every live route has exactly one §9 row, and every §9 row is a live route', () => {
+    const documented = new Set([
+      ...matrix.roles.map((r) => r.key),
+      ...matrix.exempt.map((r) => r.key),
+    ]);
+    const live = new Set(routes.map(keyOf));
+
+    const undocumented = [...live].filter((k) => !documented.has(k)).sort();
+    const stale = [...documented].filter((k) => !live.has(k)).sort();
+    expect(undocumented, 'routes with no row in ARCHITECTURE.md §9').toEqual([]);
+    expect(stale, 'rows in ARCHITECTURE.md §9 for routes that do not exist').toEqual([]);
+
+    const both = matrix.roles.map((r) => r.key).filter((k) => WORKSPACE_EXEMPT_ROUTES.has(k));
+    expect(both, 'a route cannot be both tenant-scoped (a role table) and exempt (§9.4)').toEqual(
+      [],
+    );
+  });
+
+  it('every role row matches its route’s @RequiresRole, cell by cell', () => {
+    const mismatches = matrix.roles
+      .map((row) => {
+        const live = routes.find((r) => keyOf(r) === row.key);
+        return { key: row.key, documented: row.allowed, actual: live ? liveAllowed(live) : null };
+      })
+      .filter((m) => JSON.stringify(m.documented) !== JSON.stringify(m.actual));
+    expect(mismatches, 'ARCHITECTURE.md §9 disagrees with the decorators').toEqual([]);
   });
 });

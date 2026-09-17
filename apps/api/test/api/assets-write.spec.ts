@@ -694,7 +694,7 @@ describe('assets write surface (step-6 phase 3b)', () => {
         a.userId,
       );
 
-      for (const res of [
+      const responses = [
         await http().post('/api/v1/assets').set('Cookie', a.cookie).send(newAsset()),
         await http()
           .patch(`/api/v1/assets/${asset.body.id}`)
@@ -704,13 +704,21 @@ describe('assets write surface (step-6 phase 3b)', () => {
           .post(`/api/v1/assets/${asset.body.id}/readings`)
           .set('Cookie', a.cookie)
           .send({ value: '1', unit: 'kWh', readAt: '2026-04-01T00:00:00.000Z' }),
-      ]) {
+      ];
+      for (const res of responses) {
         expect(res.status).toBe(403);
         expect(res.status).not.toBe(500);
-        // Revocation is detected before the role gate, so the code names the real
-        // reason rather than blaming the role.
-        expect(['MEMBERSHIP_REVOKED', 'FORBIDDEN_ROLE']).toContain(res.body.error.code);
       }
+      // The code names the real reason at each step, never the role. The first
+      // request still claims the revoked workspace (MEMBERSHIP_REVOKED) and clears
+      // that claim; the rest are then in the no-workspace state, which since G2 is
+      // refused before the role gate as NO_ACTIVE_WORKSPACE rather than accepted
+      // as either code (OPEN-18).
+      expect(responses.map((r) => r.body.error.code)).toEqual([
+        'MEMBERSHIP_REVOKED',
+        'NO_ACTIVE_WORKSPACE',
+        'NO_ACTIVE_WORKSPACE',
+      ]);
     });
   });
 

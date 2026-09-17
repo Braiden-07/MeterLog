@@ -458,14 +458,16 @@ describe('memberships API (step-5 phase 2 — RBAC)', () => {
         .send({ email: 'x@acme.test', role: 'technician' })
         .expect(403);
 
-      // Now the session genuinely has no active workspace. The gate is what
-      // refuses this one, with a null role.
+      // Now the session genuinely has no active workspace. Until G2 the role gate
+      // refused this with a null role (`FORBIDDEN_ROLE`); the interceptor's
+      // default-deny now refuses it first, before any role is consulted, with the
+      // code that names the state (OPEN-18). Still a 403 — never permissive.
       const res = await http()
         .post('/api/v1/users')
         .set('Cookie', cookie)
         .send({ email: 'x@acme.test', role: 'technician' })
         .expect(403);
-      expect(res.body.error.code).toBe('FORBIDDEN_ROLE');
+      expect(res.body.error.code).toBe('NO_ACTIVE_WORKSPACE');
     });
   });
 
