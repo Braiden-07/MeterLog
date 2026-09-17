@@ -174,7 +174,7 @@ WHERE u.email OPERATOR(public.=) p_email
 
 — [migration.sql:62](../apps/api/prisma/migrations/20260908000000_auth_definer_functions/migration.sql#L62)
 
-Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:181](DECISIONS.md#L181)) so the next definer function comparing an extension type does not walk back into it.
+Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:183](DECISIONS.md#L183)) so the next definer function comparing an extension type does not walk back into it.
 
 **Step 5 is where that amendment earned its keep.** The three membership-write functions are schema-qualified on _every_ operator — `OPERATOR(public.=)` for citext, `OPERATOR(pg_catalog.=)` for uuid and enum — rather than only on the one comparison that had already burned the project. In `invite_member` the consequence of getting it wrong would have been subtler than the original: a case-different existing address would miss the lookup, the create branch would fire, and the case-**insensitive** unique index would refuse it — an invite that cannot succeed for a person who is already in the system.
 
@@ -645,7 +645,7 @@ Step 7a built the audit **capture** mechanism and proved it at the database laye
 
 **Step 6 disproved it.** A maintenance edit emits **no lifecycle event at all**: correcting a description is not something that happened to the physical asset. The asset-metadata `PATCH` is the same shape (ARCHITECTURE §9.2). A derived trail is therefore silent for the entire class of change an auditor is most likely to be investigating — and silent without erroring, which is this document's recurring failure mode.
 
-So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L409)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
+So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L411)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
 
 ### The centerpiece — immutable by grant
 
@@ -660,7 +660,7 @@ psql:/tmp/neg.sql:9:  ERROR:  permission denied for table audit_log
 psql:/tmp/neg.sql:11: ERROR:  permission denied for table audit_log
 ```
 
-Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L457)).
+Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L459)).
 
 Two vacuity guards sit under it. The `ALTER` and `SUPPRESS` negatives assert the row **existed, was visible under that tenant, and is unchanged afterwards**, so neither can pass against an empty table. And a positive pairs with all three — the app role **can** read its own tenant's rows ([`the app role CAN read its own tenant rows`](../apps/api/test/db/audit.spec.ts#L335)) — because "cannot write" is otherwise satisfied by a table nobody can reach at all, which is fail-closed and broken.
 
@@ -768,7 +768,7 @@ Six, up from five, with the allowlist extended in the same PR ([`EXPECTED_DEFINE
 
 ### What 7a does not prove
 
-The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L528) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
+The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L530) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
 
 Hash-chaining is deferred, and ADR-010 records why as engineering rather than scope. What immutability-by-grant does **not** give, stated plainly: it defends against the application and against anyone holding only the app role's credentials. It does **not** defend against the migration/owner role or a cluster superuser, who can `ALTER TABLE`. Tamper-evidence against a privileged operator is what a chain buys, and that threat model is not v1.0's.
 
@@ -780,7 +780,7 @@ Step 7a proved capture at the database layer. It proved nothing about **who may 
 
 ### The test this module would have shipped broken without
 
-`PROJECT_BRIEF` names three roles (:28) and says the trail is "viewable by **admin/auditor**" (:264). So the gate is `@RequiresRole('admin', 'auditor')`.
+`PROJECT_BRIEF` names three roles (:28) and says the trail is "viewable by **admin/auditor**" (:265). So the gate is `@RequiresRole('admin', 'auditor')`.
 
 **Every RBAC negative in the suite passes identically against an admin-only implementation.** Technician 403, non-member 403, cross-tenant empty — all of them hold whether or not auditors are admitted. A module gated `@RequiresRole('admin')` would have a **completely green suite** and a real defect: the auditor role, which exists for little else, would collapse into a technician who cannot write.
 
@@ -1003,7 +1003,11 @@ This list is kept aligned with the enumerated **Open items register** in [`DECIS
 
   **`maintenance_records` is where this gap is sharpest.** A maintenance edit emits **no lifecycle event at all** — correcting a description is not something that happened to the physical asset — so for that mutation the event log is silent and `audit_log` would be the _only_ record. Of the domain's mutations it is the one a retrofit driven from `asset_events` would most certainly miss, because there is nothing in `asset_events` to drive from.
 
-- **The API surface is proven by acceptance tests, not by use.** Every claim in §7f is an automated test against a local or CI Postgres. No frontend consumes these endpoints (step 8), no load test has run against them (§13's k6 is outstanding), and the `EXPLAIN ANALYZE` numbers in [`PERF.md`](PERF.md) are local warm-cache plan comparisons — useful for plan **shape**, not quotable as production latency.
+- **The API surface is proven by acceptance tests, not by use.** Every claim in §7f is an automated test against a local or CI Postgres. No load test has run against these endpoints (§13's k6 is outstanding), and the `EXPLAIN ANALYZE` numbers in [`PERF.md`](PERF.md) are local warm-cache plan comparisons — useful for plan **shape**, not quotable as production latency. A frontend consumes the auth and asset-read endpoints as of slice 1 of the frontend slice (brief §11 step 8); the audit and admin surfaces still have no consumer.
+
+- **The cache-eviction proof is a CLIENT-MECHANISM proof against a fake server, not a browser against the real API.** [`workspace-session.spec.ts`](../apps/web/lib/workspace-session.spec.ts#L186) drives the real switch path with a real `QueryClient` against a scripted fake server with held responses and an injected fetch. That is the right shape for the invariant it checks — it can hold Beta's response open and assert Acme is gone at that exact instant, which no browser test can do reliably — and it is **not** evidence that a real browser, running the real bundle against the real API, evicts anything. Nothing here exercises the router cache, `bfcache`, a second window, or a real `BroadcastChannel`. **The live-browser version is owed as OPEN-17** (Playwright, `PROJECT_BRIEF` §11 step 9), and it carries the same gone-not-arrived assertion rather than a screenshot of tenant B.
+
+- **The client closes the late-READ race; the cross-tab WRITE race stays open (OPEN-15).** Reads are covered structurally: a reset cancels in-flight tenant-scoped requests and every response carries the cache generation it was issued under, so one arriving after a switch is discarded rather than written — proven, including for a reset back into the **same** workspace, where the tenant id alone cannot tell the generations apart. **Writes are not covered.** `X-Expected-Tenant` is sent, and the server does not read it: a write issued while workspace A was active and arriving after a switch to B is still applied under B. Until that header is enforced server-side (OPEN-15), the guarantee is "no stale data is displayed", never "no stale write lands". The header in the client is labelled inert for exactly this reason, so nobody reads its presence as enforcement.
 - **Nothing here is proven against production.** All evidence is local and CI, both of which run the migration role as a cluster **superuser**. Render's is not, and a superuser satisfies `pg_has_role` unconditionally and bypasses RLS — so a class of privilege defect is invisible in both environments where the tests run. That gap is enumerated as a pre-deploy checklist ([ARCHITECTURE.md §16.1](ARCHITECTURE.md)), including the `Secure` cookie flag, which is gated on `NODE_ENV` and therefore **unverifiable by CI by construction**.
 - **The interactive-transaction-per-request cost is priced, not eliminated.** Every authenticated request holds a transaction for its duration; under load, pool exhaustion presents as an apparent hang — rising latency with no error rate (ARCHITECTURE §16.2).
 
