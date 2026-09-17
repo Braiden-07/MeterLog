@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, RequestMethod, UnauthorizedException } from '@nestjs/common';
 import type { CallHandler, ExecutionContext } from '@nestjs/common';
+import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 import { Reflector } from '@nestjs/core';
 import { PrismaClient as PrismaClientCtor } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
@@ -13,8 +14,13 @@ import {
   peekRequestContext,
   requireRequestContext,
 } from '../../src/common/request-context/request-context';
+import { REQUIRES_SESSION } from '../../src/common/auth/requires-session.decorator';
 import { SESSION_COOKIE, SessionService } from '../../src/common/session/session.service';
-import { TenantContextInterceptor } from '../../src/common/tenant-context/tenant-context.interceptor';
+import {
+  TenantContextInterceptor,
+  WORKSPACE_EXEMPT_ROUTES,
+  routeKey,
+} from '../../src/common/tenant-context/tenant-context.interceptor';
 import { execAll, loadEnv, migratorClient, resetDatabase } from './helpers';
 
 /**
@@ -93,17 +99,47 @@ describe('tenant-context interceptor (Phase 3)', () => {
 
   // -- harness ---------------------------------------------------------------
 
-  function contextWithCookie(cookie: string | undefined): ExecutionContext {
+  interface MockRoute {
+    handler: object;
+    controller: object;
+  }
+
+  /** A route carrying real Nest route metadata, so `routeKey` resolves it. */
+  function mockRoute(base: string, sub: string, verb: RequestMethod, requiresSession = false): MockRoute {
+    const controller = class {};
+    const handler = (): void => undefined;
+    Reflect.defineMetadata(PATH_METADATA, base, controller);
+    Reflect.defineMetadata(PATH_METADATA, sub, handler);
+    Reflect.defineMetadata(METHOD_METADATA, verb, handler);
+    if (requiresSession) Reflect.defineMetadata(REQUIRES_SESSION, true, handler);
+    return { handler, controller };
+  }
+
+  // The routes a simulated request runs as. Since G2 (OPEN-18) the interceptor is
+  // default-deny: a route not in WORKSPACE_EXEMPT_ROUTES refuses a session with no
+  // active tenant (403) and an anonymous caller (401). So the route is part of
+  // the scenario, not incidental to it.
+  //
+  //  - TENANT_SCOPED — no route metadata at all, so never exempt. The default,
+  //    and what every case with an active tenant runs as.
+  //  - AUTH_ME — stands in for GET /auth/me: exempt, @RequiresSession. The no-
+  //    active-tenant GUC state is reachable ONLY through an exempt route now, so
+  //    the cases proving that state run here.
+  //  - HEALTH — stands in for GET /health: exempt, no session required. The
+  //    cases proving "no session ⇒ no transaction, no context" run here.
+  const TENANT_SCOPED: MockRoute = { handler: (): void => undefined, controller: class {} };
+  const AUTH_ME = mockRoute('auth', 'me', RequestMethod.GET, true);
+  const HEALTH = mockRoute('health', '/', RequestMethod.GET);
+
+  function contextWithCookie(
+    cookie: string | undefined,
+    route: MockRoute = TENANT_SCOPED,
+  ): ExecutionContext {
     const headers = cookie ? { cookie: `${SESSION_COOKIE}=${encodeURIComponent(cookie)}` } : {};
-    // getHandler/getClass are required because the interceptor now consults the
-    // Reflector for @RequiresSession on the session-less path. These stand in for
-    // an unannotated route, which is the correct default for this suite: it tests
-    // the context machinery, not route-level auth policy (that is test/api).
-    const noop = (): void => undefined;
     return {
       switchToHttp: () => ({ getRequest: () => ({ headers }) }),
-      getHandler: () => noop,
-      getClass: () => class {},
+      getHandler: () => route.handler,
+      getClass: () => route.controller,
     } as unknown as ExecutionContext;
   }
 
@@ -124,9 +160,13 @@ describe('tenant-context interceptor (Phase 3)', () => {
   }
 
   /** One simulated request. */
-  function request<T>(cookie: string | undefined, body: () => Promise<T>): Promise<T> {
+  function request<T>(
+    cookie: string | undefined,
+    body: () => Promise<T>,
+    route: MockRoute = TENANT_SCOPED,
+  ): Promise<T> {
     return firstValueFrom(
-      interceptor.intercept(contextWithCookie(cookie), handler(body)),
+      interceptor.intercept(contextWithCookie(cookie, route), handler(body)),
     ) as Promise<T>;
   }
 
@@ -182,27 +222,76 @@ describe('tenant-context interceptor (Phase 3)', () => {
       expect(seen.visible_memberships).toBe(2);
     });
 
+    it('the harness routes are what they claim — two exempt, one tenant-scoped', () => {
+      // Every case below that runs as AUTH_ME or HEALTH depends on the interceptor
+      // actually resolving those mocks to exempt keys. Asserted, so a metadata
+      // change cannot quietly turn them into tenant-scoped routes (or back).
+      const reflector = new Reflector();
+      expect(routeKey(reflector, AUTH_ME.handler, AUTH_ME.controller)).toBe('GET /auth/me');
+      expect(routeKey(reflector, HEALTH.handler, HEALTH.controller)).toBe('GET /health');
+      expect(WORKSPACE_EXEMPT_ROUTES.has('GET /auth/me')).toBe(true);
+      expect(WORKSPACE_EXEMPT_ROUTES.has('GET /health')).toBe(true);
+      expect(routeKey(reflector, TENANT_SCOPED.handler, TENANT_SCOPED.controller)).toBeNull();
+    });
+
     it('a session with no active tenant gets the user axis only', async () => {
-      // The post-login, pre-switch state for a multi-membership user.
+      // The post-login, pre-switch state for a multi-membership user. Since G2 this
+      // state is served only on an exempt route, so it runs as GET /auth/me — the
+      // route that genuinely reads memberships through the self axis in this state.
       const cookie = await login(userM, null);
-      const seen = await request(cookie, probe);
+      const seen = await request(cookie, probe, AUTH_ME);
       expect(seen.user_guc).toBe(userM);
       expect(seen.tenant_guc).toBe('');
       expect(seen.visible_memberships).toBe(2); // M's own A and B memberships
     });
 
-    it('an unauthenticated request opens no transaction and gets no context', async () => {
-      const ctx = await request(undefined, async () => peekRequestContext());
+    it('a session with no active tenant on a TENANT-SCOPED route is refused before the handler (G2)', async () => {
+      const cookie = await login(userM, null);
+      let reached = false;
+      const refusal = await request(
+        cookie,
+        async () => {
+          reached = true;
+          return probe();
+        },
+      ).catch((e: unknown) => e);
+
+      expect(refusal).toBeInstanceOf(ForbiddenException);
+      expect((refusal as ForbiddenException).getResponse()).toEqual({
+        error: { code: 'NO_ACTIVE_WORKSPACE', message: 'Choose a workspace to continue.' },
+      });
+      expect(reached, 'the handler ran for a session with no active workspace').toBe(false);
+    });
+
+    it('an unauthenticated request to an exempt route opens no transaction and gets no context', async () => {
+      const ctx = await request(undefined, async () => peekRequestContext(), HEALTH);
       expect(ctx).toBeNull();
+    });
+
+    it('an unauthenticated request to a TENANT-SCOPED route is 401 even with no @RequiresSession (G2)', async () => {
+      // TENANT_SCOPED carries no @RequiresSession. Before default-deny it passed
+      // straight through to a handler with no request context; now the missing
+      // decorator cannot leave a tenant-scoped route anonymously reachable.
+      let reached = false;
+      const refusal = await request(undefined, async () => {
+        reached = true;
+        return peekRequestContext();
+      }).catch((e: unknown) => e);
+
+      expect(refusal).toBeInstanceOf(UnauthorizedException);
+      expect((refusal as UnauthorizedException).getResponse()).toMatchObject({
+        error: { code: 'UNAUTHENTICATED' },
+      });
+      expect(reached).toBe(false);
     });
 
     it('a forged or tampered cookie is treated as no session', async () => {
       const cookie = await login(userM, tenantA, 'admin');
       const tampered = `${cookie.slice(0, cookie.lastIndexOf('.'))}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`;
-      expect(await request(tampered, async () => peekRequestContext())).toBeNull();
+      expect(await request(tampered, async () => peekRequestContext(), HEALTH)).toBeNull();
       // And a valid signature over an unknown id is still nothing.
       await sessions.destroy(cookie);
-      expect(await request(cookie, async () => peekRequestContext())).toBeNull();
+      expect(await request(cookie, async () => peekRequestContext(), HEALTH)).toBeNull();
     });
   });
 
@@ -270,8 +359,10 @@ describe('tenant-context interceptor (Phase 3)', () => {
 
       await expect(request(cookie, probe)).rejects.toBeInstanceOf(ForbiddenException);
 
-      // Third request: no longer 403, because the session no longer claims A.
-      const third = await request(cookie, probe);
+      // Third request: no longer MEMBERSHIP_REVOKED, because the session no longer
+      // claims A. Run as GET /auth/me — on a tenant-scoped route the no-workspace
+      // state is now its own 403 (G2), and what is under test here is the claim.
+      const third = await request(cookie, probe, AUTH_ME);
       expect(third.tenant_guc).toBe('');
       expect((await sessions.read(cookie))?.activeTenantId).toBeNull();
     });
@@ -311,7 +402,9 @@ describe('tenant-context interceptor (Phase 3)', () => {
       // N is an auditor in B alongside M — two rows, and none of A's.
       expect(second.visible_memberships).toBe(2);
 
-      const third = await request(undefined, async () => peekRequestContext());
+      // An anonymous request on the same connection — as GET /health, the exempt
+      // route that serves one (a tenant-scoped route would 401 before any of this).
+      const third = await request(undefined, async () => peekRequestContext(), HEALTH);
       expect(third).toBeNull();
 
       const residue = await residueOnConnection();
@@ -481,11 +574,16 @@ describe('tenant-context interceptor (Phase 3)', () => {
     });
 
     it('a session with no active tenant can still read its own memberships and nothing else', async () => {
+      // As GET /auth/me: the only kind of route that serves this state since G2.
       const cookie = await login(userN, null);
-      const seen = await request(cookie, async () => {
-        const { tx } = requireRequestContext();
-        return tx.$queryRawUnsafe<{ user_id: string }[]>(`SELECT user_id FROM public.memberships`);
-      });
+      const seen = await request(
+        cookie,
+        async () => {
+          const { tx } = requireRequestContext();
+          return tx.$queryRawUnsafe<{ user_id: string }[]>(`SELECT user_id FROM public.memberships`);
+        },
+        AUTH_ME,
+      );
       expect(seen).toHaveLength(1);
       expect(seen[0]?.user_id).toBe(userN);
     });

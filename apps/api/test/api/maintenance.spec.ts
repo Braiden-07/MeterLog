@@ -628,7 +628,7 @@ describe('maintenance records API (step-6 phase 4)', () => {
         a.userId,
       );
 
-      for (const res of [
+      const responses = [
         await createRecord(a.cookie, asset),
         await http()
           .patch(`/api/v1/maintenance-records/${created.body.id}`)
@@ -637,11 +637,18 @@ describe('maintenance records API (step-6 phase 4)', () => {
         await http()
           .delete(`/api/v1/maintenance-records/${created.body.id}`)
           .set('Cookie', a.cookie),
-      ]) {
+      ];
+      for (const res of responses) {
         expect(res.status).toBe(403);
         expect(res.status).not.toBe(500);
-        expect(['MEMBERSHIP_REVOKED', 'FORBIDDEN_ROLE']).toContain(res.body.error.code);
       }
+      // First request: the revoked claim. The rest: no workspace, refused before
+      // the role gate since G2 (OPEN-18).
+      expect(responses.map((r) => r.body.error.code)).toEqual([
+        'MEMBERSHIP_REVOKED',
+        'NO_ACTIVE_WORKSPACE',
+        'NO_ACTIVE_WORKSPACE',
+      ]);
     });
 
     it('404s a well-formed id that does not exist, and 400s a malformed one', async () => {

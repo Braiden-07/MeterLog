@@ -36,7 +36,7 @@ import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
  * Demonstrated, not asserted — the same standard `register_tenant`'s definer
  * insert was held to.
  *
- * **THE TWO 403s ARE THE SAME SHAPE, AND THAT IS DELIBERATE.** A technician and a
+ * ~~**THE TWO 403s ARE THE SAME SHAPE, AND THAT IS DELIBERATE.** A technician and a
  * non-member both get `403 FORBIDDEN_ROLE` from ONE branch in the interceptor:
  * `(!role || !requiredRoles.includes(role))`. A non-member has `role === null`
  * (OPEN-2: zero live memberships logs in fine and lands with no active tenant); a
@@ -44,7 +44,19 @@ import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
  * asserted to be indistinguishable on the wire, because splitting them into
  * `NO_ACTIVE_WORKSPACE` vs `FORBIDDEN_ROLE` would rebuild the enumeration oracle
  * that ADR-006's `MB002` was flattened to avoid — the response would start
- * answering "does this workspace exist and are you simply the wrong role in it?"
+ * answering "does this workspace exist and are you simply the wrong role in it?"~~
+ *
+ * **SUPERSEDED BY G2 (OPEN-18) — the two 403s are now DISTINCT, and the paragraph
+ * above is struck rather than deleted so this file records what it used to assert.**
+ * The property was never sustainable under G2. The durability fix makes every
+ * tenant-scoped route refuse a no-workspace session, and a workspace-holder is
+ * never 403'd on an un-gated read like `GET /assets` — so a 403 there means "no
+ * workspace" whatever string it carries. Keeping `FORBIDDEN_ROLE` would have lost
+ * the parity silently while this comment went on claiming it; the code now names
+ * the state instead. It is not the `MB002` oracle: the request names no workspace
+ * (the tenant comes from the caller's own session), so it can reveal only that
+ * session's state, which `GET /auth/me` already returns — proven, not argued, by
+ * the oracle test in `test/api/no-active-workspace.spec.ts`.
  */
 describe('audit read surface (step-7 phase 7b)', () => {
   let app: INestApplication;
@@ -198,16 +210,24 @@ describe('audit read surface (step-7 phase 7b)', () => {
       expect(asAdmin.body.items.length).toBeGreaterThan(0);
     });
 
-    it('NON-MEMBER is refused with the SAME shape — the OPEN-2 no-active-tenant path', async () => {
+    it('NON-MEMBER is refused with a DISTINCT code — MEMBERSHIP_REVOKED, then NO_ACTIVE_WORKSPACE (G2)', async () => {
       // OPEN-2: zero live memberships logs in successfully (200) and lands with
-      // no active tenant. A role-gated route then refuses through the existing
-      // fail-closed path, with no special casing — `role` is null, so the gate's
-      // `!role` arm fires.
+      // no active tenant.
       //
-      // ASSERTED IDENTICAL TO THE TECHNICIAN CASE ON PURPOSE. Two conditions, one
-      // answer: giving the non-member a distinct code would let a caller probe
-      // "is this workspace real and am I merely the wrong role?" — the
-      // enumeration-oracle shape `MB002` exists to prevent.
+      // RETITLED AND FLIPPED BY G2 (OPEN-18). This test was "NON-MEMBER is refused
+      // with the SAME shape — the OPEN-2 no-active-tenant path", and it asserted the
+      // settled state answered FORBIDDEN_ROLE. Its reasoning, struck and kept:
+      //
+      //   ~~A role-gated route then refuses through the existing fail-closed path,
+      //   with no special casing — `role` is null, so the gate's `!role` arm fires.
+      //   ASSERTED IDENTICAL TO THE TECHNICIAN CASE ON PURPOSE. Two conditions, one
+      //   answer: giving the non-member a distinct code would let a caller probe
+      //   "is this workspace real and am I merely the wrong role?" — the
+      //   enumeration-oracle shape `MB002` exists to prevent.~~
+      //
+      // Why it changed is in the file header: under G2 the parity could not survive
+      // on the un-gated routes whichever code shipped, and the oracle test shows the
+      // distinct code reveals nothing about any workspace.
       const a = await newOrg('Acme', 'admin@acme.test');
       const outsider = await addMember(
         a.cookie,
@@ -239,24 +259,34 @@ describe('audit read surface (step-7 phase 7b)', () => {
       expect(first.body.error.code).toBe('MEMBERSHIP_REVOKED');
 
       // (2) Now the session genuinely has no active workspace, which is the
-      //     settled OPEN-2 state: zero live memberships, nothing selected. `role`
-      //     is null, so the ROLE GATE refuses — `FORBIDDEN_ROLE`, byte-identical
-      //     to what the technician above receives.
+      //     settled OPEN-2 state: zero live memberships, nothing selected.
+      //
+      //     ~~`role` is null, so the ROLE GATE refuses — `FORBIDDEN_ROLE`,
+      //     byte-identical to what the technician above receives.~~
+      //
+      //     Since G2 the interceptor refuses this BEFORE the role gate, with its
+      //     own code: `NO_ACTIVE_WORKSPACE`.
       const settled = await audit(outsider.cookie).expect(403);
-      expect(settled.body.error.code).toBe('FORBIDDEN_ROLE');
+      expect(settled.body.error.code).toBe('NO_ACTIVE_WORKSPACE');
 
-      // Both are 403, and the SETTLED state is indistinguishable from the
+      // ~~Both are 403, and the SETTLED state is indistinguishable from the
       // wrong-role case. That is the property worth protecting: a caller in the
       // no-workspace state cannot tell "this workspace exists and I am the wrong
       // role" from "I have no workspace at all", so the endpoint answers no
       // questions about which workspaces exist. Splitting these into distinct
       // codes would rebuild the enumeration oracle `MB002` was flattened to
-      // avoid.
+      // avoid.~~
       //
-      // `MEMBERSHIP_REVOKED` is not a leak in the same way: it is only reachable
-      // by a session that ALREADY held that membership, so it tells its holder
-      // something they knew.
+      // Both are still 403, and the settled state is now DISTINGUISHABLE from the
+      // wrong-role case on purpose: "choose a workspace" and "you may not" call for
+      // different client responses.
+      //
+      // `MEMBERSHIP_REVOKED` is not a leak: it is only reachable by a session that
+      // ALREADY held that membership, so it tells its holder something they knew.
+      // The same tolerance covers `NO_ACTIVE_WORKSPACE`, which tells its holder
+      // their own session state.
       expect(first.status).toBe(settled.status);
+      expect(settled.body.error.code).not.toBe('FORBIDDEN_ROLE');
     });
   });
 

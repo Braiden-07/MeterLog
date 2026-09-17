@@ -123,36 +123,50 @@ Role comes from `RequestContext.role` — the active membership's role, re-read 
 
 `@RequiresRole('admin')` marks a route; the **tenant-context interceptor enforces it**, at step (5), immediately after the role is resolved.
 
-**It is not a `CanActivate` guard, and that is load-bearing.** Nest runs guards _before_ interceptors, so a role guard executes before the transaction is open, the GUCs are set, or the membership is read — it asks for a role that does not exist yet. Measured at the Phase 2 gate: such a guard 500s **every** request, the admin's included, not merely the non-admin's. This is the Phase 4 session-guard defect one layer up. A null role (no active workspace) fails the gate rather than passing it.
+**It is not a `CanActivate` guard, and that is load-bearing.** Nest runs guards _before_ interceptors, so a role guard executes before the transaction is open, the GUCs are set, or the membership is read — it asks for a role that does not exist yet. Measured at the Phase 2 gate: such a guard 500s **every** request, the admin's included, not merely the non-admin's. This is the Phase 4 session-guard defect one layer up. A null role (no active workspace) never reaches the gate on a tenant-scoped route — it is refused first, below — and the gate's `!role` arm stays so a null role can never read as permission.
 
 `@RequiresRole()` **implies** `@RequiresSession()`, so forgetting one of the two cannot leave a gated route anonymously reachable.
 
-| Endpoint            | admin | technician | auditor |
-| ------------------- | ----- | ---------- | ------- |
-| `GET /users`        | ✓     | ✓          | ✓       |
-| `POST /users`       | ✓     | 403        | 403     |
-| `PATCH /users/:id`  | ✓     | 403        | 403     |
-| `DELETE /users/:id` | ✓     | 403        | 403     |
+**Before any role is consulted, the interceptor is DEFAULT-DENY (G2, OPEN-18).** Every route not listed in §9.4 is tenant-scoped: a session with no active workspace gets `403 NO_ACTIVE_WORKSPACE` and an anonymous caller `401 UNAUTHENTICATED`, before the transaction, the pipes, the role gate and the handler. So every ✓ in the tables below means "with an active workspace". `NO_ACTIVE_WORKSPACE` is deliberately distinct from `FORBIDDEN_ROLE` — "choose a workspace" and "you may not" call for different client responses.
+
+**These tables are asserted against the live routes, in both directions**, by `test/api/route-inventory.spec.ts`: it reads every registered route and its `@RequiresRole` / `@RequiresSession` metadata and requires the set of rows here — role tables plus §9.4 — to match exactly, cell by cell. A route added without a row, a row left behind by a removed route, or a decorator that drifts from its row is red.
+
+| Endpoint                | admin | technician | auditor |
+| ----------------------- | ----- | ---------- | ------- |
+| `GET /users`            | ✓     | ✓          | ✓       |
+| `POST /users`           | ✓     | 403        | 403     |
+| `PATCH /users/:id`      | ✓     | 403        | 403     |
+| `DELETE /users/:id`     | ✓     | 403        | 403     |
+| `GET /users/pending`    | ✓     | 403        | 403     |
+
+`GET /users/pending` was added at G2, transcribed from ADR-016's decision to give pending invites their own admin-only route because the response carries live credentials ([`?pending=true` (DECISIONS.md:816)](DECISIONS.md#L816)). Its shape changes with the pending split, OPEN-14.
 
 ### 9.1 Domain endpoints (recorded at step 6 Phase 1; enforced at Phase 3)
 
 `PROJECT_BRIEF.md` gives the role intent in prose — §1 casts technicians as the people who "record readings/maintenance", and §7 requires that "an auditor is read-only" — but it contains no per-endpoint matrix for the domain tables. This is that matrix, decided and recorded **now**, at the step where the tables land, so Phase 3 implements a written decision rather than re-deriving one from prose.
 
-**Enforcement status.** The reads landed **un-gated** at phase 3a. `POST /assets`, `PATCH /assets/:id` and `POST /assets/:id/readings` are **enforced as of phase 3b**, via `@RequiresRole('admin', 'technician')` resolved inside the interceptor at step (5) exactly as §9 above requires — never a `CanActivate` guard. `DELETE /assets/:id` and `POST /assets/:id/events` arrive with the transition engine in phase 3c; the maintenance rows are phase 4 / 6b.
+**Enforcement status.** The reads landed **un-gated** at phase 3a. `POST /assets`, `PATCH /assets/:id` and `POST /assets/:id/readings` are **enforced as of phase 3b**, via `@RequiresRole('admin', 'technician')` resolved inside the interceptor at step (5) exactly as §9 above requires — never a `CanActivate` guard. `DELETE /assets/:id` and `POST /assets/:id/events` arrive with the transition engine in phase 3c; the maintenance rows landed at phase 4 and were added to this table at G2.
 
-A caller with **no active tenant** has a null role, which **fails the gate with 403 rather than erroring** — there is no workspace in which they hold the required role, so "denied" is the answer, not "broken". Asserted live.
+A caller with **no active workspace** is refused before any row here is consulted: `403 NO_ACTIVE_WORKSPACE` on every route in this table, the un-gated reads included (§9 above). Until G2 only the gated rows refused, through a null role at the gate; the un-gated reads answered `200` with an empty page or `404`.
 
-| Endpoint                    | admin | technician | auditor |
-| --------------------------- | ----- | ---------- | ------- |
-| `GET /assets`               | ✓     | ✓          | ✓       |
-| `GET /assets/:id`           | ✓     | ✓          | ✓       |
-| `POST /assets`              | ✓     | ✓          | 403     |
-| `PATCH /assets/:id`         | ✓     | ✓          | 403     |
-| `DELETE /assets/:id` (soft) | ✓     | 403        | 403     |
-| `GET /assets/:id/events`    | ✓     | ✓          | ✓       |
-| `POST /assets/:id/events`   | ✓     | ✓          | 403     |
-| `GET /assets/:id/readings`  | ✓     | ✓          | ✓       |
-| `POST /assets/:id/readings` | ✓     | ✓          | 403     |
+| Endpoint                                  | admin | technician | auditor |
+| ----------------------------------------- | ----- | ---------- | ------- |
+| `GET /assets`                             | ✓     | ✓          | ✓       |
+| `GET /assets/:id`                         | ✓     | ✓          | ✓       |
+| `POST /assets`                            | ✓     | ✓          | 403     |
+| `PATCH /assets/:id`                       | ✓     | ✓          | 403     |
+| `DELETE /assets/:id` (soft)               | ✓     | 403        | 403     |
+| `GET /assets/:id/events`                  | ✓     | ✓          | ✓       |
+| `POST /assets/:id/events`                 | ✓     | ✓          | 403     |
+| `GET /assets/:id/readings`                | ✓     | ✓          | ✓       |
+| `POST /assets/:id/readings`               | ✓     | ✓          | 403     |
+| `GET /maintenance-records`                | ✓     | ✓          | ✓       |
+| `GET /maintenance-records/:id`            | ✓     | ✓          | ✓       |
+| `POST /maintenance-records`               | ✓     | ✓          | 403     |
+| `PATCH /maintenance-records/:id`          | ✓     | ✓          | 403     |
+| `DELETE /maintenance-records/:id` (soft)  | ✓     | ✓          | 403     |
+
+The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:129)](PROGRESS.md#L129)).
 
 **The one cell that was genuinely open, and how it was resolved.** `POST /assets` could defensibly have been admin-only. It is **admin _and_ technician**: registering an asset is field work — the technician installing a meter is the person who knows its serial number, type and location, and routing that through an admin invents a bottleneck the product has no reason to have. The destructive act is **decommissioning**, and that is where the admin-only line is drawn: `DELETE /assets/:id` is admin-only.
 
@@ -180,13 +194,37 @@ The invariant that forces it: **every status an asset has ever held must have an
 
 **Against step 7 — this is not redundant with `audit_log`.** They answer different questions. `audit_log` records **the mutation**: who changed what, when, with before/after. `asset_events` records **the domain lifecycle**: what happened to this physical asset. An asset can gain a lifecycle event with no user-facing mutation (a bulk import), and a mutation can touch an asset without being a lifecycle event (correcting a typo in `location`). Neither table's rows are derivable from the other's.
 
+### 9.3 Audit trail
+
+| Endpoint     | admin | technician | auditor |
+| ------------ | ----- | ---------- | ------- |
+| `GET /audit` | ✓     | 403        | ✓       |
+
+Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:556)](DECISIONS.md#L556)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:635)](DECISIONS.md#L635)).
+
+### 9.4 Routes exempt from the active-workspace requirement (G2, OPEN-18)
+
+The interceptor is default-deny, so this is the list that is written down and everything else is inferred: a route absent from this table is tenant-scoped. It mirrors [`WORKSPACE_EXEMPT_ROUTES` (tenant-context.interceptor.ts:37-45)](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L37-L45), and `test/api/route-inventory.spec.ts` asserts the two equal, so an exemption cannot be added to or dropped from the code without this table moving too. The second column is asserted against each route's `@RequiresSession` metadata.
+
+| Exempt route              | Session required |
+| ------------------------- | ---------------- |
+| `POST /auth/register`     | no               |
+| `POST /auth/login`        | no               |
+| `POST /auth/set-password` | no               |
+| `POST /auth/switch`       | yes              |
+| `GET /auth/me`            | yes              |
+| `POST /auth/logout`       | no               |
+| `GET /health`             | no               |
+
+None of these reads tenant data, and three of them are how a caller without a workspace gets one: `GET /auth/me` lists workspaces, `POST /auth/switch` selects one, `POST /auth/logout` leaves.
+
 ## 10. Audit logging
 
-Lives in DECISIONS: [ADR-009](DECISIONS.md#L407) capture · [ADR-010](DECISIONS.md#L455) integrity · [ADR-011](DECISIONS.md#L481) payload and redaction · [ADR-012](DECISIONS.md#L526) scope, RBAC and volume · [ADR-013](DECISIONS.md#L597) bootstrap rows · [ADR-014](DECISIONS.md#L623) read surface · [ADR-015](DECISIONS.md#L700) column naming.
+Lives in DECISIONS: [ADR-009](DECISIONS.md#L409) capture · [ADR-010](DECISIONS.md#L457) integrity · [ADR-011](DECISIONS.md#L483) payload and redaction · [ADR-012](DECISIONS.md#L528) scope, RBAC and volume · [ADR-013](DECISIONS.md#L599) bootstrap rows · [ADR-014](DECISIONS.md#L625) read surface · [ADR-015](DECISIONS.md#L702) column naming.
 
 ## 11. API conventions
 
-Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:670)](PROGRESS.md#L670)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:232)](PROGRESS.md#L232); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L623).
+Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:670)](PROGRESS.md#L670)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:232)](PROGRESS.md#L232); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L625).
 
 ## 12. Error handling & logging
 
@@ -194,11 +232,11 @@ Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http
 
 ## 13. Configuration & secrets
 
-Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L127) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:110-113)](../.github/workflows/ci.yml#L110-L113)); production secrets in the §16.1 checklist below.
+Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L129) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:110-113)](../.github/workflows/ci.yml#L110-L113)); production secrets in the §16.1 checklist below.
 
 ## 14. Local development
 
-Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L276); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
+Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L278); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
 
 ## 15. CI/CD
 

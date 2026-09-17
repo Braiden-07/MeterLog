@@ -515,8 +515,13 @@ describe('asset lifecycle transitions (step-6 phase 3c)', () => {
       for (const res of [ev, del]) {
         expect(res.status).toBe(403);
         expect(res.status).not.toBe(500);
-        expect(['MEMBERSHIP_REVOKED', 'FORBIDDEN_ROLE']).toContain(res.body.error.code);
       }
+      // First request: the revoked claim. Second: no workspace, refused before the
+      // role gate since G2 (OPEN-18).
+      expect([ev.body.error.code, del.body.error.code]).toEqual([
+        'MEMBERSHIP_REVOKED',
+        'NO_ACTIVE_WORKSPACE',
+      ]);
     });
   });
 
