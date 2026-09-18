@@ -98,7 +98,7 @@ Three properties in one result, and the middle one is what a single-tenant model
 2. M sees **their own** B-membership while acting in A — correct, not a leak. This is precisely the row a naive isolation test would flag as a cross-tenant breach.
 3. M sees **nothing** of N's B-membership, though it sits in the same table and the same tenant as row 2.
 
-Held by [`M acting in A CAN see their own B-membership (correct, not a leak)`](../apps/api/test/db/membership-isolation.spec.ts#L122), [`the self axis is scoped to self, not to "any membership"`](../apps/api/test/db/membership-isolation.spec.ts#L141), and `M acting in A cannot see another user's membership in B`.
+Held by [`M acting in A CAN see their own B-membership (correct, not a leak)`](../apps/api/test/db/membership-isolation.spec.ts#L118), [`the self axis is scoped to self, not to "any membership"`](../apps/api/test/db/membership-isolation.spec.ts#L137), and `M acting in A cannot see another user's membership in B`.
 
 ### The cascade onto `users`
 
@@ -119,7 +119,7 @@ The tenant-members policy subqueries `memberships`, which is itself under FORCE 
  deleted_at    | t            | t
 ```
 
-The app role can read the row and not the hash; the definer can read both, which is what lets `login_lookup` work. Held by [`password_hash is unreadable by the app role, even for rows it can see`](../apps/api/test/db/membership-isolation.spec.ts#L362).
+The app role can read the row and not the hash; the definer can read both, which is what lets `login_lookup` work. Held by [`password_hash is unreadable by the app role, even for rows it can see`](../apps/api/test/db/membership-isolation.spec.ts#L358).
 
 ### Fail-closed with no context
 
@@ -174,7 +174,7 @@ WHERE u.email OPERATOR(public.=) p_email
 
 — [migration.sql:62](../apps/api/prisma/migrations/20260908000000_auth_definer_functions/migration.sql#L62)
 
-Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:183](DECISIONS.md#L183)) so the next definer function comparing an extension type does not walk back into it.
+Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:184](DECISIONS.md#L184)) so the next definer function comparing an extension type does not walk back into it.
 
 **Step 5 is where that amendment earned its keep.** The three membership-write functions are schema-qualified on _every_ operator — `OPERATOR(public.=)` for citext, `OPERATOR(pg_catalog.=)` for uuid and enum — rather than only on the one comparison that had already burned the project. In `invite_member` the consequence of getting it wrong would have been subtler than the original: a case-different existing address would miss the lookup, the create branch would fire, and the case-**insensitive** unique index would refuse it — an invite that cannot succeed for a person who is already in the system.
 
@@ -227,7 +227,7 @@ Three vacuity guards in that one result. The soft delete is **asserted**, so a r
 
 There is a sharper detail: the admin's `DELETE` runs on that same single backend, **between** M's two requests. Request 2 therefore arrives on a connection whose last transaction belonged to a different user, in a different role, with that user's id left behind in the GUCs. If the re-verify ever read identity from the connection rather than from the session, this is the shape that would catch it.
 
-Held by [`an admin revoking M over HTTP makes M's NEXT request fail closed, on the same backend`](../apps/api/test/api/revocation.spec.ts#L110), with [`M does not 403-loop: the cleared active tenant leaves an empty workspace list`](../apps/api/test/api/revocation.spec.ts#L159) and [`the revoking admin's own session is unaffected`](../apps/api/test/api/revocation.spec.ts#L185) — the last of which exists so the first two cannot pass by having broken the tenant for everyone.
+Held by [`an admin revoking M over HTTP makes M's NEXT request fail closed, on the same backend`](../apps/api/test/api/revocation.spec.ts#L108), with [`M does not 403-loop: the cleared active tenant leaves an empty workspace list`](../apps/api/test/api/revocation.spec.ts#L159) and [`the revoking admin's own session is unaffected`](../apps/api/test/api/revocation.spec.ts#L185) — the last of which exists so the first two cannot pass by having broken the tenant for everyone.
 
 Ordering itself is asserted on the **emitted SQL** via Prisma query events ([interceptor.spec.ts:472](../apps/api/test/db/interceptor.spec.ts#L472)), because the behavioural cases cannot separate the two orderings: both end in a 403 with a rolled-back transaction and no residue.
 
@@ -323,7 +323,7 @@ Liveness (`deleted_at IS NULL`) **cannot** live in the `memberships` row policie
 
 So liveness lives in the paths that only ever read: the re-verify query ([interceptor:206](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L206)), the `tenants_workspace_list` subquery ([migration.sql:80-84](../apps/api/prisma/migrations/20260907000000_identity_tenancy_schema/migration.sql#L80-L84)), `users_tenant_members_read` ([migration.sql:98-103](../apps/api/prisma/migrations/20260907000000_identity_tenancy_schema/migration.sql#L98-L103)), and **one documented app-side predicate** ([auth.service.ts:246](../apps/api/src/auth/auth.service.ts#L246)).
 
-The accepted residual — a raw self-axis read returns a revoked row — is itself asserted, so nobody "fixes" what cannot be fixed: [`the OPEN-5 residual is real: a self-axis read still returns the revoked row`](../apps/api/test/db/membership-isolation.spec.ts#L451).
+The accepted residual — a raw self-axis read returns a revoked row — is itself asserted, so nobody "fixes" what cannot be fixed: [`the OPEN-5 residual is real: a self-axis read still returns the revoked row`](../apps/api/test/db/membership-isolation.spec.ts#L536).
 
 _(Step 5 note: `revoke_member`'s soft-delete is unaffected by OPEN-5 for a stronger reason than the residual — it writes under the definer policy, which admits both the old and the new row version regardless.)_
 
@@ -426,9 +426,9 @@ Beta unchanged:
 admin@beta.test = admin
 ```
 
-Byte-identical. Recorded in ADR-006 §7 as a design rule with the refactor that would reopen it named explicitly ([ADR-006:297](ADR-006-membership-model.md#L297)) — a "make the error messages more helpful" pass that splits them into `403` when the caller is not an admin of the target's tenant and `404` when the row is absent. That reads as better API design, reviews as a usability fix, and **the distinction it adds _is_ the oracle**. Held by [`a nonexistent-but-well-formed membership id is indistinguishable from B's`](../apps/api/test/api/memberships.spec.ts#L420), and by a mutation in the step-5 sweep that performs exactly that split and must redden a test — because an anti-enumeration claim with no negative behind it is not a claim this project ships.
+Byte-identical. Recorded in ADR-006 §7 as a design rule with the refactor that would reopen it named explicitly ([ADR-006:297](ADR-006-membership-model.md#L297)) — a "make the error messages more helpful" pass that splits them into `403` when the caller is not an admin of the target's tenant and `404` when the row is absent. That reads as better API design, reviews as a usability fix, and **the distinction it adds _is_ the oracle**. Held by [`a nonexistent-but-well-formed membership id is indistinguishable from B's`](../apps/api/test/api/memberships.spec.ts#L516), and by a mutation in the step-5 sweep that performs exactly that split and must redden a test — because an anti-enumeration claim with no negative behind it is not a claim this project ships.
 
-**Finding 6 proper is about the layer above.** The HTTP write endpoints are admin-gated by `@RequiresRole('admin')` ([controller:60](../apps/api/src/memberships/memberships.controller.ts#L60)), enforced inside the interceptor at the point where the role has already been re-read from the database ([interceptor:230-260](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L230-L260)) — never in a `CanActivate` guard, because Nest runs guards _before_ interceptors. That was measured rather than assumed: such a guard, wired to a real route, **500s every request including the admin's**, because at guard time no request has a resolved context at all ([requires-role.decorator.ts:21](../apps/api/src/common/auth/requires-role.decorator.ts#L21)).
+**Finding 6 proper is about the layer above.** The HTTP write endpoints are admin-gated by `@RequiresRole('admin')` ([controller:90](../apps/api/src/memberships/memberships.controller.ts#L90)), enforced inside the interceptor at the point where the role has already been re-read from the database ([interceptor:230-260](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L230-L260)) — never in a `CanActivate` guard, because Nest runs guards _before_ interceptors. That was measured rather than assumed: such a guard, wired to a real route, **500s every request including the admin's**, because at guard time no request has a resolved context at all ([requires-role.decorator.ts:21](../apps/api/src/common/auth/requires-role.decorator.ts#L21)).
 
 ```
 === THE OUTER LAYER: the RBAC gate refuses the technician ===
@@ -442,7 +442,7 @@ The `GET` is not an oversight — co-member reads stay open to every member by d
 
 **And then removing the gate entirely left the whole endpoint suite green.** The definer body refused the same callers, `MB001` mapped to a 403, and the response was byte-identical — so nothing could tell which layer had acted. That is defence-in-depth working exactly as intended and the outer layer being completely untested, and they are the _same fact_: **a correctly-redundant layer is invisible to tests that only assert outcomes.**
 
-The fix was to make the layers distinguishable rather than to weaken either: the gate answers `FORBIDDEN_ROLE`, the function body answers `NOT_ADMIN` ([memberships.service.ts:210](../apps/api/src/memberships/memberships.service.ts#L210)), both `403`. Deleting the gate now reddens three tests with `expected 'NOT_ADMIN' to be 'FORBIDDEN_ROLE'`. The reasoning is recorded next to the code so a future tidy-up does not re-merge them ([memberships.service.ts:174](../apps/api/src/memberships/memberships.service.ts#L174)).
+The fix was to make the layers distinguishable rather than to weaken either: the gate answers `FORBIDDEN_ROLE`, the function body answers `NOT_ADMIN` ([memberships.service.ts:471](../apps/api/src/memberships/memberships.service.ts#L471)), both `403`. Deleting the gate now reddens three tests with `expected 'NOT_ADMIN' to be 'FORBIDDEN_ROLE'`. The reasoning is recorded next to the code so a future tidy-up does not re-merge them ([memberships.service.ts:443](../apps/api/src/memberships/memberships.service.ts#L443)).
 
 There is an operational payoff beyond the test: `NOT_ADMIN` reaching a client now means a request **got past the gate and was stopped by the database** — either the caller's role changed between the interceptor's read and the function's, or a route is missing its gate. That is a distinction worth having in a log.
 
@@ -478,11 +478,11 @@ Step 6 added `assets` and its two children. Four properties are now proven that 
 
 The catalog-driven matrix has existed since step 4, asserting that every tenant-scoped table's policy is _correct_ rather than merely present. Until step 6 it generated **zero cases against real tables** — `tenants`, `users` and `memberships` are all registered bespoke, because the app role cannot write any of them.
 
-`assets`, `asset_events` and `readings` are the first tables it genuinely can. It now generates **15 cases across three tables** — five each: cross-tenant read invisibility, cross-tenant `UPDATE`, cross-tenant `DELETE`, a `WITH CHECK`-rejected foreign-tenant `INSERT`, and the zero-rows-with-no-context baseline ([isolation.spec.ts:169-263](../apps/api/test/db/isolation.spec.ts#L169-L263), generated from the registry at [helpers.ts:271](../apps/api/test/db/helpers.ts#L271)).
+`assets`, `asset_events` and `readings` are the first tables it genuinely can. It now generates **15 cases across three tables** — five each: cross-tenant read invisibility, cross-tenant `UPDATE`, cross-tenant `DELETE`, a `WITH CHECK`-rejected foreign-tenant `INSERT`, and the zero-rows-with-no-context baseline ([isolation.spec.ts:169-263](../apps/api/test/db/isolation.spec.ts#L169-L263), generated from the registry at [helpers.ts:292](../apps/api/test/db/helpers.ts#L292)).
 
 The registry's key set is asserted **equal to the catalog's** in both directions, so a new tenant-scoped table cannot arrive without a fixture and a fixture cannot outlive its table ([isolation.spec.ts:85-120](../apps/api/test/db/isolation.spec.ts#L85-L120)).
 
-Two harness defects had to be fixed before it could run against a real table at all, and both are worth naming because the matrix had been "built and self-tested" for two whole steps while being unable to work: it invented tenant UUIDs and never created rows for them (invisible while the only table under test was a scratch table with no foreign keys), and `dependsOn` — ADR-004's promised FK-ordering mechanism — **was never read by anything**. It was documentation shaped like code. Parent-first seeding is now done centrally ([helpers.ts:312-345](../apps/api/test/db/helpers.ts#L312-L345)); ADR-004's bullet was amended rather than quietly dropped.
+Two harness defects had to be fixed before it could run against a real table at all, and both are worth naming because the matrix had been "built and self-tested" for two whole steps while being unable to work: it invented tenant UUIDs and never created rows for them (invisible while the only table under test was a scratch table with no foreign keys), and `dependsOn` — ADR-004's promised FK-ordering mechanism — **was never read by anything**. It was documentation shaped like code. Parent-first seeding is now done centrally ([helpers.ts:333-366](../apps/api/test/db/helpers.ts#L333-L366)); ADR-004's bullet was amended rather than quietly dropped.
 
 ### Child tenancy is enforced by a constraint, not by application care (ADR-007)
 
@@ -506,7 +506,7 @@ A trigger was rejected for a concrete reason rather than a stylistic one: it wou
 
 ### Append-only is a declared property bound to a grant
 
-`asset_events` and `readings` are append-only. The brief says so for `asset_events` but **never for `readings`** — there it follows only from an absence of `updated_at`/`deleted_at`, which is exactly the implicit-by-omission shape that produced findings 2 and 4. So the property is **declared** (`APPEND_ONLY_TABLES`, [helpers.ts:187](../apps/api/test/db/helpers.ts#L187)) and **bound to the grant** by catalog assertion 13, which asserts an equality rather than a subset — "holds no UPDATE" would be satisfied by a table nobody can read either ([catalog-rls.spec.ts:435-470](../apps/api/test/db/catalog-rls.spec.ts#L435-L470)).
+`asset_events` and `readings` are append-only. The brief says so for `asset_events` but **never for `readings`** — there it follows only from an absence of `updated_at`/`deleted_at`, which is exactly the implicit-by-omission shape that produced findings 2 and 4. So the property is **declared** (`APPEND_ONLY_TABLES`, [helpers.ts:208](../apps/api/test/db/helpers.ts#L208)) and **bound to the grant** by catalog assertion 13, which asserts an equality rather than a subset — "holds no UPDATE" would be satisfied by a table nobody can read either ([catalog-rls.spec.ts:435-470](../apps/api/test/db/catalog-rls.spec.ts#L435-L470)).
 
 The grant set, from the live catalog — note `assets` has `UPDATE` (soft delete is an update) and **no `DELETE` anywhere**:
 
@@ -619,13 +619,13 @@ This is the strongest single line of the phase. ADR-008 decides soft-delete-only
 ERROR:  permission denied for table maintenance_records
 ```
 
-Asserted on `42501` **and** `permission denied for table maintenance_records`, explicitly not the row-security message — the policy would happily permit deleting an own-tenant row, so a policy-shaped refusal would mean the grant was wrong. **Catalog assertion 14** pins the grant set as an _equality_ (`SELECT, INSERT, UPDATE` and nothing more), and **assertion 15** refuses to let a table be declared both append-only and soft-delete-only, since those profiles demand contradictory grants ([catalog-rls.spec.ts:486](../apps/api/test/db/catalog-rls.spec.ts#L486), declared at [helpers.ts:211](../apps/api/test/db/helpers.ts#L211)).
+Asserted on `42501` **and** `permission denied for table maintenance_records`, explicitly not the row-security message — the policy would happily permit deleting an own-tenant row, so a policy-shaped refusal would mean the grant was wrong. **Catalog assertion 14** pins the grant set as an _equality_ (`SELECT, INSERT, UPDATE` and nothing more), and **assertion 15** refuses to let a table be declared both append-only and soft-delete-only, since those profiles demand contradictory grants ([catalog-rls.spec.ts:486](../apps/api/test/db/catalog-rls.spec.ts#L486), declared at [helpers.ts:232](../apps/api/test/db/helpers.ts#L232)).
 
 `GRANT DELETE ON public.maintenance_records TO meterlog_app` is one line, and it would make v1.0 destructive **two build steps before `audit_log` exists** — a purged record leaving no trace of itself, of who removed it, or of what it said. That line reddens three tests. **Hard delete is deferred, not refused** (OPEN-9): when it lands, it lands behind audit.
 
 ### And the matrix extended itself
 
-The isolation matrix generates **20 cases across four tables**, up from 15 at phase 3d and from zero before step 6 — five per table, automatically, because the registry's key set is asserted equal to the catalog's in both directions ([`every tenant-scoped table has an isolation fixture, and vice versa`](../apps/api/test/db/isolation.spec.ts#L85), registry at [`ISOLATION_FIXTURES`](../apps/api/test/db/helpers.ts#L460)). The fourth table required no new harness mechanism, which is the point of having built the contract for two write shapes at phase 1.
+The isolation matrix generates **20 cases across four tables**, up from 15 at phase 3d and from zero before step 6 — five per table, automatically, because the registry's key set is asserted equal to the catalog's in both directions ([`every tenant-scoped table has an isolation fixture, and vice versa`](../apps/api/test/db/isolation.spec.ts#L85), registry at [`ISOLATION_FIXTURES`](../apps/api/test/db/helpers.ts#L481)). The fourth table required no new harness mechanism, which is the point of having built the contract for two write shapes at phase 1.
 
 ### A postscript worth more than the table it came from
 
@@ -645,7 +645,7 @@ Step 7a built the audit **capture** mechanism and proved it at the database laye
 
 **Step 6 disproved it.** A maintenance edit emits **no lifecycle event at all**: correcting a description is not something that happened to the physical asset. The asset-metadata `PATCH` is the same shape (ARCHITECTURE §9.2). A derived trail is therefore silent for the entire class of change an auditor is most likely to be investigating — and silent without erroring, which is this document's recurring failure mode.
 
-So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L411)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
+So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L412)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
 
 ### The centerpiece — immutable by grant
 
@@ -660,7 +660,7 @@ psql:/tmp/neg.sql:9:  ERROR:  permission denied for table audit_log
 psql:/tmp/neg.sql:11: ERROR:  permission denied for table audit_log
 ```
 
-Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L459)).
+Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L460)).
 
 Two vacuity guards sit under it. The `ALTER` and `SUPPRESS` negatives assert the row **existed, was visible under that tenant, and is unchanged afterwards**, so neither can pass against an empty table. And a positive pairs with all three — the app role **can** read its own tenant's rows ([`the app role CAN read its own tenant rows`](../apps/api/test/db/audit.spec.ts#L335)) — because "cannot write" is otherwise satisfied by a table nobody can reach at all, which is fail-closed and broken.
 
@@ -768,7 +768,7 @@ Six, up from five, with the allowlist extended in the same PR ([`EXPECTED_DEFINE
 
 ### What 7a does not prove
 
-The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L530) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
+The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L531) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
 
 Hash-chaining is deferred, and ADR-010 records why as engineering rather than scope. What immutability-by-grant does **not** give, stated plainly: it defends against the application and against anyone holding only the app role's credentials. It does **not** defend against the migration/owner role or a cluster superuser, who can `ALTER TABLE`. Tamper-evidence against a privileged operator is what a chain buys, and that threat model is not v1.0's.
 
@@ -784,7 +784,7 @@ Step 7a proved capture at the database layer. It proved nothing about **who may 
 
 **Every RBAC negative in the suite passes identically against an admin-only implementation.** Technician 403, non-member 403, cross-tenant empty — all of them hold whether or not auditors are admitted. A module gated `@RequiresRole('admin')` would have a **completely green suite** and a real defect: the auditor role, which exists for little else, would collapse into a technician who cannot write.
 
-The only thing that catches it is the **auditor positive** ([`AUDITOR reads the trail`](../apps/api/test/api/audit-read.spec.ts#L172)), and it is asserted non-vacuously — the auditor must see rows, not merely fail to be refused. Mutation 01 of the sweep narrows the gate to admin-only and reddens exactly that test and the capstone's auditor face, and nothing else.
+The only thing that catches it is the **auditor positive** ([`AUDITOR reads the trail`](../apps/api/test/api/audit-read.spec.ts#L181)), and it is asserted non-vacuously — the auditor must see rows, not merely fail to be refused. Mutation 01 of the sweep narrows the gate to admin-only and reddens exactly that test and the capstone's auditor face, and nothing else.
 
 This is also the **only test in the whole suite that distinguishes an auditor from a read-only technician.** Every other endpoint deliberately treats them alike — `AssetsController` carries a note saying its reads are ungated on purpose, because an auditor must see the same asset rows everyone else does. The auditor's distinguishing capability is this one endpoint.
 
@@ -798,7 +798,7 @@ The read-back for this phase asked for "the exact status and body a non-member f
 | **settled** no-workspace (OPEN-2: zero live memberships)          | ~~`403 FORBIDDEN_ROLE`~~ **`403 NO_ACTIVE_WORKSPACE`** since G2   | ~~the role gate, via its `!role` arm~~ the interceptor's default-deny, _before_ the gate, since G2  |
 | **first request after a revoke**, session still naming the tenant | `403 MEMBERSHIP_REVOKED`                                          | the per-request re-verify, _before_ the gate                                                        |
 
-The third is the one a plain "non-member is refused" test walks into. A session issued **before** the revoke still names tenant A, so the interceptor's re-verify (step 3) runs first, finds no live membership, answers `MEMBERSHIP_REVOKED` — **and clears the session's active tenant on the way out.** Only the _next_ request is in the settled state the OPEN-2 resolution describes. The suite asserts both faces in sequence ([`NON-MEMBER is refused with a DISTINCT code`](../apps/api/test/api/audit-read.spec.ts#L213)) — a test retitled by G2 from "NON-MEMBER is refused with the SAME shape", its old assertion and reasoning struck in place in the spec rather than deleted.
+The third is the one a plain "non-member is refused" test walks into. A session issued **before** the revoke still names tenant A, so the interceptor's re-verify (step 3) runs first, finds no live membership, answers `MEMBERSHIP_REVOKED` — **and clears the session's active tenant on the way out.** Only the _next_ request is in the settled state the OPEN-2 resolution describes. The suite asserts both faces in sequence ([`NON-MEMBER is refused with a DISTINCT code`](../apps/api/test/api/audit-read.spec.ts#L222)) — a test retitled by G2 from "NON-MEMBER is refused with the SAME shape", its old assertion and reasoning struck in place in the spec rather than deleted.
 
 ~~**Why the sameness of the first two is load-bearing.** A caller in the no-workspace state cannot distinguish "this workspace exists and I am merely the wrong role in it" from "I have no workspace at all". Splitting them into `NO_ACTIVE_WORKSPACE` and `FORBIDDEN_ROLE` would read as a usability improvement and would rebuild the enumeration oracle ADR-006's `MB002` was flattened to prevent — §7d's finding, arriving through a different door. `MEMBERSHIP_REVOKED` is not the same leak: it is reachable only by a session that already held the membership, so it tells its holder something they knew.~~
 
@@ -808,7 +808,7 @@ The third is the one a plain "non-member is refused" test walks into. A session 
 
 `AuditService.list` carries **no `tenant_id` predicate**. The query runs on the request transaction where the interceptor set `app.current_tenant`, and the canonical policy scopes it. A redundant application-layer filter would not strengthen isolation — it would make a policy regression **invisible**, because the filter would keep returning correct rows after the thing that actually protects the data stopped working.
 
-That claim is checked rather than asserted. Sweep mutation 11 replaces the policy with `USING (true)` and reddens **three** tests — the cross-tenant money negative, bootstrap invisibility, and the capstone's cross-tenant face ([`an admin of B reading the trail sees NOTHING of A`](../apps/api/test/api/audit-read.spec.ts#L297)). With a redundant predicate in the service, all three would have stayed green.
+That claim is checked rather than asserted. Sweep mutation 11 replaces the policy with `USING (true)` and reddens **three** tests — the cross-tenant money negative, bootstrap invisibility, and the capstone's cross-tenant face ([`an admin of B reading the trail sees NOTHING of A`](../apps/api/test/api/audit-read.spec.ts#L306)). With a redundant predicate in the service, all three would have stayed green.
 
 The money negative is asserted as "**none of A's rows**" rather than "empty", because tenant B has its own bootstrap membership row — an emptiness assertion would be checking the wrong thing and would fail for the right reason at the wrong moment.
 
@@ -818,13 +818,13 @@ The money negative is asserted as "**none of A's rows**" rather than "empty", be
 
 `NULL = <anything>` is NULL, so such a row matches **no** tenant policy and is invisible to every application read, permanently. Its only access path is direct database access as the owner.
 
-**The proof establishes the positive first**, because "a tenant read returns zero bootstrap rows" passes just as happily when no bootstrap row was ever written — the `readWorkspaces` insensitivity lesson, and §8's standing rule that **zero rows is not an error and is not evidence either**. So: read as the migration role, assert such rows exist and `count > 0`, assert they are `user.created` with a NULL actor — _then_ assert the tenant-scoped read returns none ([`the owner sees bootstrap rows`](../apps/api/test/api/audit-read.spec.ts#L333)). The tenant's own trail still records the bootstrap through the `membership.created` row, which carries a real tenant, so nothing is lost from the tenant's point of view.
+**The proof establishes the positive first**, because "a tenant read returns zero bootstrap rows" passes just as happily when no bootstrap row was ever written — the `readWorkspaces` insensitivity lesson, and §8's standing rule that **zero rows is not an error and is not evidence either**. So: read as the migration role, assert such rows exist and `count > 0`, assert they are `user.created` with a NULL actor — _then_ assert the tenant-scoped read returns none ([`the owner sees bootstrap rows`](../apps/api/test/api/audit-read.spec.ts#L342)). The tenant's own trail still records the bootstrap through the `membership.created` row, which carries a real tenant, so nothing is lost from the tenant's point of view.
 
 A **system pseudo-tenant** was the rejected alternative, and it loses twice: it puts a row in `tenants` that is not a tenant, and it only achieves its goal by creating a cross-tenant read path into the audit trail — weakening the exact guarantee this document exists to demonstrate.
 
 ### The capstone — the premise, readable
 
-The module's reason for being, at the HTTP layer. A maintenance edit emits **no lifecycle event**, so a trail derived from `asset_events` is silent for that whole class of change. 7a proved the row is _written_; this proves it is _read_, by the right people and nobody else ([`an edit that emits NO lifecycle event is readable by admin and auditor`](../apps/api/test/api/audit-read.spec.ts#L376)), in four faces plus the gap itself:
+The module's reason for being, at the HTTP layer. A maintenance edit emits **no lifecycle event**, so a trail derived from `asset_events` is silent for that whole class of change. 7a proved the row is _written_; this proves it is _read_, by the right people and nobody else ([`an edit that emits NO lifecycle event is readable by admin and auditor`](../apps/api/test/api/audit-read.spec.ts#L385)), in four faces plus the gap itself:
 
 - the lifecycle log **did not move** — `asset_events` count unchanged across the edit;
 - **admin** sees the `maintenance.updated` row;
@@ -834,7 +834,7 @@ The module's reason for being, at the HTTP layer. A maintenance edit emits **no 
 
 ### Role-at-time, now visible
 
-`actor_role` is in the response DTO, and it is the one field on an audit row that **no other table can reconstruct**: joining to `memberships` at read time returns today's answer, or none once the membership is revoked. The HTTP proof mirrors 7a's database one — a technician records a reading, is promoted to admin, and the audit row still reads `technician` ([`carries the role held AT THE TIME`](../apps/api/test/api/audit-read.spec.ts#L450)). Sweep mutation 08 nulls the field and reddens it.
+`actor_role` is in the response DTO, and it is the one field on an audit row that **no other table can reconstruct**: joining to `memberships` at read time returns today's answer, or none once the membership is revoked. The HTTP proof mirrors 7a's database one — a technician records a reading, is promoted to admin, and the audit row still reads `technician` ([`carries the role held AT THE TIME`](../apps/api/test/api/audit-read.spec.ts#L459)). Sweep mutation 08 nulls the field and reddens it.
 
 ### Pagination, and the tie that is routine here
 
@@ -842,7 +842,7 @@ Keyset on `(created_at DESC, id DESC)`. **7b adds no DDL** — the supporting in
 
 The composite cursor is not defensive: **one logical mutation fires several triggers in one transaction**, so rows sharing a `created_at` to the microsecond are routine on this table rather than a designed-in quirk of one table. Registering an asset writes `assets` plus two genesis `asset_events` rows, all at the same transaction timestamp.
 
-So the boundary is proven **directly** rather than inferred ([`THE BOUNDARY CASE`](../apps/api/test/api/audit-read.spec.ts#L592)): the test first asserts a same-timestamp group actually exists — otherwise the case it exists for does not occur — then walks the entire trail one row at a time, so a page boundary falls between _every_ adjacent pair including inside the tied group, and asserts the walk equals a single-page read with no repeats. Mutation 03 drops the `id` tiebreak and reddens it alone.
+So the boundary is proven **directly** rather than inferred ([`THE BOUNDARY CASE`](../apps/api/test/api/audit-read.spec.ts#L601)): the test first asserts a same-timestamp group actually exists — otherwise the case it exists for does not occur — then walks the entire trail one row at a time, so a page boundary falls between _every_ adjacent pair including inside the tied group, and asserts the walk equals a single-page read with no repeats. Mutation 03 drops the `id` tiebreak and reddens it alone.
 
 ### No bad request may answer as an empty 200
 
@@ -1002,6 +1002,12 @@ This list is kept aligned with the enumerated **Open items register** in [`DECIS
   `audit_log` landed at step 7a, capturing the **eleven** mutation types that had to be retrofitted rather than wired. **The count was wrong here until 7a and is corrected rather than quietly fixed:** this sentence said "ten" over a list of eleven, and `OPEN-6`'s title said "SEVEN" over a body listing eight. The _names_ were maintained as the list grew at phase 3b, 3c and phase 4; the arithmetic was not — a small instance of exactly the drift the new citation guard exists to catch in the citations. The eleven are: the three step-5 membership writes, plus asset creation, asset metadata update, reading creation, status transitions and decommission, plus maintenance creation, maintenance editing and maintenance soft-delete. Tracked as **OPEN-6** — now **DONE** at step 7a — with **OPEN-4** (whether to record role-at-time-of-action) answered there, and answered as a _property of the mechanism_ rather than as a payload decision: the trigger fires during the mutation, so the `memberships` row it reads is the role at the time of the action (ADR-009, §7h). Recorded as a known retrofit, and it grew twice during step 6 rather than being discovered at step 7.
 
   **`maintenance_records` is where this gap is sharpest.** A maintenance edit emits **no lifecycle event at all** — correcting a description is not something that happened to the physical asset — so for that mutation the event log is silent and `audit_log` would be the _only_ record. Of the domain's mutations it is the one a retrofit driven from `asset_events` would most certainly miss, because there is nothing in `asset_events` to drive from.
+
+- **The invite token travels in a URL FRAGMENT, and that is a deliberate containment boundary with a stated limit.** The redemption link is `/set-password#token=…`, never `?token=…`. **A fragment is never sent to the server at all** — it is stripped by the browser before the request leaves — so the credential stays out of three places a query string would put it, each of which retains data for something that never needed it: **server access logs** (where a `?token=` lands in plaintext, in a file with a different retention policy and a wider audience than the database), the **`Referer` header** (which would carry it to every third-party origin the page subsequently loads), and **proxy / CDN history** along the path. The token is SHA-256 at rest in `invite_tokens`, so the link is the only place the plaintext exists once it has been minted — which is precisely why where the link travels is a security property rather than a URL-style preference. The page reads it once into component state and clears the fragment from the address bar, so it does not survive in history or in a copy-pasted URL either.
+
+  **WHAT THIS DOES NOT PROVE.** The fragment keeps the token out of server-side and intermediary retention; it does nothing about the endpoints. It is still in the invitee's browser memory, in whatever the admin pasted it into — an email body is the normal case and is not protected by any of this — and in any screenshot taken before the address bar was cleared. **`no-store` on the mint response closes the one remaining server-adjacent cache**; nothing closes the mail path, which is why the token is single-use with a 72h TTL rather than relying on the channel being private.
+
+  **AND THE CONSTRAINT IS ENFORCED AT ONLY ONE END TODAY.** The consumer — the set-password page — reads from the fragment and is written that way deliberately. The **producer**, the admin UI that builds the link, does not exist yet, and nothing currently asserts it will use `#token=` rather than `?token=`. A two-ended contract enforced at one end is one refactor from being dropped at the other, so the producer-side acceptance is bound into **OPEN-14** for the invite/admin UI PR: the generated link matches `#token=` and does not match `?token=`, as a string assertion over the link-builder.
 
 - **The API surface is proven by acceptance tests, not by use.** Every claim in §7f is an automated test against a local or CI Postgres. No load test has run against these endpoints (§13's k6 is outstanding), and the `EXPLAIN ANALYZE` numbers in [`PERF.md`](PERF.md) are local warm-cache plan comparisons — useful for plan **shape**, not quotable as production latency. A frontend consumes the auth and asset-read endpoints as of slice 1 of the frontend slice (brief §11 step 8); the audit and admin surfaces still have no consumer.
 

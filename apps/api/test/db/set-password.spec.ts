@@ -4,8 +4,17 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { appClient, loadEnv, migratorClient, resetDatabase } from './helpers';
 
 /**
- * Step 8 (OPEN-7) — `set_password` and `list_pending_invites`, proven against
- * live Postgres.
+ * Step 8 (OPEN-7) — `set_password` and the pending read, proven against live
+ * Postgres.
+ *
+ * MIGRATED AT THE PENDING SPLIT (OPEN-14). `list_pending_invites` no longer
+ * mints: it is a metadata read, and issuing is `mint_invite_token`, one
+ * membership at a time. The `mintFor` fixture below composes the two so the
+ * redemption-side properties this file exists to prove — single-use consume, the
+ * 72h TTL, the monotonic guard, the both-or-neither transaction — are asserted
+ * exactly as before, against tokens that now arrive by an explicit mint. The new
+ * function's own authorization surface is proven separately, with nothing in
+ * front of it, in `test/db/mint-invite-token.spec.ts`.
  *
  * THE ENTIRE POINT OF THIS FILE IS *HOW* THE NEGATIVES ARE PRODUCED, and it is
  * the same point `membership-writes.spec.ts` makes. Every call below is made as
@@ -90,7 +99,7 @@ interface PendingInvite {
   expires_at: Date;
 }
 
-describe('set_password / list_pending_invites — step 8 (OPEN-7)', () => {
+describe('set_password / the pending read — step 8 (OPEN-7), split at OPEN-14', () => {
   let app: PrismaClient;
   let migrator: PrismaClient;
 
@@ -146,10 +155,40 @@ describe('set_password / list_pending_invites — step 8 (OPEN-7)', () => {
     };
   }
 
-  const mintFor = (tenantId: string, adminId: string) =>
-    withContext(app, { userId: adminId, tenantId }, (tx) =>
-      tx.$queryRawUnsafe<PendingInvite[]>(`SELECT * FROM public.list_pending_invites()`),
+  /**
+   * MIGRATED AT THE PENDING SPLIT (OPEN-14), and its shape is deliberately
+   * unchanged so every call site below still reads as "the tokens for this
+   * tenant's pending invites".
+   *
+   * WHAT CHANGED IS THAT IT IS NOW TWO CALLS, which is the split itself: the read
+   * lists, and a mint per row issues. Before, one read did both. Both calls are
+   * still made DIRECTLY as `meterlog_app` with the GUCs set by hand, so this file
+   * keeps its standard of proof — nothing is routed through a guard.
+   *
+   * The admin negatives below still fire on the FIRST call, because
+   * `list_pending_invites` checks the same live-admin condition and raises the
+   * same SP003. That is why those tests needed no change: the refusal they assert
+   * is the read's, and the read still refuses.
+   */
+  const mintFor = async (tenantId: string, adminId: string): Promise<PendingInvite[]> => {
+    const pending = await withContext(app, { userId: adminId, tenantId }, (tx) =>
+      tx.$queryRawUnsafe<{ membership_id: string }[]>(
+        `SELECT * FROM public.list_pending_invites()`,
+      ),
     );
+
+    const minted: PendingInvite[] = [];
+    for (const row of pending) {
+      const [token] = await withContext(app, { userId: adminId, tenantId }, (tx) =>
+        tx.$queryRawUnsafe<PendingInvite[]>(
+          `SELECT * FROM public.mint_invite_token($1::uuid)`,
+          row.membership_id,
+        ),
+      );
+      minted.push(token!);
+    }
+    return minted;
+  };
 
   const redeem = (token: string, hash: string | null) =>
     app.$queryRawUnsafe(`SELECT public.set_password($1::text, $2::text)`, token, hash);
@@ -502,11 +541,19 @@ describe('set_password / list_pending_invites — step 8 (OPEN-7)', () => {
   });
 
   // =========================================================================
-  describe('mint-on-read and supersession', () => {
-    it('re-reading mints a NEW token and kills the previous one', async () => {
-      // Re-invite is this same path with no special case. The old token must be
-      // dead the moment a new one is issued, or "single live token per invite"
-      // is a description rather than a property.
+  describe('supersession, seen from the REDEMPTION side', () => {
+    it('minting again kills the previous token', async () => {
+      // RETITLED AT OPEN-14: "mint-on-read" is gone — reading mints nothing now.
+      // The property under test survives the split unchanged and is if anything
+      // more important, because minting is a button an admin can press twice: the
+      // old token must be dead the moment a new one is issued, or "single live
+      // token per invite" is a description rather than a property.
+      //
+      // `mint_invite_token`'s own supersede is asserted structurally (live-row
+      // counts) in `test/db/mint-invite-token.spec.ts`. THIS assertion is the
+      // consequence — the superseded token actually fails to redeem — which is
+      // the only form of the claim that matters to an invitee holding a stale
+      // link.
       const { tenantId, adminId, inviteeId } = await seedTenant(
         'Acme',
         'admin@acme.test',
@@ -537,6 +584,13 @@ describe('set_password / list_pending_invites — step 8 (OPEN-7)', () => {
       // The invite path is not a password-reset path (ADR-006 §7). Inviting an
       // address that already has a usable password attaches a membership and
       // issues NOTHING.
+      //
+      // AFTER OPEN-14 THIS IS THE FIRST OF TWO INDEPENDENT REFUSALS, and both are
+      // kept. Here the person is absent from the LIST, so no mint is ever
+      // attempted. `mint_invite_token` refuses them again on its own account
+      // (MT003) if an id is named directly — proven in
+      // `test/db/mint-invite-token.spec.ts`. The list is not a security boundary;
+      // the function body is.
       const { tenantId: acme, adminId } = await seedTenant(
         'Acme',
         'admin@acme.test',

@@ -331,11 +331,23 @@ export class AuthService {
 /**
  * The user's live workspaces.
  *
- * `AND m.deleted_at IS NULL` is **the one documented app-side predicate in the
- * design** (ADR-006 §3, OPEN-5). Liveness cannot live in the `memberships` row
- * policies — the predicate would block the revoking UPDATE itself — so the self
- * axis returns revoked rows and every self-axis reader must filter them here.
- * Removing it makes a revoked workspace reappear in the switcher.
+ * `AND m.deleted_at IS NULL` is one of the **enumerated app-side predicates over
+ * RLS-protected reads** (ADR-006 §3, OPEN-5 — the list lives there, and any new
+ * one is added to it with its purpose). Liveness cannot live in the `memberships`
+ * row policies: Postgres applies the SELECT policy to the new row of an
+ * `UPDATE … WHERE`, so the predicate would block the revoking UPDATE itself.
+ * The self axis therefore returns revoked rows and every self-axis reader filters
+ * them here. Removing it makes a revoked workspace reappear in the switcher.
+ *
+ * **THERE IS DELIBERATELY NO TENANT PREDICATE HERE, and that is why G1
+ * (OPEN-13) was fixed in `MembershipsService.list` rather than in RLS.** This
+ * query rides the self axis ON PURPOSE: the workspace switcher's entire job is to
+ * list workspaces the caller is NOT currently active in, which is only possible
+ * because `memberships_self_read` is keyed on `app.current_user` with no tenant
+ * term. Adding one — here or in the policy — collapses this list to the active
+ * workspace and breaks the switcher. Demonstrated against a live database, inside
+ * a rolled-back transaction, by `an RLS tightening WOULD collapse the workspace
+ * list` in `test/db/membership-isolation.spec.ts`.
  */
 async function readWorkspaces(tx: Prisma.TransactionClient, userId: string): Promise<Workspace[]> {
   const rows = await tx.$queryRawUnsafe<{ tenant_id: string; name: string; role: string }[]>(

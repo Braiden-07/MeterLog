@@ -137,18 +137,27 @@ describe('audit read surface (step-7 phase 7b)', () => {
       .send({ email, role })
       .expect(201);
 
+    // MIGRATED AT THE PENDING SPLIT (OPEN-14). The list is metadata only now, so
+    // the fixture reads the membership id from it and then mints EXPLICITLY. The
+    // extra call is the whole point of the split: looking no longer issues.
     const pending = await http()
       .get('/api/v1/users/pending')
       .set('Cookie', adminCookie)
       .expect(200);
-    const invite = (pending.body as { email: string; token: string; userId: string }[]).find(
-      (p) => p.email === email,
-    );
+    const invite = (
+      pending.body as { email: string; membershipId: string; userId: string }[]
+    ).find((p) => p.email === email);
     if (!invite) throw new Error(`${email} did not appear in the pending-invite list`);
+
+    const minted = await http()
+      .post(`/api/v1/users/pending/${invite.membershipId}/token`)
+      .set('Cookie', adminCookie)
+      .send()
+      .expect(201);
 
     await http()
       .post('/api/v1/auth/set-password')
-      .send({ token: invite.token, password: PASSWORD })
+      .send({ token: minted.body.token, password: PASSWORD })
       .expect(204);
 
     return { cookie: await login(email), userId: invite.userId };

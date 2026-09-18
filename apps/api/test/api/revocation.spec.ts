@@ -231,18 +231,26 @@ describe('revocation over HTTP, driven by a real revoke (step-5 phase 3)', () =>
       .send({ email, role })
       .expect(201);
 
+    // MIGRATED AT THE PENDING SPLIT (OPEN-14): read the list, then mint for the
+    // one membership. The list no longer carries a token to reach for.
     const pending = await http()
       .get('/api/v1/users/pending')
       .set('Cookie', adminCookie)
       .expect(200);
-    const invite = (pending.body as { email: string; token: string }[]).find(
+    const invite = (pending.body as { email: string; membershipId: string }[]).find(
       (p) => p.email === email,
     );
     if (!invite) throw new Error(`${email} did not appear in the pending-invite list`);
 
+    const minted = await http()
+      .post(`/api/v1/users/pending/${invite.membershipId}/token`)
+      .set('Cookie', adminCookie)
+      .send()
+      .expect(201);
+
     await http()
       .post('/api/v1/auth/set-password')
-      .send({ token: invite.token, password: PASSWORD })
+      .send({ token: minted.body.token, password: PASSWORD })
       .expect(204);
 
     const list = await http().get('/api/v1/users').set('Cookie', adminCookie).expect(200);

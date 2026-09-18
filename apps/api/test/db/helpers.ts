@@ -184,6 +184,27 @@ export const EXPECTED_DEFINER_FUNCTIONS: readonly string[] = [
   // by column grant, so an app-role query naming it fails `permission denied`.
   'set_password',
   'list_pending_invites',
+  // THE ADMIN USER-MANAGEMENT SLICE (OPEN-14) adds the ninth, and what is worth
+  // noticing about it is not the count but that it is the first definer function
+  // for which ADR-006 §7's clause (b) is a REAL CHECK rather than a structural
+  // consequence.
+  //
+  // Every §7-bound function before it either takes no target at all
+  // (`list_pending_invites` — the tenant comes from `app.current_tenant` and the
+  // rows follow from it, so there is nothing a caller could name wrongly) or
+  // takes a membership id that the step-5 endpoints hand straight to a body which
+  // scopes it. `mint_invite_token` takes a membership id AND writes a live
+  // credential for the person it names, so "the target row belongs to the active
+  // tenant" is a predicate it must evaluate before it touches anything, and a
+  // missing one would be a cross-tenant credential mint rather than a leak of
+  // data already visible.
+  //
+  // It is a definer function for the same reason `list_pending_invites` is, and
+  // the reason still looks like a mere read: the pending predicate is
+  // `users.password_set_at`, withheld from `meterlog_app` by column grant, so an
+  // app-role query naming it fails `permission denied`. It also writes
+  // `invite_tokens`, which the app role holds nothing on at all.
+  'mint_invite_token',
 ];
 
 /**
