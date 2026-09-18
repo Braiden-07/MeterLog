@@ -218,6 +218,29 @@ export class WorkspaceSession {
     }
   }
 
+  /**
+   * Re-read identity, and NOTHING else.
+   *
+   * THE NARROW COUNTERPART TO `reset`, and the distinction is the whole reason
+   * this is a separate method rather than a parameter on that one. A reset means
+   * "you have no workspace": it cancels in-flight work, clears the cache and
+   * bumps the generation so the tenant subtree remounts. This means "your ROLE is
+   * not what I thought": the workspace is intact, every tenant-scoped row in the
+   * cache is still readable, and the only stale thing is `activeWorkspace.role`.
+   *
+   * Used in two places, and they are the same event seen from both sides — the
+   * server telling us (`handleApiError`'s role-correction branch, on a 403) and
+   * the client already knowing (an admin changing or revoking their OWN
+   * membership, where the next render must not still offer admin controls).
+   *
+   * Deliberately does NOT bump the generation. Doing so would remount the tenant
+   * subtree and throw away component state — a half-typed invite, a scroll
+   * position — for a change that invalidates no cached row.
+   */
+  async refresh(): Promise<void> {
+    await this.refreshIdentity();
+  }
+
   // ------------------------------------------------------- auth transitions
   async login(credentials: { email: string; password: string }): Promise<Identity> {
     const identity = await this.api.request<Identity>({
@@ -250,14 +273,46 @@ export class WorkspaceSession {
   }
 
   /**
-   * The global error hook: both reset codes mean the cache is now wrong.
+   * The global error hook. TWO BRANCHES, AND THE SPLIT IS THE POINT.
    *
    * Returns true when it handled the error, so callers can stop.
+   *
+   * **Reset** — the two `RESET_CODES` mean the caller has no workspace, so every
+   * tenant-scoped row in the cache is unreadable and all of it goes.
+   *
+   * **Role correction** — `FORBIDDEN_ROLE` / `NOT_ADMIN` mean the caller still
+   * holds this workspace and may still read it; only their ROLE is not what the
+   * client believed, which in practice means they were demoted mid-session. The
+   * response is therefore as narrow as it can be: re-read identity, and nothing
+   * else. The admin section then disappears on its own, because it renders off
+   * `activeWorkspace.role`.
+   *
+   * IT MUST NOT BE A RESET, and the reason is a user-visible one rather than a
+   * purity argument: a reset clears the cache and bumps the generation, which
+   * remounts the whole tenant subtree and flickers away data the caller is still
+   * entitled to see — the member list included, which every member may read by
+   * decision (ADR-006 §3). See the note at `RESET_CODES` for why the code is not
+   * simply added to that list.
+   *
+   * `invalidateQueries` rather than `setQueryData`: the refetch goes through the
+   * normal query path, so a concurrently-failing `/auth/me` is handled by the
+   * existing policy instead of by a second bespoke one here.
    */
   async handleApiError(error: unknown): Promise<boolean> {
-    if (!(error instanceof ApiError) || !error.isWorkspaceReset) return false;
-    await this.reset({ reason: 'workspace-lost', propagate: true, refetchIdentity: true });
-    return true;
+    if (!(error instanceof ApiError)) return false;
+
+    if (error.isWorkspaceReset) {
+      await this.reset({ reason: 'workspace-lost', propagate: true, refetchIdentity: true });
+      return true;
+    }
+
+    if (error.isRoleCorrection) {
+      await this.queryClient.invalidateQueries({ queryKey: ME_KEY });
+      await this.refresh();
+      return true;
+    }
+
+    return false;
   }
 
   // --------------------------------------------------- tenant-scoped reads

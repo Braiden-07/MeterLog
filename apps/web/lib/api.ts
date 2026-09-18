@@ -10,9 +10,34 @@ import { errorEnvelopeSchema } from '@meterlog/shared';
  */
 export const API_BASE = '/api/v1';
 
-/** Codes the client resets its cache on. Both mean "you have no workspace now". */
+/**
+ * Codes the client resets its cache on. Both mean "you have no workspace now".
+ *
+ * **`FORBIDDEN_ROLE` IS DELIBERATELY NOT HERE — do not "simplify" it in.** It is
+ * a 403 like the two above and looks like it belongs, which is exactly why this
+ * note exists. The two codes here mean the caller has **no workspace**, so every
+ * tenant-scoped row in the cache is now unreadable and the only correct response
+ * is to discard all of it. `FORBIDDEN_ROLE` means the caller still HAS this
+ * workspace and may still read it — they simply may not perform the action they
+ * just attempted, typically because they were demoted mid-session.
+ *
+ * Adding it here would clear the whole cache and bump the generation, remounting
+ * the shell and flickering data the caller is still entitled to see. The correct
+ * response is narrower and lives in `WorkspaceSession.handleApiError`: invalidate
+ * identity only, so the role corrects itself and the admin section disappears on
+ * its own. Reset means "no workspace"; role-correction means "identity only".
+ */
 export const RESET_CODES = ['NO_ACTIVE_WORKSPACE', 'MEMBERSHIP_REVOKED'] as const;
 export type ResetCode = (typeof RESET_CODES)[number];
+
+/**
+ * The role gate's refusal (ARCHITECTURE §9). Distinct from the definer bodies'
+ * `NOT_ADMIN`, which is the same 403 raised one layer deeper — the two carry
+ * different codes on purpose so a test asserting one cannot be satisfied by the
+ * other layer. Both mean the caller's role is not what the UI believed.
+ */
+export const FORBIDDEN_ROLE = 'FORBIDDEN_ROLE';
+export const NOT_ADMIN = 'NOT_ADMIN';
 
 export class ApiError extends Error {
   constructor(
@@ -28,6 +53,22 @@ export class ApiError extends Error {
   /** True for the two codes that mean the cache must be discarded. */
   get isWorkspaceReset(): boolean {
     return (RESET_CODES as readonly string[]).includes(this.code);
+  }
+
+  /**
+   * True when the caller's ROLE is not what the client believed, but their
+   * workspace is intact — a mid-session demotion being the ordinary cause.
+   *
+   * Deliberately a separate predicate from `isWorkspaceReset` rather than a
+   * widening of it, because the two call for opposite responses: that one
+   * discards everything, this one refreshes identity and leaves the cache alone.
+   * Both layers that can refuse on role are included — the gate's
+   * `FORBIDDEN_ROLE` and the definer body's `NOT_ADMIN` — because from the
+   * client's side they mean the same thing, even though the server keeps them
+   * distinguishable on purpose.
+   */
+  get isRoleCorrection(): boolean {
+    return this.code === FORBIDDEN_ROLE || this.code === NOT_ADMIN;
   }
 }
 

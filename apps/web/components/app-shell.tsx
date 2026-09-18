@@ -1,6 +1,7 @@
 'use client';
 
 import { AssetsList } from './assets-list';
+import { MembersAdmin } from './members-admin';
 import { WorkspaceSwitcher } from './workspace-switcher';
 import { useWorkspaceState } from '../lib/session-context';
 
@@ -37,6 +38,20 @@ export function AppShell() {
           </p>
         </div>
         <AssetsList />
+
+        {/*
+          ADMIN SECTION — DISPLAY-GATED ONLY, and that distinction is the point.
+          `role === 'admin'` decides whether these controls are RENDERED; it
+          decides nothing about whether they work. The real gate is the server's
+          `@RequiresRole('admin')`, backed by an independent live-admin check
+          inside each `SECURITY DEFINER` body, and neither may be relaxed on the
+          strength of this line.
+          A role that goes stale mid-session — a demotion in another tab, or by
+          another admin — is corrected rather than trusted: a 403 from any write
+          re-reads identity (`handleApiError`'s role-correction branch), and this
+          section then unmounts on the next render because `role` has changed.
+        */}
+        {active.role === 'admin' && <MembersAdmin />}
       </main>
     </div>
   );
