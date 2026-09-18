@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { PrismaClient } from '@prisma/client';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppModule } from '../../src/app.module';
+import { NEST_APP_OPTIONS, configureApp } from '../../src/bootstrap';
 import { AssetsService } from '../../src/assets/assets.service';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
 import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
@@ -45,12 +46,10 @@ describe('G2 — no active workspace is a durable, distinct 403 (OPEN-18)', () =
     migrator = migratorClient();
 
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = moduleRef.createNestApplication();
-    // Mirrors main.ts, so these run through the real request pipeline.
-    app.setGlobalPrefix('api/v1');
-    app.useGlobalPipes(
-      new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
-    );
+    app = moduleRef.createNestApplication(NEST_APP_OPTIONS);
+    // The SAME pipeline production runs — prefix, parsers, headers,
+    // validation — rather than a hand-copy of it (src/bootstrap.ts).
+    configureApp(app);
     await app.init();
   });
 

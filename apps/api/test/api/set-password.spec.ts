@@ -1,11 +1,12 @@
 import { hash as argonHash, verify as argonVerify } from '@node-rs/argon2';
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { PrismaClient } from '@prisma/client';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { AppModule } from '../../src/app.module';
+import { NEST_APP_OPTIONS, configureApp } from '../../src/bootstrap';
 import { ARGON2_OPTIONS } from '../../src/auth/auth.service';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
 import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
@@ -35,12 +36,10 @@ describe('set-password and invite uniformity over HTTP (step 8 — OPEN-7)', () 
     migrator = migratorClient();
 
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = moduleRef.createNestApplication();
-    // Mirrors main.ts, so this exercises the real request pipeline.
-    app.setGlobalPrefix('api/v1');
-    app.useGlobalPipes(
-      new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
-    );
+    app = moduleRef.createNestApplication(NEST_APP_OPTIONS);
+    // The SAME pipeline production runs — prefix, parsers, headers,
+    // validation — rather than a hand-copy of it (src/bootstrap.ts).
+    configureApp(app);
     await app.init();
   });
 
