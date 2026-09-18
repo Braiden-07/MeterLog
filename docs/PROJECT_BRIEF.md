@@ -263,7 +263,7 @@ Follow SDLC phases; work in small PRs. Log decisions as you go.
 - [x] Tenant isolation enforced by RLS and proven by an integration test (A can't see B).
 - [x] Three roles with enforced permissions; 403 paths tested.
 - [x] Audit log written on every core mutation; viewable by admin/auditor.
-- [ ] All essential endpoints implemented with validation, pagination, error envelope, OpenAPI docs.
+- [x] All essential endpoints implemented with validation, pagination, error envelope, OpenAPI docs.
 - [ ] Frontend covers all essential journeys.
 - [x] Invited users can set a password and log in; no invite creates an unreachable account.
 - [ ] ≥70% coverage on core logic; unit + integration + API + at least 2 e2e journeys green.
