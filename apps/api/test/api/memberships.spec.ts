@@ -150,13 +150,109 @@ describe('memberships API (step-5 phase 2 — RBAC)', () => {
       expect(await membershipOf('tech@acme.test', tenantId)).not.toBeNull();
     });
 
-    it('the list is scoped to the active workspace by RLS, not by a WHERE clause', async () => {
+    it('a SINGLE-workspace admin sees only their own tenant — and this fixture cannot see G1', async () => {
+      // RETITLED AT G1 (OPEN-13). This used to read "scoped by RLS, not by a
+      // WHERE clause", and that claim is no longer true of the endpoint: `list()`
+      // now carries an explicit `app.current_tenant` predicate. The fixture is
+      // kept exactly as it was, because what it demonstrates is now the OPPOSITE
+      // of what its old title claimed — it is the shape of fixture that CANNOT
+      // catch the bug.
+      //
+      // Both admins here belong to exactly ONE workspace each, so the self axis
+      // and the tenant axis select the same rows and the OR of two permissive
+      // policies is indistinguishable from either one alone. The test below is
+      // the same scenario with the one variable that matters changed.
       const { cookie } = await newOrg('Acme', 'admin@acme.test');
       await newOrg('Beta', 'admin@beta.test');
 
       const res = await http().get('/api/v1/users').set('Cookie', cookie).expect(200);
       expect(res.body).toHaveLength(1);
       expect(res.body[0].email).toBe('admin@acme.test');
+    });
+
+    it("G1 (OPEN-13) — a MULTI-workspace admin sees ONLY the active tenant's members", async () => {
+      // THE OPEN-13 NEGATIVE. `memberships_self_read` (keyed on
+      // `app.current_user`) and `memberships_tenant` (keyed on
+      // `app.current_tenant`) are both PERMISSIVE `FOR SELECT` policies, so they
+      // OR — and a user who belongs to several workspaces therefore has their own
+      // rows from EVERY workspace visible under any one tenant's context.
+      //
+      // Against the pre-G1 endpoint this returns TWO rows for Acme: Acme's own
+      // membership plus the caller's Beta membership arriving over the self axis.
+      // `Member` exposes no `tenantId` (deliberately — ADR-006 §7 keeps the
+      // response about people in this workspace), so the foreign row is not
+      // merely extra, it is INDISTINGUISHABLE in the body: it renders as the same
+      // person listed twice with two roles and no way to tell which workspace
+      // either belongs to. That is why the assertion is on the row COUNT and the
+      // role, not on a tenant field — there is none to assert.
+      const { cookie: betaCookie } = await newOrg('Beta', 'multi@beta.test');
+      const { cookie: acmeCookie, tenantId: acme } = await newOrg('Acme', 'admin@acme.test');
+
+      // The SAME person now holds a second membership, in Acme, as a technician.
+      await http()
+        .post('/api/v1/users')
+        .set('Cookie', acmeCookie)
+        .send({ email: 'multi@beta.test', role: 'technician' })
+        .expect(201);
+      expect(await membershipOf('multi@beta.test', acme)).toMatchObject({ role: 'technician' });
+
+      // Acting in BETA — where they are the admin and the only member.
+      const res = await http().get('/api/v1/users').set('Cookie', betaCookie).expect(200);
+
+      expect(
+        res.body,
+        "the caller's Acme membership must not appear in Beta's member list",
+      ).toHaveLength(1);
+      expect(res.body[0].email).toBe('multi@beta.test');
+      expect(res.body[0].role, 'the role shown must be the one held in the ACTIVE workspace').toBe(
+        'admin',
+      );
+
+      // Non-vacuity: the second membership really exists and really is visible to
+      // the database under this caller's self axis. Without this the assertion
+      // above would pass against a fixture that simply never created it.
+      const [selfRows] = await migrator.$queryRawUnsafe<{ n: number }[]>(
+        `SELECT count(*)::int AS n FROM public.memberships m
+           JOIN public.users u ON u.id = m.user_id
+          WHERE u.email = 'multi@beta.test'::citext AND m.deleted_at IS NULL`,
+      );
+      expect(selfRows!.n, 'the caller must genuinely hold two live memberships').toBe(2);
+    });
+
+    it('G1 is SERVICE-LAYER — /auth/me still lists every workspace, cross-tenant', async () => {
+      // THE DIFFERENTIAL CONTROL. This is the negative that reds if the OPEN-13
+      // fix is ever "simplified" into an RLS tightening.
+      //
+      // `readWorkspaces` (auth.service.ts) carries NO tenant predicate — only
+      // `user_id` and `deleted_at IS NULL` — and rides the self axis on purpose,
+      // because the workspace switcher's entire job is to show workspaces the
+      // caller is NOT currently active in. Putting a tenant term into
+      // `memberships_self_read` would scope `list()` correctly and collapse this
+      // list to one entry in the same stroke, breaking the switcher.
+      //
+      // So: same fixture as the test above, same caller, same active tenant —
+      // and the OPPOSITE expectation. The member list must narrow; the workspace
+      // list must not.
+      const { cookie: betaCookie } = await newOrg('Beta', 'multi@beta.test');
+      const { cookie: acmeCookie } = await newOrg('Acme', 'admin@acme.test');
+      await http()
+        .post('/api/v1/users')
+        .set('Cookie', acmeCookie)
+        .send({ email: 'multi@beta.test', role: 'technician' })
+        .expect(201);
+
+      const me = await http().get('/api/v1/auth/me').set('Cookie', betaCookie).expect(200);
+
+      expect(
+        me.body.workspaces,
+        'the workspace list is cross-tenant BY DESIGN — this is the switcher',
+      ).toHaveLength(2);
+      expect(me.body.workspaces.map((w: { name: string }) => w.name).sort()).toEqual([
+        'Acme',
+        'Beta',
+      ]);
+      expect(me.body.activeWorkspace.name).toBe('Beta');
+      expect(me.body.activeWorkspace.role).toBe('admin');
     });
   });
 

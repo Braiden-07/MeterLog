@@ -382,6 +382,95 @@ describe('membership model — dual-axis isolation', () => {
       );
       expect(rows.map((r) => r.name)).toEqual(['Tenant B']);
     });
+
+    /**
+     * WHY G1 (OPEN-13) IS A SERVICE-LAYER FILTER AND NOT AN RLS TIGHTENING —
+     * demonstrated against a live database rather than asserted in a comment.
+     *
+     * OPEN-13 is that `GET /users` returned the caller's own memberships from
+     * every workspace, because the self axis and the tenant axis are both
+     * permissive and therefore OR. The obvious-looking fix is to add a tenant
+     * term to `memberships_self_read` and be done with it — one line, in the
+     * layer this project otherwise insists isolation belongs in.
+     *
+     * THAT FIX WOULD BREAK THE WORKSPACE SWITCHER, and this test is what says so
+     * out loud. `readWorkspaces` (auth.service.ts) deliberately carries NO tenant
+     * predicate: its entire job is to list workspaces the caller is NOT currently
+     * active in, which it can only do because the self axis returns rows from
+     * every tenant. Tightening the policy scopes the member list correctly and
+     * empties the switcher in the same stroke.
+     *
+     * The mutation is applied inside a transaction that is ALWAYS rolled back —
+     * DDL is transactional in Postgres, so the policy is restored whether this
+     * test passes or fails. Same idiom as the write-grant probe above.
+     */
+    it('an RLS tightening WOULD collapse the workspace list — so the G1 filter is service-layer', async () => {
+      const ROLLBACK = '__intentional_rollback__';
+      let underTightenedPolicy!: string[];
+      let probeRole!: string;
+
+      try {
+        await migrator.$transaction(async (tx) => {
+          // The tempting one-line "fix" for OPEN-13.
+          await tx.$executeRawUnsafe(
+            `ALTER POLICY memberships_self_read ON public.memberships
+               USING (user_id = NULLIF(current_setting('app.current_user', true), '')::uuid
+                  AND tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)`,
+          );
+          await tx.$executeRawUnsafe(`SET LOCAL ROLE meterlog_app`);
+          await tx.$executeRawUnsafe(`SELECT set_config('app.current_user', $1, true)`, userM);
+          await tx.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, true)`, tenantA);
+
+          const [who] = await tx.$queryRawUnsafe<{ role: string }[]>(
+            `SELECT current_user::text AS role`,
+          );
+          probeRole = who!.role;
+
+          // `readWorkspaces`' query, verbatim in shape: self axis, liveness,
+          // NO tenant predicate — because it must not have one.
+          const rows = await tx.$queryRawUnsafe<{ name: string }[]>(
+            `SELECT t.name
+               FROM public.memberships m
+               JOIN public.tenants t ON t.id = m.tenant_id
+              WHERE m.user_id = $1::uuid
+                AND m.deleted_at IS NULL
+              ORDER BY t.name`,
+            userM,
+          );
+          underTightenedPolicy = rows.map((r) => r.name);
+
+          throw new Error(ROLLBACK);
+        });
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes(ROLLBACK)) throw error;
+      }
+
+      // The probe really ran as the restricted role, or it proves nothing.
+      expect(probeRole).toBe('meterlog_app');
+
+      // THE DAMAGE: M holds live memberships in A and B, and the switcher can
+      // now see only the one they are already in.
+      expect(
+        underTightenedPolicy,
+        'a tenant term in the self axis empties the workspace switcher',
+      ).toEqual(['Tenant A']);
+
+      // AND THE POLICY IS BACK. Without this the rest of the file would be
+      // testing a mutated schema, and the mutation would escape into every suite
+      // that runs after it.
+      const restored = await withContext(app, { userId: userM, tenantId: tenantA }, (tx) =>
+        tx.$queryRawUnsafe<{ name: string }[]>(
+          `SELECT t.name FROM public.memberships m
+             JOIN public.tenants t ON t.id = m.tenant_id
+            WHERE m.user_id = $1::uuid AND m.deleted_at IS NULL ORDER BY t.name`,
+          userM,
+        ),
+      );
+      expect(
+        restored.map((r) => r.name),
+        'the rollback must have restored the self axis',
+      ).toEqual(['Tenant A', 'Tenant B']);
+    });
   });
 
   describe('fail-closed on unset context', () => {

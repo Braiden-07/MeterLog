@@ -77,11 +77,33 @@ describe('set-password and invite uniformity over HTTP (step 8 — OPEN-7)', () 
     await http().post('/api/v1/users').set('Cookie', cookie).send({ email, role }).expect(201);
   }
 
+  /**
+   * MIGRATED AT THE PENDING SPLIT (OPEN-14). This used to return a token per row,
+   * because the GET minted one on every read. It is now the metadata read it
+   * always should have been, and `mintFor` below is where a token comes from.
+   *
+   * The signature no longer names `token`, which is the point: every call site
+   * that wanted a credential had to be rewritten to ask for one explicitly, and
+   * the ones that only ever wanted the LIST — the tenant-scoping assertions
+   * below — are unchanged and now no longer mint as a side effect of asserting.
+   */
   async function pendingList(
     cookie: string,
-  ): Promise<{ email: string; token: string; role: string }[]> {
+  ): Promise<{ membershipId: string; email: string; role: string }[]> {
     const res = await http().get('/api/v1/users/pending').set('Cookie', cookie).expect(200);
     return res.body;
+  }
+
+  /** Mints a redemption token for one pending invitee, by email. */
+  async function mintFor(cookie: string, email: string): Promise<string> {
+    const row = (await pendingList(cookie)).find((p) => p.email === email);
+    if (!row) throw new Error(`${email} is not pending`);
+    const res = await http()
+      .post(`/api/v1/users/pending/${row.membershipId}/token`)
+      .set('Cookie', cookie)
+      .send()
+      .expect(201);
+    return res.body.token;
   }
 
   // =========================================================================
@@ -96,9 +118,14 @@ describe('set-password and invite uniformity over HTTP (step 8 — OPEN-7)', () 
       const [pending] = await pendingList(adminCookie);
       expect(pending!.email).toBe('newcomer@acme.test');
 
+      // MIGRATED AT OPEN-14: the token comes from an explicit mint now, not from
+      // having looked at the list. The journey gains one step and loses the
+      // property that reading the list destroyed the link.
+      const token = await mintFor(adminCookie, 'newcomer@acme.test');
+
       await http()
         .post('/api/v1/auth/set-password')
-        .send({ token: pending!.token, password: PASSWORD })
+        .send({ token, password: PASSWORD })
         .expect(204);
 
       const cookie = await login('newcomer@acme.test');
@@ -118,27 +145,27 @@ describe('set-password and invite uniformity over HTTP (step 8 — OPEN-7)', () 
       // credentials. Asserted by sending no cookie at all.
       const adminCookie = await newOrg('Acme Metering', 'admin@acme.test');
       await invite(adminCookie, 'newcomer@acme.test');
-      const [pending] = await pendingList(adminCookie);
+      const token = await mintFor(adminCookie, 'newcomer@acme.test');
 
       await http()
         .post('/api/v1/auth/set-password')
-        .send({ token: pending!.token, password: PASSWORD })
+        .send({ token, password: PASSWORD })
         .expect(204);
     });
 
     it('a redeemed token is refused on replay, as a 400 with one generic code', async () => {
       const adminCookie = await newOrg('Acme Metering', 'admin@acme.test');
       await invite(adminCookie, 'newcomer@acme.test');
-      const [pending] = await pendingList(adminCookie);
+      const token = await mintFor(adminCookie, 'newcomer@acme.test');
 
       await http()
         .post('/api/v1/auth/set-password')
-        .send({ token: pending!.token, password: PASSWORD })
+        .send({ token, password: PASSWORD })
         .expect(204);
 
       const replay = await http()
         .post('/api/v1/auth/set-password')
-        .send({ token: pending!.token, password: 'a different password entirely' })
+        .send({ token, password: 'a different password entirely' })
         .expect(400);
       expect(replay.body.error.code).toBe('INVALID_TOKEN');
 
@@ -470,10 +497,10 @@ describe('set-password and invite uniformity over HTTP (step 8 — OPEN-7)', () 
       // `test/db/set-password.spec.ts`.
       const adminCookie = await newOrg('Acme Metering', 'admin@acme.test');
       await invite(adminCookie, 'tech@acme.test');
-      const [pending] = await pendingList(adminCookie);
+      const token = await mintFor(adminCookie, 'tech@acme.test');
       await http()
         .post('/api/v1/auth/set-password')
-        .send({ token: pending!.token, password: PASSWORD })
+        .send({ token, password: PASSWORD })
         .expect(204);
       const techCookie = await login('tech@acme.test');
 
