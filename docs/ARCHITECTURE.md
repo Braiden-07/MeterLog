@@ -202,7 +202,7 @@ A caller with **no active workspace** is refused before any row here is consulte
 | `PATCH /maintenance-records/:id`          | ✓     | ✓          | 403     |
 | `DELETE /maintenance-records/:id` (soft)  | ✓     | ✓          | 403     |
 
-The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:152)](PROGRESS.md#L152)).
+The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:172)](PROGRESS.md#L172)).
 
 **The one cell that was genuinely open, and how it was resolved.** `POST /assets` could defensibly have been admin-only. It is **admin _and_ technician**: registering an asset is field work — the technician installing a meter is the person who knows its serial number, type and location, and routing that through an admin invents a bottleneck the product has no reason to have. The destructive act is **decommissioning**, and that is where the admin-only line is drawn: `DELETE /assets/:id` is admin-only.
 
@@ -260,7 +260,7 @@ Lives in DECISIONS: [ADR-009](DECISIONS.md#L412) capture · [ADR-010](DECISIONS.
 
 ## 11. API conventions
 
-Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:693)](PROGRESS.md#L693)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:255)](PROGRESS.md#L255); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L628).
+Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:713)](PROGRESS.md#L713)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:275)](PROGRESS.md#L275); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L628).
 
 ## 12. Error handling & logging
 

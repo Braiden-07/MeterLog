@@ -478,6 +478,112 @@ describe('workspace switch evicts the previous tenant (slice 1 security gate)', 
     expect(cacheJson(queryClient)).not.toContain('SN-ACME-1');
   });
 
+  /**
+   * ================= ROLE CORRECTION IS NOT A RESET =======================
+   *
+   * Added at the admin user-management slice. `FORBIDDEN_ROLE` is a 403 like the
+   * two reset codes above and sits one line away from them in the same handler,
+   * which is exactly why it needs a test that pins the DIFFERENCE rather than a
+   * comment saying there is one.
+   *
+   * The two reset codes mean "you have no workspace": every tenant-scoped row is
+   * now unreadable, so all of it goes. `FORBIDDEN_ROLE` means "your ROLE is not
+   * what you thought" — the workspace is intact, the member list is still
+   * readable by every member by decision (ADR-006 §3), and the only stale value
+   * is `activeWorkspace.role`. Resetting would clear rows the caller is still
+   * entitled to see and remount the shell around them.
+   *
+   * THE ASSERTION THAT MATTERS IS THE SURVIVAL ONE. "Identity was re-read" would
+   * pass just as happily for a full reset, since a reset re-reads identity too.
+   * What separates the two is whether the tenant cache is STILL THERE
+   * afterwards — and whether the generation moved, because that is what remounts
+   * the subtree.
+   */
+  it('FORBIDDEN_ROLE re-reads identity and leaves the tenant cache INTACT', async () => {
+    await seedAcme();
+    const before = tenantCacheJson(queryClient);
+    expect(before, 'the fixture must be real, or the survival assertion is vacuous').toContain(
+      'SN-ACME-1',
+    );
+    const generationBefore = session.generation;
+
+    const refused = await refusedRead('FORBIDDEN_ROLE', 'You may not perform this action.');
+    expect((refused as { code?: string }).code).toBe('FORBIDDEN_ROLE');
+
+    // The demotion the 403 is reporting: admin -> technician, SAME workspace.
+    const demoted: Identity = {
+      ...ACME,
+      activeWorkspace: { tenantId: 'acme', name: 'Acme', role: 'technician' },
+    };
+    server.canned('/auth/me', demoted);
+
+    expect(await session.handleApiError(refused), 'the handler must claim this error').toBe(true);
+
+    // (1) identity corrected — the admin section unmounts off the back of this.
+    expect(session.identity()?.activeWorkspace?.role).toBe('technician');
+
+    // (2) THE WORKSPACE IS STILL THERE. A reset would have nulled it.
+    expect(session.activeTenantId()).toBe('acme');
+
+    // (3) the tenant cache SURVIVED, byte for byte.
+    expect(
+      tenantCacheJson(queryClient),
+      'a role correction must not discard rows the caller may still read',
+    ).toBe(before);
+
+    // (4) and the subtree is NOT remounted — no generation bump, so a half-typed
+    // invite or a scroll position is not thrown away for a role change.
+    expect(session.generation, 'role correction must not bump the generation').toBe(
+      generationBefore,
+    );
+  });
+
+  it("NOT_ADMIN — the definer body's own 403 — is treated the same way", async () => {
+    // The two layers answer with DIFFERENT codes on purpose (the step-5 lesson:
+    // two layers answering identically are two you cannot tell apart when one
+    // breaks). From the client's side they mean the same thing, so both take the
+    // role-correction path — but only because that is written down, not assumed.
+    await seedAcme();
+    const before = tenantCacheJson(queryClient);
+
+    const refused = await refusedRead('NOT_ADMIN', 'You do not have permission.');
+    server.canned('/auth/me', {
+      ...ACME,
+      activeWorkspace: { tenantId: 'acme', name: 'Acme', role: 'technician' },
+    });
+
+    expect(await session.handleApiError(refused)).toBe(true);
+    expect(session.activeTenantId()).toBe('acme');
+    expect(tenantCacheJson(queryClient)).toBe(before);
+  });
+
+  it('the CONTRAST — a reset code on the same fixture wipes what FORBIDDEN_ROLE kept', async () => {
+    // The discriminating test. Without this, the three assertions above could be
+    // satisfied by a handler that never resets for anything, and the reset path
+    // would be silently dead. Same seed, same handler, opposite outcome.
+    await seedAcme();
+    expect(tenantCacheJson(queryClient)).toContain('SN-ACME-1');
+
+    const refused = await refusedRead('NO_ACTIVE_WORKSPACE', 'Choose a workspace.');
+    server.canned('/auth/me', { ...ACME, activeWorkspace: null });
+    expect(await session.handleApiError(refused)).toBe(true);
+
+    expect(tenantCacheJson(queryClient)).not.toContain('SN-ACME-1');
+    expect(session.activeTenantId()).toBeNull();
+  });
+
+  it('an unrelated error is claimed by neither branch', async () => {
+    // The handler must return false for anything it does not own, or a plain
+    // 500 would silently trigger cache surgery.
+    await seedAcme();
+    const before = tenantCacheJson(queryClient);
+    const refused = await refusedRead('INTERNAL_ERROR', 'Something went wrong.');
+
+    expect(await session.handleApiError(refused)).toBe(false);
+    expect(tenantCacheJson(queryClient)).toBe(before);
+    expect(session.activeTenantId()).toBe('acme');
+  });
+
   it('the revoked two-step on bootstrap retries exactly once and does not loop', async () => {
     const fresh = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const freshServer = fakeServer();

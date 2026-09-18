@@ -14,12 +14,26 @@ const api = createApiClient((input, init) => fetch(input, init));
  * Invite redemption: `/set-password#token=…`.
  *
  * THE TOKEN COMES FROM THE FRAGMENT, NEVER A QUERY STRING, AND NEVER GOES BACK
- * INTO A URL. It is a live credential — `list_pending_invites` mints it and the
+ * INTO A URL. It is a live credential — `mint_invite_token` mints it and the
  * server stores only its SHA-256, so this page holds the one copy that exists.
  * A fragment is not sent to any server, is not written to server logs, and does
  * not travel in a `Referer` header; `?token=` fails all three, and every one of
  * those is a place a credential would be retained by something that never needed
  * it.
+ *
+ * **CORRECTED AT THE ADMIN USER-MANAGEMENT SLICE.** This said
+ * `list_pending_invites` mints the token, which was true when written and became
+ * false at the pending split (OPEN-14): that function is now a metadata-only
+ * read with no `token` in its signature at all, and minting moved to
+ * `mint_invite_token` behind `POST /users/pending/:membershipId/token`. The
+ * correction matters beyond accuracy — a reader chasing the old name would find
+ * a function that provably cannot produce what this page consumes.
+ *
+ * THE PRODUCER END IS NOW CONSTRAINED TOO. Until this slice, only this page —
+ * the consumer — was written to the fragment rule; nothing stopped the code that
+ * BUILDS the link from using `?token=`. `lib/invite-link.ts` is now the single
+ * builder and `lib/invite-link.spec.ts` asserts the shape, which is the
+ * producer-side acceptance OPEN-14 records as owed.
  *
  * It is read once into component state and put only in the POST body. The fragment
  * is then cleared from the address bar so the credential does not sit in history or

@@ -1,3 +1,4 @@
+import { roleSchema } from '@meterlog/shared';
 import { z } from 'zod';
 
 /**
@@ -37,3 +38,25 @@ export const setPasswordSchema = z.object({
   password: z.string().min(12, 'Use at least 12 characters.').max(200),
 });
 export type SetPasswordInput = z.infer<typeof setPasswordSchema>;
+
+/**
+ * The invite form (`POST /users`).
+ *
+ * `roleSchema` IS IMPORTED FROM SHARED, AND THAT IS NOT A CONTRADICTION OF THE
+ * NOTE ABOVE. The rule that note states is that REQUEST BODIES stay local
+ * because they are the client's UX rules and the server is the sole authority.
+ * A role enum is not a request body — it is a closed set of values both sides
+ * must agree on, exactly like the error envelope beside it in `shared`. If the
+ * API ever adds a fourth role, one definition should change, not two; if this
+ * file hardcoded the three, a stale copy would render a `<select>` missing an
+ * option the server accepts, and nothing would catch it.
+ *
+ * The SHAPE of the body still lives here, and still mirrors `InviteMemberDto`
+ * rather than importing it: `@IsEmail()` + `@MaxLength(320)` server-side, so a
+ * mismatch is a usability bug rather than a security one.
+ */
+export const inviteSchema = z.object({
+  email: z.string().email('Enter a valid email address.').max(320, 'That address is too long.'),
+  role: roleSchema,
+});
+export type InviteInput = z.infer<typeof inviteSchema>;
