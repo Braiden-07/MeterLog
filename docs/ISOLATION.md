@@ -174,7 +174,7 @@ WHERE u.email OPERATOR(public.=) p_email
 
 — [migration.sql:62](../apps/api/prisma/migrations/20260908000000_auth_definer_functions/migration.sql#L62)
 
-Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:184](DECISIONS.md#L184)) so the next definer function comparing an extension type does not walk back into it.
+Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:196](DECISIONS.md#L196)) so the next definer function comparing an extension type does not walk back into it.
 
 **Step 5 is where that amendment earned its keep.** The three membership-write functions are schema-qualified on _every_ operator — `OPERATOR(public.=)` for citext, `OPERATOR(pg_catalog.=)` for uuid and enum — rather than only on the one comparison that had already burned the project. In `invite_member` the consequence of getting it wrong would have been subtler than the original: a case-different existing address would miss the lookup, the create branch would fire, and the case-**insensitive** unique index would refuse it — an invite that cannot succeed for a person who is already in the system.
 
@@ -645,7 +645,7 @@ Step 7a built the audit **capture** mechanism and proved it at the database laye
 
 **Step 6 disproved it.** A maintenance edit emits **no lifecycle event at all**: correcting a description is not something that happened to the physical asset. The asset-metadata `PATCH` is the same shape (ARCHITECTURE §9.2). A derived trail is therefore silent for the entire class of change an auditor is most likely to be investigating — and silent without erroring, which is this document's recurring failure mode.
 
-So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L412)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
+So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L424)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
 
 ### The centerpiece — immutable by grant
 
@@ -660,7 +660,7 @@ psql:/tmp/neg.sql:9:  ERROR:  permission denied for table audit_log
 psql:/tmp/neg.sql:11: ERROR:  permission denied for table audit_log
 ```
 
-Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L460)).
+Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L472)).
 
 Two vacuity guards sit under it. The `ALTER` and `SUPPRESS` negatives assert the row **existed, was visible under that tenant, and is unchanged afterwards**, so neither can pass against an empty table. And a positive pairs with all three — the app role **can** read its own tenant's rows ([`the app role CAN read its own tenant rows`](../apps/api/test/db/audit.spec.ts#L335)) — because "cannot write" is otherwise satisfied by a table nobody can reach at all, which is fail-closed and broken.
 
@@ -768,7 +768,7 @@ Six, up from five, with the allowlist extended in the same PR ([`EXPECTED_DEFINE
 
 ### What 7a does not prove
 
-The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L531) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
+The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L543) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
 
 Hash-chaining is deferred, and ADR-010 records why as engineering rather than scope. What immutability-by-grant does **not** give, stated plainly: it defends against the application and against anyone holding only the app role's credentials. It does **not** defend against the migration/owner role or a cluster superuser, who can `ALTER TABLE`. Tamper-evidence against a privileged operator is what a chain buys, and that threat model is not v1.0's.
 

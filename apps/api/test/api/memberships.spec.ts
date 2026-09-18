@@ -1,10 +1,11 @@
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { PrismaClient } from '@prisma/client';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { AppModule } from '../../src/app.module';
+import { NEST_APP_OPTIONS, configureApp } from '../../src/bootstrap';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
 import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
 
@@ -45,12 +46,10 @@ describe('memberships API (step-5 phase 2 — RBAC)', () => {
     migrator = migratorClient();
 
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = moduleRef.createNestApplication();
-    // Mirrors main.ts, so the acceptance tests exercise the real request pipeline.
-    app.setGlobalPrefix('api/v1');
-    app.useGlobalPipes(
-      new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
-    );
+    app = moduleRef.createNestApplication(NEST_APP_OPTIONS);
+    // The SAME pipeline production runs — prefix, parsers, headers,
+    // validation — rather than a hand-copy of it (src/bootstrap.ts).
+    configureApp(app);
     await app.init();
   });
 

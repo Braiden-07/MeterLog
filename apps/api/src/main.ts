@@ -1,33 +1,19 @@
 import 'reflect-metadata';
 
-import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import helmet from 'helmet';
 
 import { AppModule } from './app.module';
+import { NEST_APP_OPTIONS, configureApp } from './bootstrap';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  const app = await NestFactory.create(AppModule, { ...NEST_APP_OPTIONS, bufferLogs: true });
 
-  app.setGlobalPrefix('api/v1');
-  app.use(helmet());
-
-  // Credentials are sent with every request (session cookie, ADR-001), so the
-  // origin must be an allow-list — a wildcard is not permitted with credentials.
-  app.enableCors({
-    origin: process.env.CORS_ORIGIN?.split(',') ?? ['http://localhost:3000'],
-    credentials: true,
-  });
-
-  app.useGlobalPipes(
-    new ValidationPipe({
-      transform: true,
-      whitelist: true,
-      // PROJECT_BRIEF §6: reject unknown fields rather than silently dropping them.
-      forbidNonWhitelisted: true,
-    }),
-  );
+  // The request-pipeline floor — prefix, parsers, headers, validation. Shared
+  // with every acceptance test so the suite exercises the pipeline this process
+  // actually runs, rather than a hand-copied approximation of it (see
+  // bootstrap.ts).
+  configureApp(app);
 
   const openApi = new DocumentBuilder()
     .setTitle('MeterLog API')

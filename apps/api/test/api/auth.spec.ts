@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import type { PrismaClient } from '@prisma/client';
 import request from 'supertest';
@@ -9,6 +9,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import Redis from 'ioredis';
 
 import { AppModule } from '../../src/app.module';
+import { NEST_APP_OPTIONS, configureApp } from '../../src/bootstrap';
 import { ARGON2_OPTIONS, dummyVerifyTarget } from '../../src/auth/auth.service';
 import { SESSION_COOKIE } from '../../src/common/session/session.service';
 import { loadEnv, migratorClient, resetDatabase } from '../db/helpers';
@@ -50,12 +51,10 @@ describe('auth API (step-4 acceptance)', () => {
     process.env.DATABASE_URL = `${base}${base.includes('?') ? '&' : '?'}connection_limit=1&pool_timeout=10`;
 
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = moduleRef.createNestApplication();
-    // Mirrors main.ts, so the acceptance tests exercise the real request pipeline.
-    app.setGlobalPrefix('api/v1');
-    app.useGlobalPipes(
-      new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
-    );
+    app = moduleRef.createNestApplication(NEST_APP_OPTIONS);
+    // The SAME pipeline production runs — prefix, parsers, headers,
+    // validation — rather than a hand-copy of it (src/bootstrap.ts).
+    configureApp(app);
     await app.init();
 
     process.env.DATABASE_URL = base;
