@@ -39,6 +39,22 @@ export type ResetCode = (typeof RESET_CODES)[number];
 export const FORBIDDEN_ROLE = 'FORBIDDEN_ROLE';
 export const NOT_ADMIN = 'NOT_ADMIN';
 
+/**
+ * The 409 a state-changing request gets when its `X-Expected-Tenant` names a
+ * workspace other than the one the server just verified as active (OPEN-15).
+ *
+ * **A THIRD POLICY CLASS, not a variant of the two above.** It is neither "you
+ * have no workspace" (reset) nor "your role is not what you thought"
+ * (role-correction): the workspace is valid and the role is right — the TAB is
+ * simply behind, because the active workspace changed underneath it, typically
+ * in another tab. The write it was carrying did not happen.
+ *
+ * Matched against the exact string the interceptor throws
+ * (`tenant-context.interceptor.ts`); the server keeps it distinct from every
+ * other refusal precisely so the client can respond differently.
+ */
+export const TENANT_MISMATCH = 'TENANT_MISMATCH';
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -69,6 +85,21 @@ export class ApiError extends Error {
    */
   get isRoleCorrection(): boolean {
     return this.code === FORBIDDEN_ROLE || this.code === NOT_ADMIN;
+  }
+
+  /**
+   * True when the caller's ACTIVE WORKSPACE is not what the client believed —
+   * the tab is behind, and the write it just attempted did not happen.
+   *
+   * One getter per policy class, like the two above, and for the same reason:
+   * three predicates that can be read side by side are three responses that can
+   * be told apart. Folding this into either of the others would be wrong in
+   * opposite directions — `isWorkspaceReset` would discard a cache the caller is
+   * still entitled to, and `isRoleCorrection` would leave the tab pointed at a
+   * workspace the server no longer considers active.
+   */
+  get isTenantMismatch(): boolean {
+    return this.code === TENANT_MISMATCH;
   }
 }
 

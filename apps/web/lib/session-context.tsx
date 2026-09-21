@@ -30,11 +30,21 @@ export function useWorkspaceState(): {
   session: WorkspaceSession;
   identity: Identity | undefined;
   mountKey: string;
+  notice: string | null;
 } {
   const session = useSession();
   const [, force] = useState(0);
   useEffect(() => session.subscribe(() => force((n) => n + 1)), [session]);
-  return { session, identity: session.identity(), mountKey: session.mountKey() };
+  // `notice` rides the SAME subscription as identity and mountKey. It has to be
+  // read here rather than held in a component: the tenant-mismatch recovery that
+  // raises it also changes `mountKey`, so anything below that boundary remounts
+  // and would lose it (workspace-session.ts, `recoveryNotice`).
+  return {
+    session,
+    identity: session.identity(),
+    mountKey: session.mountKey(),
+    notice: session.notice(),
+  };
 }
 
 /**

@@ -101,6 +101,20 @@ export class WorkspaceSession {
   /** Bumped by every reset. Also the remount key, and the late-write guard. */
   private currentGeneration = 0;
 
+  /**
+   * The "your write did not happen" notice, raised by the TENANT_MISMATCH branch.
+   *
+   * IT LIVES HERE, ON THE SESSION, AND THAT IS A CORRECTNESS REQUIREMENT RATHER
+   * THAN A STYLE CHOICE. The recovery it describes re-homes the tab to a
+   * different workspace, which changes `mountKey()` — so everything under
+   * `<main key={mountKey}>` UNMOUNTS, `MembersAdmin` included. A notice held in
+   * component state there would be destroyed by the very event it is reporting:
+   * it would flash and vanish, and after re-homing to a workspace where the
+   * caller is not an admin that subtree may not render at all. Session state
+   * outlives the remount; `AppShell` renders it ABOVE the boundary.
+   */
+  private recoveryNotice: string | null = null;
+
   constructor({ queryClient, api, channel }: WorkspaceSessionOptions) {
     this.queryClient = queryClient;
     this.api = api;
@@ -139,6 +153,18 @@ export class WorkspaceSession {
    */
   mountKey(): string {
     return `${this.activeTenantId() ?? 'no-workspace'}#${this.currentGeneration}`;
+  }
+
+  /** The pending "your action did not apply" notice, or null. */
+  notice(): string | null {
+    return this.recoveryNotice;
+  }
+
+  /** Dismisses the notice. Non-blocking by design: nothing waits on this. */
+  clearNotice(): void {
+    if (this.recoveryNotice === null) return;
+    this.recoveryNotice = null;
+    this.notify();
   }
 
   subscribe(listener: () => void): () => void {
@@ -273,7 +299,7 @@ export class WorkspaceSession {
   }
 
   /**
-   * The global error hook. TWO BRANCHES, AND THE SPLIT IS THE POINT.
+   * The global error hook. THREE BRANCHES, AND THE SPLIT IS THE POINT.
    *
    * Returns true when it handled the error, so callers can stop.
    *
@@ -294,6 +320,20 @@ export class WorkspaceSession {
    * decision (ADR-006 §3). See the note at `RESET_CODES` for why the code is not
    * simply added to that list.
    *
+   * **Tenant mismatch** — `TENANT_MISMATCH` (OPEN-15) means the caller's ACTIVE
+   * WORKSPACE is not what this tab believed, so the write it sent did not
+   * happen. The workspace is valid and the role is right; only the tab is
+   * behind. Recovery is identity only, and it is NARROWER than the reset — see
+   * the three-reason argument at the branch itself for why that is provably
+   * safe here rather than merely cheaper. It is also the one branch that raises
+   * a user-visible notice, because it is the one where an action was silently
+   * dropped.
+   *
+   * THE THREE ARE ORDERED WIDEST-FIRST and are mutually exclusive by code, so
+   * the order is documentation rather than logic — but keep it, because reading
+   * reset / role / tenant top to bottom is reading them in decreasing order of
+   * how much they discard.
+   *
    * `invalidateQueries` rather than `setQueryData`: the refetch goes through the
    * normal query path, so a concurrently-failing `/auth/me` is handled by the
    * existing policy instead of by a second bespoke one here.
@@ -308,6 +348,54 @@ export class WorkspaceSession {
 
     if (error.isRoleCorrection) {
       await this.queryClient.invalidateQueries({ queryKey: ME_KEY });
+      await this.refresh();
+      return true;
+    }
+
+    if (error.isTenantMismatch) {
+      // ============ TENANT MISMATCH — G3, OPEN-15's client half ==============
+      //
+      // The server verified an active workspace that is not the one this tab
+      // claimed, so the write this tab sent DID NOT HAPPEN. The workspace is
+      // valid and the role is right; the TAB is behind — another tab switched
+      // underneath it.
+      //
+      // RECOVERY IS IDENTITY ONLY. No clear, no generation bump, no
+      // cancelQueries, no reset broadcast. That is NARROWER than the reset path
+      // above, and it is not merely "role-correction shaped" — it is provably
+      // safe here for three reasons that are specific to this branch:
+      //
+      //   1. TENANT-QUALIFIED KEYS. Every tenant-scoped entry lives under
+      //      ['tenant', <id>, ...] (see `tenantKey`). Once identity re-syncs
+      //      A -> B, `tenantQuery` computes keys under B, a different key space,
+      //      so A's rows can never render under B. The cross-tenant leak the
+      //      generation bump exists to prevent cannot occur, so no bump is owed.
+      //
+      //   2. `mountKey()` CARRIES THE TENANT ID, not just the generation. So
+      //      `acme#0` -> `beta#0`: the tenant subtree remounts FOR FREE on the
+      //      tenant half alone. This is exactly where this branch parts company
+      //      with role correction, which stays in the SAME workspace and must
+      //      NOT remount — there the unchanged mountKey is the point.
+      //
+      //   3. IN-FLIGHT READS ARE ALREADY GUARDED. `tenantQuery`'s late check is
+      //      `generation !== startedAt || activeTenantId() !== startedFor`. The
+      //      TENANT-ID half catches every read started under A that resolves
+      //      after the re-sync; it throws StaleGenerationError and is discarded.
+      //      The bump would be a second, redundant mechanism.
+      //
+      // BOUNDED RESIDUAL, noted so a reader does not have to wonder: A's rows
+      // linger orphaned under ['tenant', A, ...]. They are unrenderable — no
+      // component asks for A's keys once B is active — and going active in A
+      // again runs switchTo -> reset() -> clear(), which discards them. Transient,
+      // and not a leak.
+      //
+      // THE NOTICE IS NOT DECORATION. A silently dropped write in a multi-tenant
+      // app is a data-trust problem: the admin believes they changed a role and
+      // nothing changed. It is set BEFORE the refresh so it is already on the
+      // session when `notify()` fires and `AppShell` re-renders above the
+      // remount boundary.
+      this.recoveryNotice =
+        'Your workspace changed in another tab, so that action did not apply. Please try again.';
       await this.refresh();
       return true;
     }
