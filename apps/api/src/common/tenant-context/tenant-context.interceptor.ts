@@ -1,5 +1,6 @@
 import {
   CallHandler,
+  ConflictException,
   ExecutionContext,
   ForbiddenException,
   Injectable,
@@ -33,6 +34,23 @@ import { SESSION_COOKIE, SessionService } from '../session/session.service';
  * uses to enumerate routes. That spec asserts this set equal to the exempt-routes
  * table in `ARCHITECTURE.md` §9, so an exemption cannot be added or dropped here
  * without the documented matrix moving with it.
+ *
+ * ============ THIS SET NOW CARRIES TWO MEANINGS — READ BEFORE EDITING ========
+ *
+ * As of OPEN-15 a listed route is exempt from BOTH:
+ *
+ *   1. needing an active workspace (the original meaning, G2/ADR-006 §5), and
+ *   2. `X-Expected-Tenant` enforcement (`enforcesTenantExpectation` below).
+ *
+ * The two happen to coincide today — nothing in this set is a tenant-scoped
+ * write — and (2) reuses (1) deliberately rather than minting a second list that
+ * could drift out of step with the first. But they are NOT the same idea, and
+ * adding a route here that IS a tenant-scoped write would silently drop
+ * enforcement for it rather than merely waiving the workspace requirement.
+ *
+ * `route-inventory.spec.ts` guards exactly that: it asserts the enforced set is
+ * non-empty and still contains all four admin writes, so the mistake reds a test
+ * instead of quietly widening the hole this row was opened to close.
  */
 export const WORKSPACE_EXEMPT_ROUTES: ReadonlySet<string> = new Set([
   'POST /auth/register',
@@ -59,6 +77,45 @@ export function routeKey(reflector: Reflector, handler: object, controller: obje
     .filter(Boolean)
     .join('/')}`;
   return `${RequestMethod[verb]} ${path}`;
+}
+
+/** The header carrying the tenant the CALLER believed was active (OPEN-15). */
+export const EXPECTED_TENANT_HEADER = 'x-expected-tenant';
+
+/**
+ * Does `X-Expected-Tenant` get ENFORCED on this route? (OPEN-15.)
+ *
+ * **Writes only, and never an exempt route.** Both halves are load-bearing.
+ *
+ * WRITES ONLY, because the race OPEN-15 closes is a late WRITE: a request issued
+ * while workspace A was active landing after a switch to B and being applied
+ * under B. Late READS are already handled client-side — `tenantQuery` cancels
+ * and discards them by cache generation — and reads DO send the header today, so
+ * this predicate is what makes the server ignore it there rather than act on it.
+ * Enforcing on reads is scope the row does not ask for.
+ *
+ * NEVER AN EXEMPT ROUTE, and this is the half that is easy to get wrong. A naive
+ * "any non-GET" rule also catches `POST /auth/switch`, which is the one request
+ * that must never be refused for a stale claim: `switchTo` sends
+ * `expectedTenant: activeTenantId()` — the OLD tenant — so a client whose view
+ * has gone stale (a second tab switched underneath it) would send A while the
+ * session verified B, get a 409, and be PINNED: the UI says one thing, the
+ * server another, and the single request that reconciles them is refused.
+ *
+ * It would be easy to assume the exempt list already prevents this because the
+ * re-verify "does not run" for exempt routes. IT DOES RUN. `exempt` gates only
+ * the 401 and the NO_ACTIVE_WORKSPACE 403; the tenant re-verify runs on the sole
+ * condition that the session HAS an active tenant, exempt or not — which is why
+ * `revocation.spec.ts` sees `GET /auth/me`, an exempt route, answer 403
+ * MEMBERSHIP_REVOKED. The exclusion here is therefore explicit and deliberate,
+ * not inherited.
+ *
+ * A null route key is never exempt, so an unidentifiable route is ENFORCED
+ * rather than waved through — the same fail-closed direction `routeKey` takes.
+ */
+export function enforcesTenantExpectation(method: string, key: string | null): boolean {
+  if (method.toUpperCase() === 'GET') return false;
+  return !WORKSPACE_EXEMPT_ROUTES.has(key ?? '');
 }
 
 /**
@@ -102,8 +159,14 @@ export class TenantContextInterceptor implements NestInterceptor {
   }
 
   private async handle(context: ExecutionContext, next: CallHandler): Promise<unknown> {
-    const request = context.switchToHttp().getRequest<{ headers?: Record<string, string> }>();
-    const cookie = SessionService.readCookie(request?.headers?.cookie, SESSION_COOKIE);
+    const request = context.switchToHttp().getRequest<{
+      headers?: Record<string, string | string[] | undefined>;
+      method?: string;
+    }>();
+    const cookie = SessionService.readCookie(
+      typeof request?.headers?.cookie === 'string' ? request.headers.cookie : undefined,
+      SESSION_COOKIE,
+    );
     const session = await this.sessions.read(cookie);
 
     // Both route declarations are read up front. `@RequiresRole()` IMPLIES a
@@ -117,9 +180,13 @@ export class TenantContextInterceptor implements NestInterceptor {
     ]);
 
     // Default-deny: only a listed route may be served without an active workspace.
-    const exempt = WORKSPACE_EXEMPT_ROUTES.has(
-      routeKey(this.reflector, context.getHandler(), context.getClass()) ?? '',
-    );
+    const key = routeKey(this.reflector, context.getHandler(), context.getClass());
+    const exempt = WORKSPACE_EXEMPT_ROUTES.has(key ?? '');
+
+    // OPEN-15. Computed here, from the same route key, so the two meanings the
+    // exempt set now carries are derived in one place rather than re-decided
+    // further down.
+    const enforceExpectedTenant = enforcesTenantExpectation(request?.method ?? '', key);
 
     if (!session) {
       // No identity to scope by, so no transaction and no GUCs.
@@ -225,6 +292,51 @@ export class TenantContextInterceptor implements NestInterceptor {
           session.activeTenantId,
         );
         tenantId = session.activeTenantId;
+
+        // (4b) THE TENANT THE CALLER EXPECTED — G3, OPEN-15.
+        //
+        // Checked HERE, immediately after (4), because this is the first instant
+        // in the request at which the active tenant is PROVEN. Comparing against
+        // the session's stored copy earlier would be comparing a claim to
+        // another claim; `session.activeTenantId` is only trustworthy once the
+        // membership re-verify above has returned a row for it.
+        //
+        // WHAT IT CLOSES. Responses do not echo the tenant that scoped them, so
+        // a write issued while workspace A was active could land after a switch
+        // to B and be applied under B — the cross-tab and late-response write
+        // races. The client states the tenant it believed was active; if that
+        // disagrees with the verified one, the request is refused rather than
+        // silently re-homed.
+        //
+        // ABSENT MEANS NO CLAIM, AND NO CLAIM IS ALLOWED. A missing header is
+        // never a mismatch: Swagger, curl and any non-browser caller send
+        // nothing, and refusing them would break every client that never made a
+        // claim to begin with. The web client cannot send an EMPTY claim either
+        // — `api.ts` only sets the header when the value is truthy — so there is
+        // no third state to consider.
+        //
+        // 409 rather than 403, and a distinct code rather than a shared one, for
+        // the same reason NO_ACTIVE_WORKSPACE is not FORBIDDEN_ROLE: "your view
+        // of the workspace is stale, re-read and retry" needs a different client
+        // response from "you may not do this". The 409 handler is PR 2.
+        //
+        // Nothing has been written at this point — the handler has not run — and
+        // throwing here rolls the transaction back regardless, which is what
+        // makes the acceptance test's second half (the target row is UNCHANGED)
+        // hold rather than merely the status code.
+        const expected = request?.headers?.[EXPECTED_TENANT_HEADER];
+        if (
+          enforceExpectedTenant &&
+          typeof expected === 'string' &&
+          expected !== session.activeTenantId
+        ) {
+          throw new ConflictException({
+            error: {
+              code: 'TENANT_MISMATCH',
+              message: 'Your active workspace changed. Reload and try again.',
+            },
+          });
+        }
       }
 
       // (5) The role gate — @RequiresRole(), enforced HERE and nowhere else.

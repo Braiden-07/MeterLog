@@ -174,7 +174,7 @@ WHERE u.email OPERATOR(public.=) p_email
 
 — [migration.sql:62](../apps/api/prisma/migrations/20260908000000_auth_definer_functions/migration.sql#L62)
 
-Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:196](DECISIONS.md#L196)) so the next definer function comparing an extension type does not walk back into it.
+Schema-qualify the **operator** — _not_ add `public` to the `search_path`. Widening the path is the change that makes the symptom disappear while removing the property the pin exists to provide. The distinction is recorded as an amendment to ADR-004 ([DECISIONS.md:197](DECISIONS.md#L197)) so the next definer function comparing an extension type does not walk back into it.
 
 **Step 5 is where that amendment earned its keep.** The three membership-write functions are schema-qualified on _every_ operator — `OPERATOR(public.=)` for citext, `OPERATOR(pg_catalog.=)` for uuid and enum — rather than only on the one comparison that had already burned the project. In `invite_member` the consequence of getting it wrong would have been subtler than the original: a case-different existing address would miss the lookup, the create branch would fire, and the case-**insensitive** unique index would refuse it — an invite that cannot succeed for a person who is already in the system.
 
@@ -191,9 +191,9 @@ Assertion 4 was tightened at the same time from checking that a pin _exists_ to 
 
 ### The mechanism
 
-`SET LOCAL` is scoped to a transaction, and therefore to the one pooled connection that transaction holds. So every authenticated request runs inside one interactive transaction ([interceptor:174](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L174)), and the ordering inside it is **verify, then set**:
+`SET LOCAL` is scoped to a transaction, and therefore to the one pooled connection that transaction holds. So every authenticated request runs inside one interactive transaction ([interceptor:241](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L241)), and the ordering inside it is **verify, then set**:
 
-1. `SET LOCAL app.current_user` — always ([interceptor:178](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L178)).
+1. `SET LOCAL app.current_user` — always ([interceptor:245](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L245)).
 2. Re-verify the claimed tenant, with the candidate passed as a **bound parameter, never read from a GUC** — reading it from a GUC would mean setting it first, which is the ordering this design exists to avoid ([interceptor:201-208](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L201-L208)).
 3. Zero rows ⇒ **403**, the session's active tenant is cleared, and `app.current_tenant` is never assigned at any instant ([interceptor:211-219](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L211-L219)).
 4. One row ⇒ set the tenant GUC and use the freshly-read role ([interceptor:222-227](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L222-L227)).
@@ -321,7 +321,7 @@ CREATE POLICY memberships_definer ON public.memberships
 
 Liveness (`deleted_at IS NULL`) **cannot** live in the `memberships` row policies. Postgres applies a table's SELECT policy to the _new_ row of an `UPDATE … WHERE`, so a liveness predicate there blocks the revoking `UPDATE` itself — the predicate defeats the operation it exists to enforce. Splitting into `FOR SELECT` + `FOR UPDATE` does not help; the SELECT policy still bites.
 
-So liveness lives in the paths that only ever read: the re-verify query ([interceptor:206](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L206)), the `tenants_workspace_list` subquery ([migration.sql:80-84](../apps/api/prisma/migrations/20260907000000_identity_tenancy_schema/migration.sql#L80-L84)), `users_tenant_members_read` ([migration.sql:98-103](../apps/api/prisma/migrations/20260907000000_identity_tenancy_schema/migration.sql#L98-L103)), and **one documented app-side predicate** ([auth.service.ts:246](../apps/api/src/auth/auth.service.ts#L246)).
+So liveness lives in the paths that only ever read: the re-verify query ([interceptor:273](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L273)), the `tenants_workspace_list` subquery ([migration.sql:80-84](../apps/api/prisma/migrations/20260907000000_identity_tenancy_schema/migration.sql#L80-L84)), `users_tenant_members_read` ([migration.sql:98-103](../apps/api/prisma/migrations/20260907000000_identity_tenancy_schema/migration.sql#L98-L103)), and **one documented app-side predicate** ([auth.service.ts:246](../apps/api/src/auth/auth.service.ts#L246)).
 
 The accepted residual — a raw self-axis read returns a revoked row — is itself asserted, so nobody "fixes" what cannot be fixed: [`the OPEN-5 residual is real: a self-axis read still returns the revoked row`](../apps/api/test/db/membership-isolation.spec.ts#L536).
 
@@ -645,7 +645,7 @@ Step 7a built the audit **capture** mechanism and proved it at the database laye
 
 **Step 6 disproved it.** A maintenance edit emits **no lifecycle event at all**: correcting a description is not something that happened to the physical asset. The asset-metadata `PATCH` is the same shape (ARCHITECTURE §9.2). A derived trail is therefore silent for the entire class of change an auditor is most likely to be investigating — and silent without erroring, which is this document's recurring failure mode.
 
-So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L424)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
+So capture is **mutation-level**: a `SECURITY DEFINER` trigger on each audited table, firing on the write itself ([ADR-009](DECISIONS.md#L425)). The premise is asserted in both directions rather than argued ([`THE PREMISE — a maintenance edit emits no lifecycle event and IS captured anyway`](../apps/api/test/db/audit.spec.ts#L213)): the test performs a maintenance edit, asserts `asset_events` **did not move**, and asserts the audit row **did**. The first half is what makes the second half mean something.
 
 ### The centerpiece — immutable by grant
 
@@ -660,7 +660,7 @@ psql:/tmp/neg.sql:9:  ERROR:  permission denied for table audit_log
 psql:/tmp/neg.sql:11: ERROR:  permission denied for table audit_log
 ```
 
-Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L472)).
+Each is asserted on **SQLSTATE `42501` and the message, with the row-security message excluded** ([`immutable by grant — forge, alter, suppress`](../apps/api/test/db/audit.spec.ts#L256)). That disambiguation is not ceremony here: `audit_log` carries a `FOR SELECT` policy, so a policy-shaped refusal would mean the **grant** was wrong while the test stayed green — and the grant is the whole decision ([ADR-010](DECISIONS.md#L473)).
 
 Two vacuity guards sit under it. The `ALTER` and `SUPPRESS` negatives assert the row **existed, was visible under that tenant, and is unchanged afterwards**, so neither can pass against an empty table. And a positive pairs with all three — the app role **can** read its own tenant's rows ([`the app role CAN read its own tenant rows`](../apps/api/test/db/audit.spec.ts#L335)) — because "cannot write" is otherwise satisfied by a table nobody can reach at all, which is fail-closed and broken.
 
@@ -768,7 +768,7 @@ Six, up from five, with the allowlist extended in the same PR ([`EXPECTED_DEFINE
 
 ### What 7a does not prove
 
-The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L543) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
+The read surface. There is no `GET /audit`, so the admin/auditor gate recorded in [ADR-012](DECISIONS.md#L544) is a **decision, not an enforcement** — and RBAC on the trail is asserted nowhere yet. Tenant isolation on `audit_log` is proven at the **database** layer only ([`M, admin of BOTH tenants and active in A`](../apps/api/test/db/audit.spec.ts#L703)), with M holding a real, live admin membership in B so the negative is semantic rather than syntactic. The HTTP axis, the RBAC negatives and the maintenance-edit capstone are step 7b.
 
 Hash-chaining is deferred, and ADR-010 records why as engineering rather than scope. What immutability-by-grant does **not** give, stated plainly: it defends against the application and against anyone holding only the app role's credentials. It does **not** defend against the migration/owner role or a cluster superuser, who can `ALTER TABLE`. Tamper-evidence against a privileged operator is what a chain buys, and that threat model is not v1.0's.
 

@@ -72,6 +72,14 @@ function codeFor(status: number): string {
       return 'NOT_FOUND';
     case HttpStatus.CONFLICT:
       return 'CONFLICT';
+    case HttpStatus.TOO_MANY_REQUESTS:
+      // The login limiter (OPEN-16) writes its own envelope, because it runs in
+      // Express UPSTREAM of this filter and is never seen by it. This case is
+      // for the other direction: a 429 raised from INSIDE Nest — by a future
+      // limiter, or by anything that throws `TooManyRequestsException` — would
+      // otherwise fall through to the meaningless default and ship as `ERROR`,
+      // so the same status could reach a client under two different codes.
+      return 'RATE_LIMITED';
     default:
       return 'ERROR';
   }

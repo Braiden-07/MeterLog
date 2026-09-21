@@ -23,6 +23,7 @@ meterlog/
 │   │   │   ├── common/tenant-context/   the two-GUC interceptor (verify-before-set)
 │   │   │   ├── common/auth/             @RequiresSession + @RequiresRole metadata
 │   │   │   ├── common/http/             error-envelope exception filter
+│   │   │   ├── common/rate-limit/       per-email login failure counter (OPEN-16)
 │   │   │   ├── auth/                    register · login · switch · me · logout
 │   │   │   ├── memberships/             GET/POST/PATCH/DELETE /users (RBAC-gated)
 │   │   │   └── health/                  GET /api/v1/health
@@ -147,6 +148,8 @@ Session cookie + Redis (ADR-001). `SessionService` stores `{ userId, activeTenan
 
 The stored `role` is **not authoritative** — it goes stale the moment an admin changes it. Authorization uses `RequestContext.role`, re-read from the database each request.
 
+**Login rate limiting (OPEN-16)** is per EMAIL, not per IP, and the axis is a measured choice rather than a preference. Every browser request reaches the API through the Next rewrite, and that rewrite is a **verbatim header relay** — it neither originates `X-Forwarded-For` nor appends the peer to an existing chain — so the only XFF the API ever sees is one the caller typed. A hop-count remedy would therefore bucket on attacker-controlled input. `LoginRateLimitService` counts FAILED attempts under `meterlog:loginfail:email:<sha256(email)>` (hashed, so no credential enters a Redis key), ten per fifteen minutes, and `configureApp` mounts it as Express middleware **after** the JSON parser because the key comes from the parsed body. A successful login is never charged. There is deliberately **no global ceiling**: a counter with no client-identity axis is an anonymous site-wide login-outage lever, so bounding mass spray belongs to step-10 observability instead.
+
 ## 9. Authorization (RBAC matrix)
 
 Role comes from `RequestContext.role` — the active membership's role, re-read from the database every request (§7.2). The session's copy is never used for an authorization decision, so a role change takes effect on the next request rather than at next login.
@@ -170,7 +173,7 @@ Role comes from `RequestContext.role` — the active membership's role, re-read 
 | `GET /users/pending`                         | ✓     | 403        | 403     |
 | `POST /users/pending/:membershipId/token`    | ✓     | 403        | 403     |
 
-**The pending pair, and why it is two rows rather than one (OPEN-14).** `GET /users/pending` was added at G2 as a single route that both listed pending invites and minted a redemption token for each, transcribed from ADR-016's decision to give pending invites their own admin-only route because the response carried live credentials ([`?pending=true` (DECISIONS.md:831)](DECISIONS.md#L831)). The pending split separates the two jobs, and the role sources differ per row even though the cells agree:
+**The pending pair, and why it is two rows rather than one (OPEN-14).** `GET /users/pending` was added at G2 as a single route that both listed pending invites and minted a redemption token for each, transcribed from ADR-016's decision to give pending invites their own admin-only route because the response carried live credentials ([`?pending=true` (DECISIONS.md:832)](DECISIONS.md#L832)). The pending split separates the two jobs, and the role sources differ per row even though the cells agree:
 
 - **`GET /users/pending` — admin ✓ / 403 / 403, and the source of that is now ADR-006 §3 read in the negative rather than ADR-016.** The credential has left the body, so ADR-016's "the response carries live credentials" no longer applies to this route. The gate stays because co-member visibility (ADR-006 §3) is a decision about who is IN the workspace; who has not yet activated their account is administrative state, and nothing in §3 extends the open read to it. Recorded explicitly because "the reason for the gate went away and the gate stayed" is exactly the kind of thing a later reader deletes as vestigial.
 - **`POST /users/pending/:membershipId/token` — admin ✓ / 403 / 403, and this row inherits ADR-016's rationale directly.** It is the route whose response body is a live credential, so it is the one the original reasoning was always about. It is also a write, which would gate it at admin under §9's own convention regardless.
@@ -236,11 +239,11 @@ The invariant that forces it: **every status an asset has ever held must have an
 | ------------ | ----- | ---------- | ------- |
 | `GET /audit` | ✓     | 403        | ✓       |
 
-Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:571)](DECISIONS.md#L571)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:650)](DECISIONS.md#L650)).
+Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:572)](DECISIONS.md#L572)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:651)](DECISIONS.md#L651)).
 
 ### 9.4 Routes exempt from the active-workspace requirement (G2, OPEN-18)
 
-The interceptor is default-deny, so this is the list that is written down and everything else is inferred: a route absent from this table is tenant-scoped. It mirrors [`WORKSPACE_EXEMPT_ROUTES` (tenant-context.interceptor.ts:37-45)](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L37-L45), and `test/api/route-inventory.spec.ts` asserts the two equal, so an exemption cannot be added to or dropped from the code without this table moving too. The second column is asserted against each route's `@RequiresSession` metadata.
+The interceptor is default-deny, so this is the list that is written down and everything else is inferred: a route absent from this table is tenant-scoped. It mirrors [`WORKSPACE_EXEMPT_ROUTES` (tenant-context.interceptor.ts:55-63)](../apps/api/src/common/tenant-context/tenant-context.interceptor.ts#L55-L63), and `test/api/route-inventory.spec.ts` asserts the two equal, so an exemption cannot be added to or dropped from the code without this table moving too. The second column is asserted against each route's `@RequiresSession` metadata.
 
 | Exempt route              | Session required |
 | ------------------------- | ---------------- |
@@ -256,23 +259,23 @@ None of these reads tenant data, and three of them are how a caller without a wo
 
 ## 10. Audit logging
 
-Lives in DECISIONS: [ADR-009](DECISIONS.md#L424) capture · [ADR-010](DECISIONS.md#L472) integrity · [ADR-011](DECISIONS.md#L498) payload and redaction · [ADR-012](DECISIONS.md#L543) scope, RBAC and volume · [ADR-013](DECISIONS.md#L614) bootstrap rows · [ADR-014](DECISIONS.md#L640) read surface · [ADR-015](DECISIONS.md#L717) column naming.
+Lives in DECISIONS: [ADR-009](DECISIONS.md#L425) capture · [ADR-010](DECISIONS.md#L473) integrity · [ADR-011](DECISIONS.md#L499) payload and redaction · [ADR-012](DECISIONS.md#L544) scope, RBAC and volume · [ADR-013](DECISIONS.md#L615) bootstrap rows · [ADR-014](DECISIONS.md#L641) read surface · [ADR-015](DECISIONS.md#L718) column naming.
 
 ## 11. API conventions
 
-Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:732)](PROGRESS.md#L732)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:294)](PROGRESS.md#L294); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L640).
+Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:732)](PROGRESS.md#L732)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:294)](PROGRESS.md#L294); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L641).
 
 ## 12. Error handling & logging
 
-Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14) — see §11. Logging: not yet built — PROJECT_BRIEF §11 step 10; [`nestjs-pino` (package.json:31)](../apps/api/package.json#L31) is installed and has no use in `apps/api/src`.
+Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14) — see §11. **One exception, by construction:** the login rate limiter runs in Express, upstream of Nest, so the filter never sees its **429** and the middleware writes the `RATE_LIMITED` envelope itself (plus `Retry-After`). `codeFor()` carries a `TOO_MANY_REQUESTS` case regardless, so a 429 raised from inside Nest cannot ship under the default `ERROR` code. Logging: not yet built — PROJECT_BRIEF §11 step 10; [`nestjs-pino` (package.json:31)](../apps/api/package.json#L31) is installed and has no use in `apps/api/src`.
 
 ## 13. Configuration & secrets
 
-Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L144) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:110-113)](../.github/workflows/ci.yml#L110-L113)); production secrets in the §16.1 checklist below.
+Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L145) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:110-113)](../.github/workflows/ci.yml#L110-L113)); production secrets in the §16.1 checklist below.
 
 ## 14. Local development
 
-Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L293); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
+Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L294); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
 
 ## 15. CI/CD
 

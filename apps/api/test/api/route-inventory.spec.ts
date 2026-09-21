@@ -12,6 +12,7 @@ import { REQUIRES_ROLE } from '../../src/common/auth/requires-role.decorator';
 import { REQUIRES_SESSION } from '../../src/common/auth/requires-session.decorator';
 import {
   WORKSPACE_EXEMPT_ROUTES,
+  enforcesTenantExpectation,
   routeKey,
 } from '../../src/common/tenant-context/tenant-context.interceptor';
 import { APPEND_ONLY_TABLES, DEFINER_WRITTEN_APPEND_ONLY_TABLES, loadEnv } from '../db/helpers';
@@ -428,6 +429,66 @@ describe('§9 route/role matrix — the document and the live routes agree in bo
     expect(both, 'a route cannot be both tenant-scoped (a role table) and exempt (§9.4)').toEqual(
       [],
     );
+  });
+
+  /**
+   * THE `X-Expected-Tenant` ENFORCED SET (OPEN-15) — the guard the exempt list's
+   * new second meaning owes.
+   *
+   * `WORKSPACE_EXEMPT_ROUTES` now says two things at once: exempt from needing an
+   * active workspace, AND exempt from tenant-expectation enforcement. Reusing one
+   * list for two ideas is deliberate — a second list is a second thing to forget
+   * — but it means a future exemption added for the FIRST reason silently waives
+   * the second. If someone exempts a tenant-scoped write, enforcement quietly
+   * stops covering it and nothing else in the suite would notice.
+   *
+   * So the enforced set is asserted here, derived from the live routes, in both
+   * directions: it is non-empty, it still contains every admin write, and it
+   * still excludes the switch.
+   */
+  describe('the X-Expected-Tenant enforced set (OPEN-15)', () => {
+    const enforced = (): string[] =>
+      routes.filter((r) => enforcesTenantExpectation(r.method, keyOf(r))).map(keyOf).sort();
+
+    it('is not empty — enforcement covers something', () => {
+      // The vacuity guard. An empty enforced set would make every OPEN-15
+      // assertion below trivially true and the mitigation a no-op.
+      expect(enforced().length).toBeGreaterThan(0);
+    });
+
+    it('contains all four admin writes — the routes the row was opened for', () => {
+      // These are the four the admin user-management slice added; all four send
+      // the header from the client and none of them enforced it until this PR.
+      expect(enforced()).toEqual(
+        expect.arrayContaining([
+          'POST /users',
+          'POST /users/pending/:membershipId/token',
+          'PATCH /users/:id',
+          'DELETE /users/:id',
+        ]),
+      );
+    });
+
+    it('excludes POST /auth/switch — the deadlock the naive by-method rule ships', () => {
+      // `switchTo` sends the OLD tenant as its expectation, so enforcing here
+      // would 409 exactly the request a stale-view client needs to recover.
+      // `tenant-expectation.spec.ts` proves the behaviour; this pins the rule.
+      expect(enforced()).not.toContain('POST /auth/switch');
+    });
+
+    it('excludes every exempt route and every GET, and nothing else', () => {
+      // Stated as an equality rather than a spot-check, so the set cannot drift
+      // in either direction without this failing.
+      const expected = routes
+        .filter((r) => r.method !== 'GET' && !WORKSPACE_EXEMPT_ROUTES.has(keyOf(r)))
+        .map(keyOf)
+        .sort();
+      expect(enforced()).toEqual(expected);
+
+      for (const key of WORKSPACE_EXEMPT_ROUTES) {
+        expect(enforced(), `${key} is exempt but enforced`).not.toContain(key);
+      }
+    });
   });
 
   it('every role row matches its route’s @RequiresRole, cell by cell', () => {
