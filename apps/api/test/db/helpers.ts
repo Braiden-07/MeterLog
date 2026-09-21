@@ -655,6 +655,63 @@ export async function resetDatabase(migrator: PrismaClient): Promise<void> {
   await migrator.$executeRawUnsafe(`TRUNCATE ${quoted} CASCADE`);
 
   await assertNoResidualRows(migrator);
+
+  // Postgres is not the only durable state a test leaves behind — see below.
+  await resetLoginRateLimit();
+}
+
+/**
+ * Clears the per-email login-failure counters (OPEN-16).
+ *
+ * ============== WHY THIS IS IN THE SHARED TEARDOWN =========================
+ *
+ * The limiter's state lives in **Redis**, which `TRUNCATE` cannot reach. Without
+ * this, a bucket filled by one spec file is still full in the next: the login
+ * helper that every acceptance suite opens with starts answering **429**, and
+ * whole files fail with an error naming neither the cause nor the culprit.
+ *
+ * That is not hypothetical — it is exactly what happened when the limiter first
+ * landed. `assets-read`, `pending-split` and `set-password` went red together
+ * with `expected 200 "OK", got 429`, none of them having anything to do with
+ * rate limiting, because earlier files had spent the budget on shared fixture
+ * emails like `admin@acme.test`.
+ *
+ * It goes HERE, beside the TRUNCATE, for the reason the file's own doctrine
+ * gives: teardown knowledge lives in one place. Clearing buckets per-spec would
+ * recreate the hand-maintained cleanup list that broke 31 tests when `readings`
+ * landed — every new spec would have to remember, and the one that forgot would
+ * break a different file.
+ *
+ * Matched on the exported PREFIX rather than a list of emails, so a spec that
+ * invents a new fixture address is covered without editing anything. `SCAN`
+ * rather than `KEYS`: `KEYS` blocks the server, and this runs in a `beforeEach`.
+ */
+export async function resetLoginRateLimit(): Promise<void> {
+  const url = process.env.REDIS_URL;
+  if (!url) return;
+
+  const { default: Redis } = await import('ioredis');
+  const { LOGIN_FAILURE_KEY_PREFIX } = await import(
+    '../../src/common/rate-limit/login-rate-limit.service'
+  );
+
+  const redis = new Redis(url, { maxRetriesPerRequest: 2, lazyConnect: false });
+  try {
+    let cursor = '0';
+    do {
+      const [next, keys] = await redis.scan(
+        cursor,
+        'MATCH',
+        `${LOGIN_FAILURE_KEY_PREFIX}*`,
+        'COUNT',
+        500,
+      );
+      cursor = next;
+      if (keys.length > 0) await redis.del(...keys);
+    } while (cursor !== '0');
+  } finally {
+    await redis.quit();
+  }
 }
 
 /**

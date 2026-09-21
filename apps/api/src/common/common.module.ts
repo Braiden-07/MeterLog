@@ -3,6 +3,7 @@ import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 
 import { HttpExceptionFilter } from './http/http-exception.filter';
 import { PrismaService } from './prisma/prisma.service';
+import { LoginRateLimitService } from './rate-limit/login-rate-limit.service';
 import { SessionService } from './session/session.service';
 import { TenantContextInterceptor } from './tenant-context/tenant-context.interceptor';
 
@@ -27,10 +28,14 @@ import { TenantContextInterceptor } from './tenant-context/tenant-context.interc
   providers: [
     PrismaService,
     SessionService,
+    // Resolved per request by the Express middleware `configureApp` mounts on
+    // the login path (OPEN-16). It is a provider rather than a bare singleton so
+    // its Redis connection closes with the app, like SessionService's.
+    LoginRateLimitService,
     TenantContextInterceptor,
     { provide: APP_INTERCEPTOR, useExisting: TenantContextInterceptor },
     { provide: APP_FILTER, useClass: HttpExceptionFilter },
   ],
-  exports: [PrismaService, SessionService, TenantContextInterceptor],
+  exports: [PrismaService, SessionService, TenantContextInterceptor, LoginRateLimitService],
 })
 export class CommonModule {}

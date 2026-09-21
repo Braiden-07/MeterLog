@@ -2,6 +2,9 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { json } from 'express';
 import helmet from 'helmet';
 
+import { loginRateLimitMiddleware } from './common/rate-limit/login-rate-limit.middleware';
+import { LoginRateLimitService } from './common/rate-limit/login-rate-limit.service';
+
 /**
  * Creation-time options for the Nest app, shared by production and the tests.
  *
@@ -18,6 +21,14 @@ import helmet from 'helmet';
  * every legitimate request 400s.
  */
 export const NEST_APP_OPTIONS = { bodyParser: false } as const;
+
+/**
+ * The URL prefix every route is served under. Named rather than repeated because
+ * the login rate limiter below mounts on a RAW EXPRESS path, which
+ * `setGlobalPrefix` does not apply to — so the two must be kept in step by
+ * construction instead of by memory.
+ */
+const GLOBAL_PREFIX = 'api/v1';
 
 /**
  * THE REQUEST-PIPELINE FLOOR — one definition, applied by production and by every
@@ -64,7 +75,7 @@ export const NEST_APP_OPTIONS = { bodyParser: false } as const;
  * a hand-mirror that drifted; it is a spec that needs none of this.
  */
 export function configureApp(app: INestApplication): INestApplication {
-  app.setGlobalPrefix('api/v1');
+  app.setGlobalPrefix(GLOBAL_PREFIX);
   app.use(helmet());
 
   // ===================== THE ANTI-LOGIN-CSRF FLOOR ==========================
@@ -126,7 +137,34 @@ export function configureApp(app: INestApplication): INestApplication {
   // allow-listed origin. Together there is no cross-origin path to a
   // state-changing route at all.
   //
-  // `CORS_ORIGIN` remains in `.env.example` and is now read by nothing.
+  // `CORS_ORIGIN` was removed from `.env.example` by the tenant/abuse hardening
+  // PR, once nothing had read it for a whole slice.
+
+  // =============== LOGIN RATE LIMITING — OPEN-16, PER EMAIL ==================
+  //
+  // AFTER `json()` AND THAT IS A REQUIREMENT: the bucket is keyed on the email in
+  // the parsed body, so this cannot sit above the parser. It is also why the
+  // limiter is Express middleware rather than a Nest guard — it belongs between
+  // the parser and everything else.
+  //
+  // THE AXIS IS THE EMAIL, NOT THE IP, and the reason is empirical. OPEN-16 was
+  // written expecting `X-Forwarded-For` trusted at a fixed hop count; the
+  // orientation probe for this PR put the real `next.config.mjs` rewrite in front
+  // of an echo origin and found Next to be a VERBATIM HEADER RELAY — it neither
+  // originates XFF nor appends the peer to a chain, in dev or in a production
+  // build. The only `x-forwarded-for` that ever reaches this API is one the
+  // caller typed. A hop count has nothing to count, and keying on it would hand
+  // every attacker a fresh bucket per request. See login-rate-limit.service.ts
+  // for the probe output and for why a GLOBAL ceiling is refused rather than
+  // deferred.
+  //
+  // Mounted on the RAW path (no `setGlobalPrefix` here), hence GLOBAL_PREFIX.
+  // The service is resolved per request, not at mount time, because every
+  // acceptance spec calls this function BEFORE `app.init()`.
+  app.use(
+    `/${GLOBAL_PREFIX}/auth/login`,
+    loginRateLimitMiddleware(() => app.get(LoginRateLimitService)),
+  );
 
   app.useGlobalPipes(
     new ValidationPipe({

@@ -1077,3 +1077,42 @@ A literal rolled-back transaction was not usable — the test connects separatel
 - Citations: **0 re-anchored.** The change is a single append-only hunk at line 928 (`@@ -927,0 +928,89 @@`, zero modifications above it); the highest inbound citation to that file is L486. Verified structurally, not by arithmetic.
 - **Out of scope, logged for step 9:** the `actions/checkout@v4` / `setup-node@v4` deprecation in `ci.yml`.
 - OPEN-9 (hard delete) still deferred.
+
+## `PROJECT_BRIEF` §11 step 9 — the tenant/abuse hardening PR (OPEN-16, OPEN-15, security headers)
+
+The second PR of step 9. The first was the cross-site posture (OPEN-20 + the login-CSRF floor); this one pays OPEN-16 and OPEN-15 and puts security headers on the responses a browser actually loads.
+
+### OPEN-16 — the row's mechanism could not work, and the probe is why we knew before building
+
+The row owed a limiter trusting `X-Forwarded-For` at a fixed hop count. Before writing any of it, the orientation put the **real** `apps/web/next.config.mjs` rewrite in front of an echo origin and read what arrives at the API, in `next dev` and in a production `next build` + `next start`:
+
+| the client sends | the API receives |
+| --- | --- |
+| nothing | **no `x-forwarded-for` at all** |
+| `X-Forwarded-For: 1.2.3.4` | **exactly `1.2.3.4`** |
+| `X-Forwarded-For: 8.8.8.8, 7.7.7.7` | **that chain, verbatim** |
+
+Next's rewrite is a **verbatim header relay** — it neither originates XFF nor appends the peer. There is no trustworthy client IP at the API and **no hop to count**, so the named remedy would have bucketed on attacker-controlled input and handed out a fresh bucket per request: worse than no limiter, because it would have looked like it worked. Closed instead by **per-email** limiting — failures only, `sha256`-keyed, ten per fifteen minutes.
+
+**The global ceiling was refused, not deferred.** A counter with no client-identity axis is an anonymous site-wide login-outage lever. Bounding mass spray is a detection problem for step 10.
+
+### OPEN-15 — the orientation's own premise was wrong, and correcting it changed the design
+
+The orientation assumed `POST /auth/switch` was safe from enforcement because it is exempt and "the verify block never runs for it". **The verify block does run** — `exempt` gates only the 401 and the `NO_ACTIVE_WORKSPACE` 403, which is why `revocation.spec.ts` already saw exempt `GET /auth/me` answer 403 `MEMBERSHIP_REVOKED`. A naive "any non-GET" rule would therefore have 409ed the switch, and since `switchTo` sends the OLD tenant it would have fired exactly when a client's view had gone stale — pinning the user out of the one request that recovers them. The enforced set is **non-GET AND not exempt**, and the deadlock has its own regression test that reds under the naive rule.
+
+### Two things the build found that the plan did not predict
+
+- **The absent-body guard does not do what it was specified to do.** It was to stop `req.body.email` throwing on a form-encoded POST and turning 1a's deliberate 400 into a 500. Measured: body-parser sets `req.body = {}` at `lib/types/json.js:108` *before* its skip branches, so the naive read yields `undefined` and never throws — removing the guard does not red the test. It is retained as defence against a dependency internal and the comment now says exactly that, rather than claiming a fix for a 500 that cannot currently happen.
+- **The limiter is durable state `resetDatabase` could not reach.** It lives in Redis, so a bucket filled by one spec file was still full in the next: `assets-read`, `pending-split` and `set-password` went red together with `expected 200 "OK", got 429`, none of them anything to do with rate limiting. Fixed in the **shared teardown** (`resetLoginRateLimit`, matched on the exported key prefix) rather than per-spec, because a per-spec list is the hand-maintained cleanup that broke 31 tests when `readings` landed.
+
+### Security headers — the half a browser loads
+
+`helmet()` has dressed the API's JSON since 1a; `next.config.mjs` had no `headers()` block at all, so every document shipped with no frame, referrer or transport policy. Added on the document route only, with `/api/*` excluded by negative lookahead so the proxied responses do not get a second, independent copy. Verified live: `/` and `/login` carry all five; `/api/v1/auth/login` on a real 200 carries none.
+
+`frame-ancestors 'none'` only — a `script-src`/`style-src` policy needs nonces plus `middleware.ts` and per-request dynamic rendering, so it is enrolled as **OPEN-21** rather than rushed. HSTS ships `max-age` alone; `includeSubDomains`/`preload` are owed at step 10 with the custom domain.
+
+### Notes
+
+- Citations: **12 re-anchored, split by cause.** Nine by code displacement (this PR's interceptor and bootstrap edits moved `WORKSPACE_EXEMPT_ROUTES`, the `NO_ACTIVE_WORKSPACE` block, `clearActiveTenant`, `setGlobalPrefix`, the CORS note and three `ISOLATION.md` interceptor anchors); three by the one-line `DECISIONS.md` insertion of OPEN-21, which shifted every anchor at or below it by exactly +1. **`docs:check` was green before the sweep and green after** — it never saw the +1, which is OPEN-19 blind spot (3) exactly: a bare `[ADR-NNN](DECISIONS.md#Lnnn)` citation carries no literal to content-check and no number in its label, so two of its four checks are structurally inert. Found by landing, not by the checker.
+- **`docs/PROJECT_BRIEF.md` is author-owned and was left untouched** — its nine ADR anchors are now off by one for the same reason. Flagged for the author rather than edited.
+- OPEN-19's proximity-window fix remains its own later PR.
