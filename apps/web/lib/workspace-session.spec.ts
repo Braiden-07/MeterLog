@@ -572,6 +572,140 @@ describe('workspace switch evicts the previous tenant (slice 1 security gate)', 
     expect(session.activeTenantId()).toBeNull();
   });
 
+  /**
+   * ============ TENANT MISMATCH IS NEITHER A RESET NOR A ROLE CORRECTION =====
+   *
+   * OPEN-15's client half. The server verified an active workspace that is not
+   * the one this tab claimed, so the WRITE this tab sent did not happen. The
+   * workspace is valid and the role is right — the tab is simply behind.
+   *
+   * IT IS PRODUCED BY A WRITE, AND THIS TEST USES ONE. Enforcement is
+   * writes-only, so a read can never see this code; driving it through
+   * `refusedRead` would prove the branch against a request shape that cannot
+   * produce it in the running app. `refusedWrite` also exercises the path the
+   * four admin writes actually take — `api.request` -> catch -> `handleApiError`
+   * — which is where the branch fires, since those writes are plain async calls
+   * and never reach `QueryCache.onError`.
+   *
+   * THE DISCRIMINATOR IS `mountKey`. Every other assertion here it shares with
+   * the role-correction test one way or the other: identity re-read, no bump,
+   * cache intact. What is unique to THIS branch is that the tab re-homes to a
+   * DIFFERENT workspace — so `mountKey` must MOVE (`acme#0` -> `beta#0`), where
+   * the role-correction test asserts it stays put. That is the whole reason the
+   * narrow recovery is safe without a generation bump: the tenant half of the
+   * mount key remounts the subtree for free.
+   */
+  async function refusedWrite(code: string, message: string, status = 409): Promise<unknown> {
+    server.canned('/users', { error: { code, message } }, status);
+    return createApiClient(server.fetchImpl)
+      .request({
+        method: 'POST',
+        path: '/users',
+        body: { email: 'new@acme.test', role: 'technician' },
+        // The stale claim: this tab still believes Acme is active.
+        expectedTenant: 'acme',
+      })
+      .catch((error: unknown) => error);
+  }
+
+  it('TENANT_MISMATCH re-homes the tab to the verified workspace WITHOUT a reset', async () => {
+    await seedAcme();
+    const before = tenantCacheJson(queryClient);
+    expect(before, 'the fixture must be real, or the survival assertion is vacuous').toContain(
+      'SN-ACME-1',
+    );
+    const generationBefore = session.generation;
+    const mountKeyBefore = session.mountKey();
+
+    const refused = await refusedWrite('TENANT_MISMATCH', 'Your active workspace changed.');
+    expect((refused as { code?: string }).code).toBe('TENANT_MISMATCH');
+    expect((refused as { status?: number }).status, 'it is a 409, not a 403').toBe(409);
+
+    // What the server verified: the active workspace is Beta, not Acme.
+    server.canned('/auth/me', BETA);
+
+    expect(await session.handleApiError(refused), 'the handler must claim this error').toBe(true);
+
+    // (1) re-homed to the tenant the SERVER verified, not the one the tab claimed.
+    expect(session.activeTenantId()).toBe('beta');
+
+    // (2) and NOT null — this is what separates it from the reset path, which
+    //     leaves the caller with no workspace at all.
+    expect(session.activeTenantId(), 'a reset would have nulled this').not.toBeNull();
+
+    // (3) the tenant cache was NOT wiped, byte for byte. A reset clears
+    //     everything; this must not — the rows belong to a workspace the caller
+    //     still holds, and they are unreachable under Beta's keys anyway.
+    expect(
+      tenantCacheJson(queryClient),
+      'a tenant re-sync must not discard the cache the way a reset does',
+    ).toBe(before);
+
+    // (4) no generation bump. The late-response guard and the key space already
+    //     cover what a bump would, so paying for one would be redundant.
+    expect(session.generation, 'tenant mismatch must not bump the generation').toBe(
+      generationBefore,
+    );
+
+    // (5) THE DISCRIMINATOR — the subtree still remounts, on the TENANT half of
+    //     the mount key alone. Role correction asserts the opposite (mountKey
+    //     unchanged, because it stays in the same workspace).
+    expect(session.mountKey(), 'the tab must re-home, not sit on the old key').not.toBe(
+      mountKeyBefore,
+    );
+    expect(session.mountKey()).toBe(`beta#${generationBefore}`);
+  });
+
+  it('TENANT_MISMATCH raises a notice that SURVIVES the remount it causes', async () => {
+    // THE TEST THAT CATCHES THE BROKEN PLACEMENT. The recovery changes
+    // `mountKey`, so everything under `<main key={mountKey}>` unmounts — a
+    // notice held in component state there would flash and vanish, and after
+    // re-homing to Beta (technician) `MembersAdmin` would not render at all.
+    // Living on the session is what makes it survivable, and "survives a
+    // remount" is only expressible because it does.
+    await seedAcme();
+    expect(session.notice(), 'nothing to report before the failure').toBeNull();
+
+    const refused = await refusedWrite('TENANT_MISMATCH', 'Your active workspace changed.');
+    server.canned('/auth/me', BETA);
+    await session.handleApiError(refused);
+
+    // Set, and it names the dropped action rather than merely the switch — a
+    // silently dropped write is the data-trust problem this notice exists for.
+    const notice = session.notice();
+    expect(notice).toBeTruthy();
+    expect(notice).toMatch(/did not apply/i);
+
+    // Simulate the remount: the tenant subtree is rebuilt under the new mount
+    // key. Session state is untouched by that, which is the point.
+    expect(session.mountKey()).toBe('beta#0');
+    expect(session.notice(), 'the notice must outlive the subtree it was raised in').toBe(notice);
+
+    // And it is dismissable, because the recovery has already happened — the
+    // user is being told, not asked.
+    session.clearNotice();
+    expect(session.notice()).toBeNull();
+  });
+
+  it('the CONTRAST — a reset code on the same fixture wipes what TENANT_MISMATCH kept', async () => {
+    // Non-vacuity for the branch above. Without this, every assertion in it
+    // could be satisfied by a handler that never resets for anything, and the
+    // reset path would be silently dead. Same seed, same handler, opposite
+    // outcome on all four axes.
+    await seedAcme();
+    const generationBefore = session.generation;
+    expect(tenantCacheJson(queryClient)).toContain('SN-ACME-1');
+
+    const refused = await refusedWrite('MEMBERSHIP_REVOKED', 'You no longer have access.', 403);
+    server.canned('/auth/me', { ...ACME, activeWorkspace: null });
+    expect(await session.handleApiError(refused)).toBe(true);
+
+    expect(tenantCacheJson(queryClient), 'a reset DOES wipe the cache').not.toContain('SN-ACME-1');
+    expect(session.activeTenantId(), 'a reset DOES null the workspace').toBeNull();
+    expect(session.generation, 'a reset DOES bump the generation').toBe(generationBefore + 1);
+    expect(session.notice(), 'and a reset raises no dropped-write notice').toBeNull();
+  });
+
   it('an unrelated error is claimed by neither branch', async () => {
     // The handler must return false for anything it does not own, or a plain
     // 500 would silently trigger cache surgery.

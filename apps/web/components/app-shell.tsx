@@ -16,13 +16,46 @@ import { useWorkspaceState } from '../lib/session-context';
  * would reintroduce exactly the cross-tenant leak this slice exists to close.
  */
 export function AppShell() {
-  const { identity, mountKey } = useWorkspaceState();
+  const { session, identity, mountKey, notice } = useWorkspaceState();
   const active = identity?.activeWorkspace;
   if (!active) return null;
 
   return (
     <div className="mx-auto flex min-h-screen max-w-4xl flex-col gap-6 px-6 py-8">
       <WorkspaceSwitcher />
+
+      {/*
+        THE DROPPED-WRITE NOTICE — ABOVE `<main key={mountKey}>`, AND THAT
+        PLACEMENT IS THE WHOLE POINT.
+
+        It reports the tenant-mismatch recovery: the active workspace changed in
+        another tab, so the write this tab sent did not apply. That recovery
+        re-homes the tab, which CHANGES `mountKey` — so everything inside `main`
+        unmounts. Rendered in there (or held as state in `MembersAdmin`) this
+        notice would be destroyed by the very event it reports: a flash and then
+        nothing. Worse, after re-homing to a workspace where the caller is not an
+        admin, `MembersAdmin` does not render at all.
+
+        So it sits outside the boundary and reads from session state, which
+        outlives the remount. Non-blocking and dismissable: the recovery has
+        already happened by the time this renders — the user is being told their
+        action was dropped, not asked to do anything.
+      */}
+      {notice && (
+        <div
+          role="status"
+          className="flex items-start justify-between gap-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3"
+        >
+          <p className="text-sm text-amber-900">{notice}</p>
+          <button
+            type="button"
+            onClick={() => session.clearNotice()}
+            className="text-sm font-medium text-amber-900 underline underline-offset-2"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/*
         KEYED BY THE REMOUNT KEY, not by the tenant id alone. The key carries the
