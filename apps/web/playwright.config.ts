@@ -10,7 +10,20 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  reporter: process.env.CI ? 'github' : 'list',
+  /**
+   * On CI, BOTH reporters, and the html one is not decoration.
+   *
+   * `github` annotates the failing line in the PR diff, which is what you want
+   * while reading the run. It writes no files — so the workflow's
+   * "Upload Playwright report" step found nothing to upload and said so, an
+   * artifact step that could never produce an artifact. Adding `html` gives that
+   * step something real: on a red gate you download the report and get the
+   * failure with its trace (`trace: 'on-first-retry'` above) instead of
+   * re-running locally and hoping it reproduces.
+   *
+   * `open: 'never'` because nothing can open a browser on a runner.
+   */
+  reporter: process.env.CI ? [['github'], ['html', { open: 'never' }]] : 'list',
   use: {
     baseURL: process.env.E2E_BASE_URL ?? 'http://localhost:3000',
     trace: 'on-first-retry',
