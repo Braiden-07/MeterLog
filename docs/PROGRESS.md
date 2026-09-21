@@ -1116,3 +1116,58 @@ The orientation assumed `POST /auth/switch` was safe from enforcement because it
 - Citations: **12 re-anchored, split by cause.** Nine by code displacement (this PR's interceptor and bootstrap edits moved `WORKSPACE_EXEMPT_ROUTES`, the `NO_ACTIVE_WORKSPACE` block, `clearActiveTenant`, `setGlobalPrefix`, the CORS note and three `ISOLATION.md` interceptor anchors); three by the one-line `DECISIONS.md` insertion of OPEN-21, which shifted every anchor at or below it by exactly +1. **`docs:check` was green before the sweep and green after** — it never saw the +1, which is OPEN-19 blind spot (3) exactly: a bare `[ADR-NNN](DECISIONS.md#Lnnn)` citation carries no literal to content-check and no number in its label, so two of its four checks are structurally inert. Found by landing, not by the checker.
 - **`docs/PROJECT_BRIEF.md` is author-owned and was left untouched** — its nine ADR anchors are now off by one for the same reason. Flagged for the author rather than edited.
 - OPEN-19's proximity-window fix remains its own later PR.
+
+## `PROJECT_BRIEF` §11 step 9 — the Playwright E2E PR (OPEN-17), and what it found
+
+The last PR of step 9. It tests the merged system and changes none of it: no app feature code, no `apps/api`.
+
+### The harness
+
+`playwright.config.ts` gained a `webServer` array, so **Playwright owns the app lifecycle** — it starts the API (`node apps/api/dist/main.js`, probed on `/api/v1/health`, not merely on the port) and the web server (`next start`), and stops both. There is no "start the servers first" step in any environment.
+
+Both run **from the repo root**, which is not tidiness: `ConfigModule` resolves `.env` against the process cwd and the only `.env` here is the root one. Started from `apps/api` the API would report a database error that was really a working-directory error.
+
+`NODE_ENV` is pinned to `test` **on the API entry only**. The session cookie is `secure: NODE_ENV === 'production'`, and a Secure cookie is never sent over `http://localhost` — a production-mode API would make every journey fail to authenticate for a reason that looks nothing like the cause. It is pinned on the API rather than job-wide because `next start` manages its own and expects a production build.
+
+The fixture is built **entirely from HTTP calls to the web origin** — no seed script, no database access, no importing from `apps/api`. A row inserted behind the API's back would be the one thing in the test that had never met RLS, the interceptor, or a DTO. One consequence worth recording: `POST /auth/register` sets **no cookie**; only `login` does, which cost one debugging cycle.
+
+### What the eviction journey found — OPEN-22
+
+**Cross-tab reset propagation has never worked.** `broadcast.ts` normalises every inbound message to `handler('remote')`; the subscriber in `workspace-session.ts` opens with `if (reason === 'remote') return;`. The two comments contradict each other — the channel says the receiver "discards its cache and re-reads identity", the session treats exactly that signal as "ignore" — and `reset()` is unreachable on every message.
+
+Established by probe rather than inference: the message **is** delivered to the second tab's page, the tab issues **zero** `/auth/me` refetches, and it keeps rendering the workspace the session has left.
+
+It was never caught because **no unit spec constructs a session with a channel at all** (`channel` is optional "so the spec can run without a channel"), which is precisely the gap `ISOLATION.md` §9 had written down. The first test that looked found it.
+
+**Not fixed here.** This PR writes no app feature code, and a user-visible behaviour change deserves its own reviewed slice rather than a drive-by in a test harness. Enrolled as **OPEN-22** with the written test kept as `test.fail()`: it runs on every CI pass and turns the build **red the moment someone fixes the app**, which is the signal to un-mark it. A skip would have gone quiet forever.
+
+**Scope, stated so nobody over- or under-reacts:** stale DISPLAY in a background tab. The rows are ones the caller is entitled to see, RLS is untouched, and a stale WRITE is already refused by the 409 the backstop journey proves.
+
+### Two tests, two setups — and they cannot be merged
+
+The broadcast is the **fast path**; the 409 `TENANT_MISMATCH` is the **backstop for when the broadcast cannot reach**. A backstop tested through its fast path proves only the fast path.
+
+So the backstop journey uses a **second browser context with the session cookie copied in**, and that is the condition rather than a convenience: an independent login would create its own session, whose active tenant always agrees with its own header, so the 409 could never fire and the test would pass while proving nothing. Separate contexts also mean no channel reaches across — which is the condition the backstop exists for, and incidentally why this journey is unaffected by OPEN-22.
+
+It asserts the **staleness precondition immediately before the write**, because a stale tab can cure itself and a cured tab fails the recovery assertions for a reason that has nothing to do with the recovery. This is the only browser-level proof of PR 2's recovery.
+
+### The admin journey
+
+invite → mint → fragment link → set password → sign in → exactly one workspace. The token is read **from the link the admin UI put on screen**, and the journey navigates to exactly that string — which turns the fragment rule from an assertion into an exercise: switch the builder to `?token=` and redemption fails, because the set-password page reads `location.hash`. It also asserts the address bar is cleared before anything is typed.
+
+### CI
+
+A **separate `e2e` job**, named with no middle dot on purpose: the required context is matched byte-for-byte and `verify`'s `·` already turns up mojibaked in API output. **No `paths` filter** — a skipped job never reports, and a required context that never reports blocks the merge permanently, which is the incident this file already records reached through a different door. The `verify` job is untouched apart from correcting its stale `Test`-step comment ("the web workspace passes with no test files" — it has six).
+
+### The DoD boxes stay unticked, and why
+
+`PROJECT_BRIEF` is author-owned, so the reasoning lives here.
+
+- **"Frontend covers all essential journeys"** — asset detail, reading/maintenance recording and the audit view have **no page**. E2E cannot cover pages that do not exist; that is step-8 work.
+- **"≥70% coverage on core logic; unit + integration + API + at least 2 e2e journeys green"** is **compound, and only one clause is met.** The two e2e journeys are delivered and green. The coverage number is **unmeasured and unenforced** — `test:cov` exists and `@vitest/coverage-v8` is installed, but no threshold is set and no figure is recorded anywhere. Naming which clause is outstanding matters more than the box.
+
+### Notes
+
+- Citations: re-anchored by landing, split by cause (below). `docs:check` is blind to the bare-anchor class (OPEN-19 blind spot 3), so green was not treated as evidence.
+- **The `docs:check`-script fix remains the top POST-step-9 item**, not this PR's job.
+- **Step 9 is complete**: the cross-site posture PR, the tenant/abuse hardening PR, the client 409-handler PR, and this one.

@@ -128,10 +128,135 @@ jobs:
         # catalog-driven isolation harness, and the definer probe — each running
         # as meterlog_app against the Postgres service above.
         #
-        # The web workspace passes with no test files; the API workspace does
-        # not, so a mis-globbed or empty DB suite still fails here rather than
-        # going green on zero matches.
+        # CORRECTED AT THE PLAYWRIGHT E2E PR: this said "the web workspace
+        # passes with no test files", which was true when written and has not
+        # been since the frontend slice. The web workspace now has six spec
+        # files and `--passWithNoTests` was deliberately removed from its script,
+        # so an empty frontend suite FAILS here too — which is the property the
+        # sentence was reaching for and no longer described.
+        #
+        # It does NOT run the Playwright journeys: `apps/web/vitest.config.ts`
+        # excludes `e2e/**`, and its `include` covers only app/components/lib, so
+        # the e2e specs are unreachable from here twice over. They run in the
+        # separate `e2e` job below, which owns the browser and the app servers.
         run: npm run test
 
       - name: Build
         run: npm run build
+
+  # ===========================================================================
+  # THE E2E JOB — SEPARATE, AND THE SEPARATION IS THE POINT
+  #
+  # It is NOT folded into `verify`. That job's NAME is the required status-check
+  # context in the `main` ruleset (see the comment at the top of this file), and
+  # reshaping it is the one edit that has already broken mergeability once.
+  #
+  # NAMED `e2e`, WITH NO MIDDLE DOT, DELIBERATELY. The required context is matched
+  # by exact string, and `verify`'s name carries a `·` (U+00B7) that already turns
+  # up mojibaked in API output. A second dotted name would double the chance of a
+  # ruleset entry that looks right in the settings UI and matches nothing.
+  #
+  # NO `paths` / `paths-ignore` FILTER, DELIBERATELY. A skipped job never reports,
+  # and a REQUIRED context that never reports blocks the merge permanently — the
+  # same incident this file already records, reached through a different door. It
+  # runs on every pull request or it is not required.
+  #
+  # IT SHARES NOTHING WITH `verify` AUTOMATICALLY: services, env and the whole
+  # install/migrate sequence are per-job in Actions, so they are repeated here
+  # rather than inherited.
+  #
+  # NOTE FOR WHOEVER MERGES THIS: adding the job does NOT make it required. The
+  # ruleset lists its required contexts explicitly, and `e2e` has to be added
+  # there as a second one, in repository settings, deliberately. Until it is, a
+  # red run here does not block anything.
+  # ===========================================================================
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: meterlog_migrator
+          POSTGRES_PASSWORD: ci_migrator_password
+          POSTGRES_DB: meterlog
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U meterlog_migrator -d meterlog"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MIGRATION_DATABASE_URL: postgresql://meterlog_migrator:ci_migrator_password@localhost:5432/meterlog?schema=public
+      DATABASE_URL: postgresql://meterlog_app:ci_app_password@localhost:5432/meterlog?schema=public
+      REDIS_URL: redis://localhost:6379
+      SESSION_SECRET: ci_session_secret_not_used_outside_ci
+      # NODE_ENV IS DELIBERATELY NOT SET HERE. The session cookie is
+      # `secure: NODE_ENV === 'production'`, and a Secure cookie is never sent
+      # over http://localhost — a production-mode API would make every journey
+      # fail to authenticate for a reason that looks nothing like the cause. The
+      # API process is pinned to `NODE_ENV=test` where it is actually started
+      # (`webServer` in apps/web/playwright.config.ts); setting it job-wide would
+      # also reach `next start`, which manages its own and expects a production
+      # build.
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Run migrations
+        run: npm run db:migrate:deploy
+
+      - name: Give the app role a password
+        run: |
+          PGPASSWORD="$MIGRATOR_PASSWORD" psql \
+            -h localhost -U meterlog_migrator -d "$POSTGRES_DB" \
+            -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE meterlog_app WITH LOGIN PASSWORD '$APP_PASSWORD';"
+
+      - name: Build
+        # The journeys run the BUILT artefacts — `node dist/main.js` and
+        # `next start` — so this is a prerequisite of the run, not a duplicate of
+        # the verify job's build.
+        run: npm run build
+
+      - name: Install Playwright browsers
+        # Chromium only: the config declares no `projects`, so one browser is the
+        # whole matrix. `--with-deps` pulls the system libraries the runner lacks.
+        run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+
+      - name: E2E
+        # Playwright starts and stops the API and the web server itself
+        # (`webServer`), so there is no start step here and no orphan process
+        # afterwards.
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: apps/web/playwright-report/
+          retention-days: 7
