@@ -20,12 +20,40 @@
  *
  *   1. The target path resolves.
  *   2. Every line number is within the target file's length.
+ *  2b. The anchor line is NOT BLANK. (Added by the OPEN-19 fix.)
  *   3. CONTENT. Where the link TEXT contains a quoted string or an
  *      identifier-shaped token, that literal must appear in the target file
- *      within PROXIMITY lines of the anchor.
+ *      within PROXIMITY lines of the anchor —
+ *  3a. EXCEPT where the link text is entirely a record id, which must point AT
+ *      the heading that declares it. (Added by the OPEN-19 fix.)
  *   4. LABEL. Where the link TEXT itself carries a `:<line>` reference — the
  *      `file.ts:132` / `:158` form this repo writes constantly — that number
  *      must equal the anchor it is attached to.
+ *
+ * ================= WHAT THE OPEN-19 FIX CHANGED, AND WHY ====================
+ *
+ * The register recorded three blind mechanisms, and BUILDING FIXTURES FOR THEM
+ * SHOWED ONE WAS MIS-DIAGNOSED. It said a bare `[ADR-NNN](DECISIONS.md#Lnnn)`
+ * had "no literal, so check 3 has nothing to match". Not so: `literalsFrom`
+ * extracts `ADR-NNN`, `normalise` keeps it, and the old heading filter matched
+ * it — a fixture anchoring such a link far from its heading FAILS on the
+ * unmodified checker, and so does one pointing at the wrong ADR's heading.
+ *
+ * The two landed drifts (+1 and +2 on the ADR headings) passed for a different
+ * reason: THE ±5 WINDOW ABSORBED THEM. That is why 3a exists and why it is
+ * scoped to record-id links only — the window is right for everything else.
+ *
+ * The other two mechanisms are real and are closed by 2b, which needs neither a
+ * literal nor a label and therefore reaches the citations the content checks
+ * skip: a label number that agrees with a wrong anchor (check 4 compares the two
+ * halves of a link to each other and never opens the file, so both can agree and
+ * both be wrong), and citations carrying neither a literal nor a label.
+ *
+ * THE CHECKER IS NOW CHECKED. `npm run docs:check:self` runs a fixture corpus of
+ * known-bad and known-good citations against this file. It is the acceptance gate
+ * the OPEN-19 fix needed and could not get from `docs:check` itself: a change to
+ * the checker cannot be proven by the checker's own verdict on the live corpus,
+ * because that verdict is the thing under test.
  *
  * Checks 1 and 2 catch deletions and truncations only. A citation that slides
  * twenty lines because somebody added an import passes both of them, every time
@@ -65,7 +93,23 @@ import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { dirname, resolve, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+/**
+ * The root whose `docs/` is checked. Defaults to the repo, and the override
+ * exists for ONE reason: so this checker can be run against a fixture corpus.
+ *
+ * A change to this file cannot be proven by this file's verdict on the live
+ * docs — that verdict is the thing under test, and "docs:check is green" is
+ * exactly as true of a checker that has stopped checking. The corpus in
+ * `scripts/fixtures/docs-check/` is the acceptance gate instead: known-bad trees
+ * that must FAIL and known-good trees that must PASS, run by
+ * `npm run docs:check:self`.
+ *
+ * It is an env var rather than an argument so the production invocation stays
+ * `node scripts/check-doc-citations.mjs` with nothing to get wrong.
+ */
+const REPO_ROOT = process.env.DOCS_CHECK_ROOT
+  ? resolve(process.env.DOCS_CHECK_ROOT)
+  : resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DOCS_DIR = join(REPO_ROOT, 'docs');
 
 /**
@@ -309,6 +353,44 @@ function main() {
           continue;
         }
 
+        // ---- 2b. THE ANCHOR LINE IS NOT BLANK ------------------------------
+        //
+        // THE CHEAPEST CHECK HERE AND THE ONE THAT WOULD HAVE CAUGHT THE MOST.
+        // It needs no literal and no label, so it reaches the citations every
+        // other content check skips: 116 of 212 carry no checkable literal and
+        // 77 carry no label reference, and four carry neither — those four rested
+        // entirely on "the path resolves" and "the file has that many lines".
+        //
+        // WHY BLANK IS THE RIGHT SIGNAL. Nobody cites a blank line on purpose. A
+        // citation lands on one for exactly one reason: content was inserted
+        // above it and the anchor slid off the thing it named onto the gap beside
+        // it. That is the entire shape of the drift this repo has landed twice —
+        // the tenant/abuse hardening PR's +1 and the E2E PR's +2 both pushed ADR
+        // anchors onto the blank line above their heading, and `docs:check`
+        // reported green both times.
+        //
+        // It found SIX live citations on the first run, every one real drift:
+        // a spec's assertion cited one line late, `CLAUDE.md`'s append-only table
+        // cited at the gap above it, a helpers array cited past its closing
+        // bracket. None of them were caught by anything else.
+        //
+        // A RANGE'S START LINE COUNTS. `#L46-L52` beginning on a blank is the
+        // same defect wearing a range: `CLAUDE.md#L46-L52` pointed at the gap
+        // above the heading it meant. A range legitimately STARTS on a comment or
+        // a prose line — that stays allowed, and only blank is refused.
+        const anchorLine = lines[from - 1] ?? '';
+        if (anchorLine.trim() === '') {
+          failures.push({
+            where,
+            cite,
+            why:
+              `the anchor points at a BLANK line (L${from}) — an anchor lands on a ` +
+              `blank when content was inserted above it and the citation slid off ` +
+              `what it named`,
+          });
+          continue;
+        }
+
         // ---- 3. the content check -----------------------------------------
         const literals = literalsFrom(linkText)
           .map((l) => normalise(l, rawTarget))
@@ -333,15 +415,53 @@ function main() {
         // Restricting to headings removes the coincidence: prose mentions a
         // record, a heading DECLARES it, and a record-id link means the latter.
         const headingOnly = /^[A-Z]{2,6}-?\d{2,4}$/.test(linkText.trim());
-        const headings = headingOnly
-          ? haystack
-              .split('\n')
-              .filter((l) => l.trimStart().startsWith('#'))
-              .join('\n')
-          : haystack;
-
-        const missing = literals.filter((literal) => !headings.includes(literal));
         contentChecked += 1;
+
+        if (headingOnly) {
+          // ---- 3a. A HEADING-ANCHORED CITATION IS EXACT, NOT PROXIMATE ------
+          //
+          // THE PROXIMITY WINDOW IS WHAT LET THE DRIFT THROUGH, and this is the
+          // narrow place it can be removed without cost.
+          //
+          // The window exists for a real case, argued in its own comment above
+          // and still correct: prose legitimately points a line or two into a
+          // block, an `it(...)` citation may land on the `it(` line or inside the
+          // body, a range may start on a comment. Removing it globally would
+          // force character-exactness the docs have no reason to keep, and the
+          // guard would be gamed by loosening link text rather than fixing
+          // anchors. So it is NOT removed globally.
+          //
+          // But a link whose ENTIRE text is a record id is not prose pointing
+          // into a block. It claims one thing: "this record is DECLARED here."
+          // A declaration is a single line, so "within five lines" is not a
+          // tolerance for that claim — it is a hole. Both landed drifts sat in
+          // it: a +1 or +2 shift leaves the heading comfortably inside ±5, so
+          // every ADR citation in the repo could be off by one or two and green.
+          //
+          // Exactness here also closes a case the blank rule alone cannot:
+          // `ISOLATION.md:343` cited an `it(...)` name four lines above a blank
+          // anchor — the blank rule catches that one, but the same slide onto a
+          // NON-blank line would still pass on the window. For heading anchors
+          // that residual is now gone.
+          const isHeading = anchorLine.trimStart().startsWith('#');
+          const missing = literals.filter((literal) => !anchorLine.includes(literal));
+
+          if (!isHeading || missing.length > 0) {
+            failures.push({
+              where,
+              cite,
+              why: !isHeading
+                ? `a record-id citation must point AT the heading that declares it, ` +
+                  `and L${from} is not a heading`
+                : `the heading at L${from} does not declare ` +
+                  missing.map((m) => JSON.stringify(m)).join(', ') +
+                  ` — a record-id citation is exact, not within ${PROXIMITY} lines`,
+            });
+          }
+          continue;
+        }
+
+        const missing = literals.filter((literal) => !haystack.includes(literal));
 
         if (missing.length > 0) {
           failures.push({

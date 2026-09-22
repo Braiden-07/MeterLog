@@ -84,6 +84,20 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Check the citation checker
+        # BEFORE `docs:check`, and the order is the argument. If the guard has
+        # stopped guarding, the next step's green means nothing — "docs citations
+        # OK" is exactly as true of a checker that no longer checks. So the tool
+        # is proven against a fixture corpus of known-bad and known-good trees
+        # first, and only then used.
+        #
+        # That is not hypothetical: the register carried three blind mechanisms
+        # for four slices while this workflow stayed green through all of them,
+        # and two real drifts landed on `main` underneath that green. The corpus
+        # also runs a mutation pass, so a future weakening of either rule reds
+        # here rather than going quiet.
+        run: npm run docs:check:self
+
       - name: Check doc citations
         # ITS OWN STEP, DELIBERATELY (step 7 phase 7a, Part 0). Folding this into
         # `test` would make citation drift surface as a red test among 300 others,

@@ -1171,3 +1171,42 @@ A **separate `e2e` job**, named with no middle dot on purpose: the required cont
 - Citations: re-anchored by landing, split by cause (below). `docs:check` is blind to the bare-anchor class (OPEN-19 blind spot 3), so green was not treated as evidence.
 - **The `docs:check`-script fix remains the top POST-step-9 item**, not this PR's job.
 - **Step 9 is complete**: the cross-site posture PR, the tenant/abuse hardening PR, the client 409-handler PR, and this one.
+
+## The `docs:check`-script fix — OPEN-19 narrowed, and a mis-diagnosis corrected
+
+The first post-step-9 item. It changes the citation guard itself, which makes `docs:check` green the thing under test rather than the proof.
+
+### The register was wrong about why the drift got through
+
+OPEN-19 recorded three blind mechanisms, and mechanism (3) said a bare `[ADR-NNN](DECISIONS.md#Lnnn)` has "nothing to content-check" because check 3 finds no literal. **Building fixtures showed that is not what the code does.** `literalsFrom` extracts `ADR-NNN`, `normalise` keeps it, and the heading filter matches it — a fixture anchoring such a link far from its heading **fails on the unmodified checker**, and so does one pointing at the wrong ADR's heading.
+
+The two landed drifts passed for a different reason: **the ±5 proximity window absorbed them.** A +1 or +2 shift leaves the heading comfortably inside the window, so every ADR citation in the repo could be off by one or two and green.
+
+That correction changed what got built. A fix aimed at "check 3 is inert" would have added a content check that was already there and left the actual hole open.
+
+### Two rules, each proven by a fixture the other does not catch
+
+- **2b — the anchor line must not be BLANK**, a range's start line included. Nobody cites a blank line on purpose; one means content was inserted above and the anchor slid off what it named. It needs neither a literal nor a label, which is how it reaches the mechanisms the content checks skip (116 of 212 citations get no content check, 77 get no label check, 4 get neither).
+- **3a — a record-id citation must point AT the heading that declares it**, exactly. The window stays untouched everywhere else: prose legitimately points a line or two into a block, and the file's own argument that a guard tightened past what the docs owe gets gamed by loosening link text is correct.
+
+### The acceptance gate came from outside the tool
+
+`npm run docs:check:self` runs a fixture corpus reconstructing drift this project actually landed: **five known-bad trees that must fail, four known-good that must pass** — including the prose-into-block case the window exists for, so the guard is proven able to tell drift from legitimate imprecision.
+
+**Four of the five known-bad trees were GREEN on the pre-fix checker and are red now.** The fifth guards the pre-existing content check and was correctly red both ways — labelled as a regression guard rather than counted as a new catch.
+
+A **mutation pass** disables each new rule in turn and asserts a *different, named* fixture goes green, so neither rule is decorative and the corpus records which mechanism each closes. It runs in CI **before** `docs:check`, because a tool that has stopped working makes the next step's green meaningless.
+
+### What the improved checker found
+
+**9 real drifts on first run**, split by cause:
+
+- **6 pre-existing blank-anchor drifts**, invisible to every previous run. The worst was `helpers.ts:292`, which was **189 lines** from the `ISOLATION_FIXTURES` registry it claimed to point at — invisible because its label agreed with its anchor and the label is a file reference the content check discards.
+- **3 caused by this PR's own `ci.yml` edit** (inserting the self-test step shifted two cited steps by +14). Caught by the *pre-existing* check 3, which is useful evidence that check works.
+
+Then, **the fix proved itself on this PR**: inserting the OPEN-24 row pushed **25 ADR anchors onto blank lines**, and the checker caught all 25. That is precisely the displacement that went green in the tenant/abuse hardening PR and again in the E2E PR.
+
+### Notes
+
+- OPEN-19 → **NARROWED**, not DONE. Residual enrolled as **OPEN-24**: the four citations carrying neither a literal nor a label can still drift onto a wrong NON-blank line. Closing it needs on-topic resolution, which is not a string comparison, and the cheap approximations are worse than the gap.
+- `docs:check` green is now **necessary but not sufficient**; the corpus is the proof.
