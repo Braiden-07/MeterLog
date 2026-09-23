@@ -169,6 +169,21 @@ services:
           type: redis
           property: connectionString
 
+      # ===================== OBSERVABILITY (step 10, PR-2) ==================
+      #
+      # Both optional, and the app is correct without either. No DSN means no
+      # Sentry — `initSentry` returns false and says so once at boot, because a
+      # reporter that is silently off looks exactly like one that is working and
+      # has nothing to report.
+      - key: SENTRY_DSN
+        sync: false
+
+      # pino's level. Absent, the API infers it from `NODE_ENV` (`info` in
+      # production), so this is here to be RAISED during an incident without a
+      # code change — which is the only time anyone wants it.
+      - key: LOG_LEVEL
+        sync: false
+
       # `PORT` IS DELIBERATELY ABSENT. Render injects it and the API reads
       # `process.env.PORT ?? 3001` (apps/api/src/main.ts). Declaring a fixed one
       # here would fight the platform for no gain.

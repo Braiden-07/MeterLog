@@ -24,6 +24,7 @@
     "@nestjs/swagger": "^8.1.0",
     "@node-rs/argon2": "^2.2.0",
     "@prisma/client": "^6.1.0",
+    "@sentry/nestjs": "^11.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
     "helmet": "^8.0.0",

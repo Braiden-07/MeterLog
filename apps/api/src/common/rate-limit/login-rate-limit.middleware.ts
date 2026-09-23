@@ -1,6 +1,39 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import { pino } from 'pino';
 
-import { LoginRateLimitService } from './login-rate-limit.service';
+import { LOGIN_FAILURE_EVENT, LoginRateLimitService } from './login-rate-limit.service';
+
+/**
+ * THIS MIDDLEWARE LOGS FOR ITSELF, and the reason is the same one it already
+ * writes its own error envelope for.
+ *
+ * It runs in Express, UPSTREAM of Nest — mounted by `configureApp` with
+ * `app.use(...)` before `app.init()`. `nestjs-pino` registers its request logger
+ * as Nest MODULE middleware, which is applied during `init()`, i.e. after this.
+ * So when this middleware short-circuits with a 429, `pino-http` never runs and
+ * there is NO request log line for it. The 429s are the most interesting events
+ * the API produces; losing them would make the aggregate counter the only trace
+ * of an attack in progress.
+ *
+ * ARCHITECTURE §12 already records this exact asymmetry for ERRORS — "the login
+ * rate limiter runs in Express, upstream of Nest, so the filter never sees its
+ * 429 and the middleware writes the `RATE_LIMITED` envelope itself". This is
+ * the logging half of the same sentence.
+ *
+ * THE ALTERNATIVE WAS REJECTED RATHER THAN MISSED: moving `pino-http` ahead of
+ * helmet, into `configureApp`, would log everything including this. It would
+ * also put logging inside the request-pipeline floor that every acceptance spec
+ * pins, so a logging change could alter the security boundary. A dozen lines of
+ * its own logger is the cheaper side of that trade.
+ *
+ * Its own pino instance, for the same structural reason: Nest's DI is not
+ * available here, and reaching into the container from Express middleware would
+ * couple the two in the direction this file deliberately avoids.
+ */
+const log = pino({
+  level: process.env.NODE_ENV === 'test' ? 'silent' : (process.env.LOG_LEVEL ?? 'info'),
+  name: 'login-rate-limit',
+});
 
 /**
  * The status a failed credential check answers with. The login route is exempt
@@ -99,6 +132,14 @@ export function loginRateLimitMiddleware(resolve: () => LoginRateLimitService): 
       .check(key)
       .then(({ limited, retryAfterSeconds }) => {
         if (limited) {
+          // The refusal, logged where it happens. NO EMAIL AND NO KEY: the key
+          // is a SHA-256 of the address precisely so the address never lands in
+          // a store, and a log file is a store. What a reader needs is that a
+          // refusal occurred and for how long, both of which are here.
+          log.warn(
+            { event: LOGIN_FAILURE_EVENT, outcome: 'rate_limited', retryAfterSeconds },
+            'login refused: per-email failure budget exhausted',
+          );
           res
             .status(429)
             .setHeader('Retry-After', String(retryAfterSeconds))
@@ -149,7 +190,23 @@ function chargeFailureBeforeResponding(
     if (res.statusCode !== FAILED_LOGIN_STATUS) return originalEnd(...args);
 
     void limiter.recordFailure(key).then(
-      () => void originalEnd(...args),
+      ({ emailFailures, windowFailures }) => {
+        // THE MASS-SPRAY SIGNAL. `windowFailures` is the aggregate across ALL
+        // addresses in the current five-minute bucket, which is the number that
+        // distinguishes one person mistyping from a spray across many accounts
+        // — a distinction the per-email counters structurally cannot make.
+        //
+        // IT IS A SIGNAL, NOT A DETECTION. Nothing here decides anything and
+        // nothing alerts: an alert RULE is a platform artifact that lives
+        // outside this repository, and is owed on the author checklist in
+        // ARCHITECTURE §16.B. Saying this "detects mass spray" while only the
+        // counter exists would be the green-proves-nothing shape.
+        log.info(
+          { event: LOGIN_FAILURE_EVENT, outcome: 'failed', emailFailures, windowFailures },
+          'login failed',
+        );
+        void originalEnd(...args);
+      },
       () => void originalEnd(...args),
     );
     return res;

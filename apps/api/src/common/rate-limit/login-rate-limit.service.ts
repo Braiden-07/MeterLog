@@ -16,6 +16,55 @@ import Redis from 'ioredis';
 export const LOGIN_FAILURE_KEY_PREFIX = 'meterlog:loginfail:email:';
 
 /**
+ * THE AGGREGATE FAILURE COUNTER — the mass-spray SIGNAL (step 10 observability).
+ *
+ * This class's own comment refuses a GLOBAL rate LIMIT and re-homes the problem
+ * here: "Bounding mass spray is a DETECTION problem (step 10 observability —
+ * alert on the aggregate failure rate), not a limiter problem, because the
+ * useful response is 'page someone', never 'refuse everyone'." This is that
+ * counter, and it REFUSES NOTHING. Nothing reads it to make a decision; it
+ * exists to be read by a human or an alert rule.
+ *
+ * ============ WHY THE PER-EMAIL KEYS CANNOT ANSWER THIS ====================
+ *
+ * They are `sha256(email)` under one key each. Summing them would mean
+ * enumerating a keyspace the hashing exists to keep unenumerable — a `KEYS`
+ * scan over live credentials-adjacent data, which is the opposite of the
+ * property `keyFor` is built for. An aggregate has to be counted as it happens,
+ * on its own key, which is what this is.
+ *
+ * ==================== WHY THE BUCKET IS COARSE =============================
+ *
+ * A fixed five-minute bucket, not a per-second series. The question it answers
+ * is "is something spraying right now", whose shape is visible at minutes and
+ * drowns in per-second noise; and a coarse bucket is a bounded number of keys
+ * per day rather than an unbounded time series in a store that is not a metrics
+ * database. Redis holds sessions here, and sessions are what must not be
+ * evicted to make room for telemetry.
+ */
+export const LOGIN_FAILURE_AGGREGATE_PREFIX = 'meterlog:loginfail:all:';
+
+/** Bucket width. Five minutes: coarse enough to read, fine enough to alert on. */
+export const LOGIN_FAILURE_BUCKET_SECONDS = 5 * 60;
+
+/**
+ * How long a bucket survives. Twelve buckets (one hour) so a reader arriving
+ * after the fact can see the shape of the last hour rather than only the
+ * current five minutes — and so the keyspace is bounded without a sweeper.
+ */
+export const LOGIN_FAILURE_AGGREGATE_TTL_SECONDS = 12 * LOGIN_FAILURE_BUCKET_SECONDS;
+
+/**
+ * The structured event name emitted alongside every charged failure.
+ *
+ * STABLE, AND THAT IS THE POINT: an alert rule, a log query and a dashboard all
+ * key on this string, and all three live OUTSIDE this repository. Renaming it
+ * silently breaks them with nothing here turning red, so it is a named export
+ * with this comment attached rather than a literal inside a log call.
+ */
+export const LOGIN_FAILURE_EVENT = 'login.failure';
+
+/**
  * The window, in seconds. Fixed rather than sliding: the counter is created by
  * the first failure and expires whole, so a locked-out caller is always told a
  * bounded `Retry-After` rather than being held by a tail of old attempts.
@@ -109,6 +158,28 @@ export class LoginRateLimitService implements OnModuleDestroy {
     this.redis = new Redis(redisUrl, { maxRetriesPerRequest: 2, lazyConnect: false });
   }
 
+  /**
+   * PING — purely additive, for the readiness probe (`/api/v1/health/ready`).
+   *
+   * `PING` and nothing else: it reads no key, writes no key, and touches no
+   * session. It answers one question — is this connection usable — which is
+   * the only question a readiness probe is entitled to ask of a store holding
+   * live credentials. Anything richer would make an UNAUTHENTICATED endpoint
+   * into a way to measure the store's contents.
+   *
+   * Never throws. A readiness probe that throws turns a dependency being down
+   * into a 500 with a stack, which is both an information leak and the wrong
+   * answer: "Redis is unreachable" is a fact to report, not an exception to
+   * propagate.
+   */
+  async ping(): Promise<boolean> {
+    try {
+      return (await this.redis.ping()) === 'PONG';
+    } catch {
+      return false;
+    }
+  }
+
   async onModuleDestroy(): Promise<void> {
     await this.redis.quit();
   }
@@ -128,6 +199,16 @@ export class LoginRateLimitService implements OnModuleDestroy {
   static keyFor(email: string): string {
     const normalised = email.trim().toLowerCase();
     return LOGIN_FAILURE_KEY_PREFIX + createHash('sha256').update(normalised).digest('hex');
+  }
+
+  /**
+   * The aggregate bucket key for a moment in time. No identity in it at all —
+   * that is the difference between this and `keyFor`, and the reason it can be
+   * read freely without touching anything about who was attacked.
+   */
+  static bucketKeyFor(atMs: number = Date.now()): string {
+    const bucket = Math.floor(atMs / 1000 / LOGIN_FAILURE_BUCKET_SECONDS);
+    return LOGIN_FAILURE_AGGREGATE_PREFIX + String(bucket);
   }
 
   /**
@@ -155,8 +236,32 @@ export class LoginRateLimitService implements OnModuleDestroy {
    * each subsequent one — a sliding expiry would let a patient attacker hold a
    * victim locked out indefinitely.
    */
-  async recordFailure(key: string): Promise<void> {
-    const count = await this.redis.incr(key);
-    if (count === 1) await this.redis.expire(key, LOGIN_FAILURE_WINDOW_SECONDS);
+  async recordFailure(key: string): Promise<{ emailFailures: number; windowFailures: number }> {
+    const bucketKey = LoginRateLimitService.bucketKeyFor();
+
+    // ONE ROUND TRIP FOR BOTH COUNTERS, and that is not micro-optimisation.
+    // This runs inside `chargeFailureBeforeResponding`, which holds the response
+    // open until it resolves — so a second sequential round trip would add its
+    // full latency to every failed login. Pipelined, the aggregate costs the
+    // signal nothing measurable.
+    const [emailFailures, windowFailures] = (await this.redis
+      .multi()
+      .incr(key)
+      .incr(bucketKey)
+      .exec()
+      .then((replies) => (replies ?? []).map(([, value]) => Number(value)))) as [number, number];
+
+    // Expiries are attached on the FIRST increment of each key only. For the
+    // per-email key that is load-bearing: a sliding expiry would let a patient
+    // attacker hold a victim locked out indefinitely. For the aggregate it
+    // simply bounds the keyspace.
+    const expiries = [];
+    if (emailFailures === 1) expiries.push(this.redis.expire(key, LOGIN_FAILURE_WINDOW_SECONDS));
+    if (windowFailures === 1) {
+      expiries.push(this.redis.expire(bucketKey, LOGIN_FAILURE_AGGREGATE_TTL_SECONDS));
+    }
+    if (expiries.length > 0) await Promise.all(expiries);
+
+    return { emailFailures, windowFailures };
   }
 }

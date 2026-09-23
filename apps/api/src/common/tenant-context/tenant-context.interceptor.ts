@@ -60,6 +60,14 @@ export const WORKSPACE_EXEMPT_ROUTES: ReadonlySet<string> = new Set([
   'GET /auth/me',
   'POST /auth/logout',
   'GET /health',
+  // The readiness probe (step 10 observability). Exempt for the same reason
+  // its sibling is: it is a pre-auth infrastructure check that reads no tenant
+  // data. Without this entry the interceptor's default-deny answers an
+  // anonymous probe with 401, so an uptime monitor would report the service
+  // down while it was perfectly healthy. It is a GET and writes nothing, so the
+  // set's SECOND meaning — waiving `X-Expected-Tenant` enforcement — costs
+  // nothing here.
+  'GET /health/ready',
 ]);
 
 /**

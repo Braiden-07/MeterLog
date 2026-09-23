@@ -58,6 +58,28 @@ export class SessionService implements OnModuleDestroy {
     this.secret = secret;
   }
 
+  /**
+   * PING — purely additive, for the readiness probe (`/api/v1/health/ready`).
+   *
+   * `PING` and nothing else: it reads no key, writes no key, and touches no
+   * session. It answers one question — is this connection usable — which is
+   * the only question a readiness probe is entitled to ask of a store holding
+   * live credentials. Anything richer would make an UNAUTHENTICATED endpoint
+   * into a way to measure the store's contents.
+   *
+   * Never throws. A readiness probe that throws turns a dependency being down
+   * into a 500 with a stack, which is both an information leak and the wrong
+   * answer: "Redis is unreachable" is a fact to report, not an exception to
+   * propagate.
+   */
+  async ping(): Promise<boolean> {
+    try {
+      return (await this.redis.ping()) === 'PONG';
+    } catch {
+      return false;
+    }
+  }
+
   async onModuleDestroy(): Promise<void> {
     await this.redis.quit();
   }

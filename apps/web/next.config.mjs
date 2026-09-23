@@ -1,3 +1,11 @@
+// FROM THE `/config` SUBPATH, NOT THE PACKAGE ROOT. In @sentry/nextjs v11 the
+// root export is the RUNTIME SDK and carries no `withSentryConfig`; the
+// build-time wrapper lives here. Importing it from the root resolves to
+// `undefined` and fails at config-load time with "withSentryConfig is not a
+// function" — which `lib/security-headers.spec.ts` catches, because that spec
+// loads this file.
+import { withSentryConfig } from '@sentry/nextjs/config';
+
 /** @type {import('next').NextConfig} */
 
 /**
@@ -96,4 +104,43 @@ const nextConfig = {
   },
 };
 
-export default nextConfig;
+/**
+ * SENTRY — the build-time wrapper, and `tunnelRoute` is the decision in it.
+ *
+ * ====================== WHY TUNNEL AT ALL ==================================
+ *
+ * Without a tunnel the browser posts events straight to Sentry's ingest host,
+ * which means a cross-origin request to a third-party domain. That is fine
+ * today and stops being fine twice over:
+ *
+ *   1. **The CSP.** `lib/security-headers.spec.ts` asserts the policy with an
+ *      EXACT match — `toBe("frame-ancestors 'none'")` — so adding a
+ *      `connect-src` for an ingest host would red a pinned test. And OPEN-21
+ *      owes a full nonce-based CSP at a later slice; a policy that has to name
+ *      a third-party ingest host is a policy with a permanent hole in it.
+ *      Tunnelling means the eventual `connect-src` can stay `'self'`, and the
+ *      forward-marker is recorded on OPEN-21 so whoever writes that policy
+ *      knows they owe no ingest allowance.
+ *   2. **Ad blockers.** They block known ingest hosts by hostname, so a
+ *      meaningful share of real browser errors never arrive — silently, and
+ *      biased toward exactly the privacy-conscious users least likely to report
+ *      a bug by hand.
+ *
+ * ================ AND WHY IT IS NOT UNDER `/api/` ==========================
+ *
+ * `rewrites()` above sends `/api/:path*` wholesale to the API origin. A tunnel
+ * mounted there would be proxied to NestJS, which knows nothing about it, and
+ * every event would 404 into the void. `/monitoring` is clear of the rewrite
+ * and of the headers block's negative lookahead.
+ */
+export default withSentryConfig(nextConfig, {
+  // Build-time upload of source maps needs an auth token; without one the
+  // plugin skips it. Errors still arrive, unminified frames do not — an
+  // author-side setup step, not a code change (ARCHITECTURE §16.B).
+  silent: true,
+  tunnelRoute: '/monitoring',
+  // The repo is public and the maps would be too; uploading them is gated on a
+  // token the author supplies, so this stays off rather than half-configured.
+  widenClientFileUpload: false,
+  disableLogger: true,
+});
