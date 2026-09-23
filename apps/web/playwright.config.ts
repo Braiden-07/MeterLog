@@ -30,6 +30,88 @@ export default defineConfig({
   },
 
   /**
+   * TWO PROJECTS, AND THE SECOND ONE IS A DIFFERENT SITE.
+   *
+   * ================ WHY `localhost` CANNOT TEST WHAT DEPLOYS =================
+   *
+   * Everything above runs on `localhost`, where `:3000` and `:3001` differ only
+   * by PORT — and a port does not change the SITE. So the session cookie is
+   * same-site throughout, no matter how the app is configured, and a green run
+   * here is not evidence about the deployed Vercel→Render topology.
+   * `ISOLATION.md` §9 says exactly that and owes a deploy smoke test.
+   *
+   * The `cross-site` project is the half of that debt CI can pay. It drives the
+   * SAME app through hostnames that are genuinely different sites, so the
+   * browser's same-site computation does real work.
+   *
+   * ============ THE ALIASES MUST DIFFER AT THE REGISTRABLE DOMAIN ============
+   *
+   * `web.test` and `api.test`, NOT `web.meterlog.test` and `api.meterlog.test`.
+   *
+   * Same-site is computed on the registrable domain (eTLD+1), not on the
+   * hostname. `.test` is a reserved TLD and is not a multi-label public suffix,
+   * so `web.test` and `api.test` are each their OWN registrable domain — two
+   * different sites. Under `meterlog.test` both would share an eTLD+1 of
+   * `meterlog.test`, making them the SAME site, and every assertion in this
+   * project would pass while proving nothing at all.
+   *
+   * **That is the tidy-up to refuse.** Grouping the two under one parent domain
+   * is the obvious readability improvement and it silently converts this project
+   * into a tautology — green, fast, and blind to the exact regression it exists
+   * to catch. If these names ever change, the replacement pair must still be two
+   * distinct registrable domains.
+   *
+   * ================= WHAT THE RIG PROVES, AND WHAT IT CANNOT ================
+   *
+   * PROVES: the topology holds across a real site boundary, and — the reason it
+   * earns its place — that nothing in the browser addresses the API directly
+   * (§16.A condition 2). If an absolute API origin were ever introduced,
+   * `credentials: 'same-origin'` means the cookie is not sent AT ALL and the
+   * call 401s loudly, here, on every pull request, forever.
+   *
+   * CANNOT PROVE, and the smoke test owes all of it: `Secure` (this rig is HTTP,
+   * and forcing `NODE_ENV=production` to get the flag would mean the cookie is
+   * never sent — the trap `ci.yml` documents), Vercel's BUILD-TIME `API_ORIGIN`
+   * bake, real Vercel proxying, and `NODE_ENV` on Render.
+   *
+   * ===================== IT NEEDS A BUILD OF ITS OWN ========================
+   *
+   * `rewrites()` is baked into `.next/routes-manifest.json` at `next build` and
+   * a runtime `API_ORIGIN` is IGNORED — measured, not assumed: serving a build
+   * made with the default while passing `API_ORIGIN=http://127.0.0.1:3999` still
+   * proxied to `:3001`. So this project needs the web app built with
+   * `API_ORIGIN=http://api.test:3001`, which is why CI gives it its own job
+   * rather than folding it into `e2e`. (That measurement independently confirms
+   * `ARCHITECTURE.md` §16.A's first condition, which had been reasoned rather
+   * than tested.)
+   *
+   * SKIPS ITSELF, LOUDLY, when the aliases do not resolve — a developer who has
+   * not edited their hosts file gets a named skip rather than a proxy error that
+   * looks nothing like its cause. CI always adds them, so the guard cannot hide
+   * a regression where it matters.
+   */
+  projects: [
+    {
+      name: 'e2e',
+      testDir: './e2e',
+    },
+    {
+      name: 'cross-site',
+      testDir: './cross-site',
+      use: {
+        baseURL: process.env.CROSS_SITE_BASE_URL ?? 'http://web.test:3000',
+        // Chromium resolves the aliases itself, so the BROWSER half works even
+        // where the hosts file has not been edited. The Next server still needs
+        // real OS resolution for `api.test`, which is why the spec probes and
+        // skips rather than assuming both halves are present.
+        launchOptions: {
+          args: ['--host-resolver-rules=MAP web.test 127.0.0.1, MAP api.test 127.0.0.1'],
+        },
+      },
+    },
+  ],
+
+  /**
    * PLAYWRIGHT OWNS THE APP LIFECYCLE — both halves, started and stopped for the
    * run. There is no "start the servers first" step, locally or in CI, because a
    * harness that depends on a human having done something is a harness that goes

@@ -274,3 +274,135 @@ jobs:
           name: playwright-report
           path: apps/web/playwright-report/
           retention-days: 7
+
+  # ===========================================================================
+  # THE CROSS-SITE RIG — the half of the deploy debt CI can actually pay.
+  #
+  # WHY IT IS ITS OWN JOB AND NOT A SECOND STEP IN `e2e`. The rig needs the web
+  # app built with `API_ORIGIN=http://api.test:3001`, and `rewrites()` is BAKED
+  # into `.next/routes-manifest.json` at `next build` — a runtime value is
+  # ignored. That was measured rather than assumed: serving a build made with
+  # the default while passing `API_ORIGIN=http://127.0.0.1:3999` still proxied
+  # to `:3001`. One `.next` directory holds one bake, so the rig cannot share
+  # the `e2e` job's build, and giving `e2e` a different bake would silently
+  # change what the required gate exercises.
+  #
+  # (That measurement independently confirms ARCHITECTURE §16.A's FIRST
+  # condition, which until now had been reasoned and never tested.)
+  #
+  # NOT REQUIRED, AND NOT PROPOSED AS REQUIRED. `e2e` is the context the ruleset
+  # names. This job is new, it runs on every PR, and it should earn a while of
+  # green before anyone considers adding it — the comment at the top of this
+  # file records what happens when a required context cannot report.
+  #
+  # WHAT A RED RUN HERE MEANS: either the same-origin proxy stopped working
+  # across a real site boundary, or something in the browser started addressing
+  # the API directly (ARCHITECTURE §16.A condition 2). Both are deploy-breaking
+  # and neither is visible to the `e2e` job, where `localhost:3000` and
+  # `localhost:3001` are the same SITE.
+  # ===========================================================================
+  cross-site:
+    name: cross-site
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: meterlog_migrator
+          POSTGRES_PASSWORD: ci_migrator_password
+          POSTGRES_DB: meterlog
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U meterlog_migrator -d meterlog"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MIGRATION_DATABASE_URL: postgresql://meterlog_migrator:ci_migrator_password@localhost:5432/meterlog?schema=public
+      DATABASE_URL: postgresql://meterlog_app:ci_app_password@localhost:5432/meterlog?schema=public
+      REDIS_URL: redis://localhost:6379
+      SESSION_SECRET: ci_session_secret_not_used_outside_ci
+      # NODE_ENV IS DELIBERATELY NOT SET, for the reason the `e2e` job records:
+      # a Secure cookie is never sent over plain HTTP, so a production-mode API
+      # would make every assertion here fail to authenticate for a reason that
+      # looks nothing like its cause. `Secure` is therefore the one cookie flag
+      # this rig CANNOT test, and the deploy smoke test owes it.
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # THE ALIASES. Two hostnames, 127.0.0.1, and they MUST be two different
+      # REGISTRABLE DOMAINS — `web.test` and `api.test`, never `web.meterlog.test`
+      # and `api.meterlog.test`, which would share an eTLD+1 of `meterlog.test`,
+      # be the SAME site, and turn the whole rig into a tautology that passes
+      # proving nothing. The spec and the Playwright config both carry the full
+      # argument; this is the third place it has to be right.
+      - name: Add the cross-site host aliases
+        run: |
+          echo "127.0.0.1 web.test" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 api.test" | sudo tee -a /etc/hosts
+          getent hosts web.test api.test
+
+      - name: Install
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Run migrations
+        run: npm run db:migrate:deploy
+
+      - name: Give the app role a password
+        run: |
+          PGPASSWORD="$MIGRATOR_PASSWORD" psql \
+            -h localhost -U meterlog_migrator -d "$POSTGRES_DB" \
+            -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE meterlog_app WITH LOGIN PASSWORD '$APP_PASSWORD';"
+
+      # THE BAKE. This is the line that makes the rig a rig: the proxy must
+      # forward to a DIFFERENT SITE, and that destination is compiled in here.
+      - name: Build with the cross-site API origin
+        env:
+          API_ORIGIN: http://api.test:3001
+        run: npm run build
+
+      - name: Confirm the bake landed
+        # Cheap, and it turns the one silent failure mode of this job into a
+        # named one. If the manifest still says `localhost`, every assertion
+        # below would pass while testing the same-site topology `e2e` already
+        # covers — green, and proving nothing.
+        run: |
+          grep -q 'http://api.test:3001/api/:path\*' apps/web/.next/routes-manifest.json \
+            || { echo "::error::the rewrite was not baked with API_ORIGIN=http://api.test:3001 — the rig would test the same-site topology and pass vacuously"; exit 1; }
+          echo "rewrite destination is baked cross-site"
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+
+      - name: Cross-site rig
+        run: npm run test:e2e:cross-site
+
+      - name: Upload cross-site report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-site-report
+          path: apps/web/playwright-report/
+          retention-days: 7

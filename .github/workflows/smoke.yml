@@ -1,0 +1,124 @@
+# =============================================================================
+# THE DEPLOY SMOKE TEST — the acceptance gate for slice 1's same-origin proxy.
+#
+# ===================== `workflow_dispatch` ONLY, DELIBERATELY ================
+#
+# Never on push. Never on pull_request. NEVER a required status check.
+#
+# Three separate reasons, each sufficient on its own:
+#
+#   1. IT TARGETS A DEPLOYMENT, and there is not one yet. A job that cannot run
+#      until an author has provisioned two platforms is a job that would be red
+#      on every commit until then, training everyone to ignore it.
+#   2. THE FIRST RUN IS EXPECTED TO POSSIBLY FAIL, AND THAT FAILURE IS THE
+#      FINDING. `ARCHITECTURE.md` §16.A describes a posture that has never been
+#      tested; this is the instrument that decides whether it holds. Wiring an
+#      acceptance gate to a deploy turns a finding into an incident.
+#   3. A REQUIRED CONTEXT THAT NEVER REPORTS BLOCKS THE MERGE BUTTON
+#      PERMANENTLY. `ci.yml` carries that incident twice over. A separate file
+#      with no `push`/`pull_request` trigger cannot become one by accident.
+#
+# IT TOUCHES PRODUCTION STATE. Every run registers one organisation through the
+# live API and leaves it there permanently — v1.0 has no hard delete (ADR-008).
+# Identities carry a `smoke-` prefix and an `@smoke.invalid` address so the
+# residue is greppable and obviously synthetic. Read the spec header before
+# running it repeatedly.
+# =============================================================================
+name: deploy smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      vercel_url:
+        description: 'The deployed WEB origin, e.g. https://meterlog.vercel.app (no trailing path)'
+        required: true
+        type: string
+      render_url:
+        description: 'The deployed API origin on Render, e.g. https://meterlog-api.onrender.com'
+        required: true
+        type: string
+
+# Nothing here needs write access to anything.
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: smoke
+    runs-on: ubuntu-latest
+
+    env:
+      SMOKE_BASE_URL: ${{ inputs.vercel_url }}
+      # AN INPUT, NOT A SECRET, AND THAT IS A DECISION. It is a public hostname,
+      # not a credential — and GitHub masks secret values in logs, which would
+      # blank out the one URL a failing negative control needs to name. An
+      # unreadable failure on the assertion that makes the whole test
+      # non-vacuous is the worst possible place to save a hostname.
+      SMOKE_API_ORIGIN: ${{ inputs.render_url }}
+
+    steps:
+      # ====================== THE STEP-ZERO GUARD ============================
+      #
+      # Before checkout, before install, before anything. A smoke run that
+      # silently drops the negative control is the VACUOUS version of itself and
+      # it LOOKS GREEN — so a missing or malformed input has to stop the job
+      # here, where the message is the first thing in the log.
+      #
+      # The spec asserts this too (test 0), and the duplication is deliberate:
+      # this one fails in five seconds without installing a browser, and it
+      # fires even if the spec file is somehow not reached.
+      - name: Guard the inputs
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+
+          for pair in "vercel_url:$SMOKE_BASE_URL" "render_url:$SMOKE_API_ORIGIN"; do
+            name="${pair%%:*}"
+            url="${pair#*:}"
+
+            [ -n "$url" ] || fail "$name is empty. BOTH origins are required: the negative control needs render_url, and a run without it proves nothing while looking green."
+
+            case "$url" in
+              https://*) ;;
+              *) fail "$name must be https:// — a plain-HTTP origin cannot carry a Secure cookie, and Secure is the assertion that only a real deployment can settle. Got: $url" ;;
+            esac
+
+            # Allow "https://host" and "https://host/", reject any real path.
+            # A trailing path is the API_ORIGIN mistake ARCHITECTURE 16.A names:
+            # the spec appends /api/v1/..., so "https://host/api/v1" would
+            # produce /api/v1/api/v1/... and 404 everything.
+            rest="${url#https://}"
+            rest="${rest%/}"
+            case "$rest" in
+              */*) fail "$name must stop at the origin — no trailing path. Got: $url" ;;
+              "") fail "$name has no host. Got: $url" ;;
+            esac
+
+            echo "$name OK: $url"
+          done
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+
+      # No build, no database, no Redis, no migration: every target is remote.
+      # That is the whole reason this uses its own config with no `webServer`.
+      - name: Smoke
+        run: npm run test:smoke
+
+      - name: Upload smoke report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-report
+          path: apps/web/playwright-report/
+          retention-days: 30

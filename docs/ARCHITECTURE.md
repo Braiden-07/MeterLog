@@ -205,7 +205,7 @@ A caller with **no active workspace** is refused before any row here is consulte
 | `PATCH /maintenance-records/:id`          | ✓     | ✓          | 403     |
 | `DELETE /maintenance-records/:id` (soft)  | ✓     | ✓          | 403     |
 
-The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:193)](PROGRESS.md#L193)).
+The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:194)](PROGRESS.md#L194)).
 
 **The one cell that was genuinely open, and how it was resolved.** `POST /assets` could defensibly have been admin-only. It is **admin _and_ technician**: registering an asset is field work — the technician installing a meter is the person who knows its serial number, type and location, and routing that through an admin invents a bottleneck the product has no reason to have. The destructive act is **decommissioning**, and that is where the admin-only line is drawn: `DELETE /assets/:id` is admin-only.
 
@@ -239,7 +239,7 @@ The invariant that forces it: **every status an asset has ever held must have an
 | ------------ | ----- | ---------- | ------- |
 | `GET /audit` | ✓     | 403        | ✓       |
 
-Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:577)](DECISIONS.md#L577)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:656)](DECISIONS.md#L656)).
+Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:578)](DECISIONS.md#L578)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:657)](DECISIONS.md#L657)).
 
 ### 9.4 Routes exempt from the active-workspace requirement (G2, OPEN-18)
 
@@ -260,11 +260,11 @@ None of these reads tenant data — the two health routes read no application da
 
 ## 10. Audit logging
 
-Lives in DECISIONS: [ADR-009](DECISIONS.md#L430) capture · [ADR-010](DECISIONS.md#L478) integrity · [ADR-011](DECISIONS.md#L504) payload and redaction · [ADR-012](DECISIONS.md#L549) scope, RBAC and volume · [ADR-013](DECISIONS.md#L620) bootstrap rows · [ADR-014](DECISIONS.md#L646) read surface · [ADR-015](DECISIONS.md#L723) column naming.
+Lives in DECISIONS: [ADR-009](DECISIONS.md#L431) capture · [ADR-010](DECISIONS.md#L479) integrity · [ADR-011](DECISIONS.md#L505) payload and redaction · [ADR-012](DECISIONS.md#L550) scope, RBAC and volume · [ADR-013](DECISIONS.md#L621) bootstrap rows · [ADR-014](DECISIONS.md#L647) read surface · [ADR-015](DECISIONS.md#L724) column naming.
 
 ## 11. API conventions
 
-Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:732)](PROGRESS.md#L732)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:296)](PROGRESS.md#L296); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L646).
+Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:735)](PROGRESS.md#L735)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:297)](PROGRESS.md#L297); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L647).
 
 ## 12. Error handling & logging
 
@@ -274,17 +274,17 @@ Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http
 
 ## 13. Configuration & secrets
 
-Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L150) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127)); production secrets in the §16.1 checklist below.
+Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L151) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127)); production secrets in the §16.1 checklist below.
 
 ## 14. Local development
 
-Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L299); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
+Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L300); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
 
 ## 15. CI/CD
 
 CI: the rationale lives in the `ci.yml` comments — [`DO NOT RENAME THIS JOB` (ci.yml:19)](../.github/workflows/ci.yml#L19), [`Check doc citations` (ci.yml:101)](../.github/workflows/ci.yml#L101), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127).
 
-CD: **decided and not yet built.** Its shape is [ADR-019](DECISIONS.md#L954) — a `deploy` job on push to `main`, gated on `verify` and `e2e`, with migrations as a step ahead of the deploy and a smoke test behind it — and the deploy target is declared in [`render.yaml`](../render.yaml), which sets `autoDeploy: false` precisely so nothing ships before that job exists. The job itself is a later slice of `PROJECT_BRIEF` §11 step 10, deliberately sequenced after an author has watched one deploy by hand (§16.B).
+CD: **decided and not yet built.** Its shape is [ADR-019](DECISIONS.md#L955) — a `deploy` job on push to `main`, gated on `verify` and `e2e`, with migrations as a step ahead of the deploy and a smoke test behind it — and the deploy target is declared in [`render.yaml`](../render.yaml), which sets `autoDeploy: false` precisely so nothing ships before that job exists. The job itself is a later slice of `PROJECT_BRIEF` §11 step 10, deliberately sequenced after an author has watched one deploy by hand (§16.B).
 
 ## 16. Deployment topology
 
@@ -313,7 +313,16 @@ The cookie is `httpOnly`, `secure` in production, `SameSite=Lax`, and carries **
 
 **What breaks it, stated so it is recognisable in the wild:** a missing or runtime-only `API_ORIGIN` (every call fails at once); a `NEXT_PUBLIC_` copy, or an absolute base URL in the client (login appears to succeed and every call after it 401s — the silent one); `NODE_ENV` unset or spelled differently (no `Secure` flag); a `Domain=` added to the cookie (it stops being host-only); a trailing `/api/v1` on `API_ORIGIN` (404s everywhere).
 
-**And none of it is proven until it is deployed.** The acceptance gate is the deploy smoke test: a real login through the deployed Vercel origin sets the cookie, a subsequent API call through the same origin sends it, and the same cookie sent **directly** to Render is refused — the third assertion being what stops the first two passing for the wrong reason. That test is owed by a later slice of step 10. Until it has run, everything above is a design rather than a result.
+**And none of it is proven until it is deployed.** The acceptance gate is the deploy smoke test: a real login through the deployed Vercel origin sets the cookie, a subsequent API call through the same origin sends it, and the same cookie sent **directly** to Render is refused — the third assertion being what stops the first two passing for the wrong reason.
+
+**THE INSTRUMENT NOW EXISTS; THE VERDICT DOES NOT.** The smoke-test PR built it and ran it against nothing. Two things came out of that slice and the difference between them is the whole point:
+
+- **Proven on every pull request, by the cross-site rig** (`apps/web/cross-site/`, the `cross-site` CI job): the five document headers arriving on a live response, `HttpOnly` / `SameSite=Lax` / no `Domain`, the cookie surviving a round trip through the proxy, the API refusing that cookie when it is sent directly, and `/health/ready` answering. The rig drives the app through `web.test` and `api.test` — two genuinely different registrable domains — so the browser's same-site computation does real work, and **condition 2 above is now a permanent regression guard** rather than a claim.
+- **Never run against anything, and settled only by RUN-1**: **`Secure`** (the rig is HTTP by necessity), the **build-time `API_ORIGIN` bake on Vercel**, **real Vercel routing-layer proxying**, **`NODE_ENV=production` on Render**, and the production **`X-Forwarded-For`** hop count.
+
+So conditions 1, 3 and 4 remain designs. Condition 2 is a result. A green `cross-site` job means the instrument works and the direct-call regression is guarded — it does **not** mean the deployment is proven, and it must not be read that way.
+
+**One thing the smoke-test PR did settle, incidentally:** condition 1's bake had been reasoned and never tested. Serving a Next build made with the default `API_ORIGIN` while passing a different value at runtime still proxied to the baked host — the runtime value is ignored, exactly as this section claims.
 
 ### 16.B The author actions no pull request can perform
 
@@ -328,7 +337,9 @@ Deploy config in this repo declares; it does not act. The order matters: the las
 - [ ] **Add `e2e` to the `main` ruleset's required status checks.** It is required by nothing today — [`adding the job does NOT make it required` (ci.yml:182-183)](../.github/workflows/ci.yml#L182-L183) says so in the file — so a red e2e blocks no merge, and DoD :270 cannot honestly tick until it does.
 - [ ] Work §16.1's eleven boxes against the real database, and enable managed Postgres backups with the restore procedure written down (`PROJECT_BRIEF` §10).
 - [ ] **Run the first migration and the first deploy by hand, and watch them.** `20260908000000_auth_definer_functions` is the first migration that would have failed on Render.
-- [ ] Run the deploy smoke test against the live deployment by hand, **before** anything automates it. Its first result is the finding, whichever way it goes.
+- [ ] **RUN-1 — run the deploy smoke test against the live deployment by hand, before anything automates it.** It exists now and has never been pointed at a deployment. Actions → *deploy smoke* → Run workflow, with `vercel_url` and `render_url`; both are required and a malformed one stops the job in its first step, because a run that silently drops the negative control looks green and proves nothing. **Its first result is the finding, whichever way it goes** — this is the assertion that decides whether the same-origin proxy holds in production, and a red one is information rather than an incident.
+- [ ] **Do assertion 6's log-inspection step while you are there** (OPEN-16). The run sends a forged `X-Forwarded-For` and prints what to look for; open the Render request log, find it, and record which of the three outcomes held. Until then the production hop count is unmeasured.
+- [ ] **Note the residue.** Every smoke run registers an organisation through the live API and leaves it there permanently — v1.0 has no hard delete (ADR-008). They are greppable: `smoke-` prefix, `@smoke.invalid` address.
 - [ ] **Create the Sentry projects and set the two DSNs** — `SENTRY_DSN` on Render and in the Vercel server environment, `NEXT_PUBLIC_SENTRY_DSN` on Vercel. Both are optional to the code: absent, error reporting is simply off and the API says so at boot.
 - [ ] **Point the uptime monitor at `/api/v1/health/ready`, not at `/api/v1/health`.** The liveness route answers `ok` while Postgres is unreachable — that is what makes it a safe deploy gate and a useless monitor. Readiness answers 503 when a dependency is down, which is the status code an alert can fire on.
 - [ ] **Create the mass-spray ALERT RULE.** The aggregate failure counter ships with this build; nothing alerts on it. The rule is a platform artifact — a threshold on the `login.failure` event's `windowFailures`, or on the Redis key directly — and until it exists the signal is recorded and unwatched. **This is the difference between a signal and a detection**, and the docs say which one is built.
