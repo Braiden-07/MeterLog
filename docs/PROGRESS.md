@@ -7,7 +7,8 @@
 
 - **Current state:** backend feature-complete for v1.0; e2e journeys green; **deploy CONFIGURED but not performed** — the frontend's domain pages and the deploy itself are outstanding
 - **`PROJECT_BRIEF` §11 step 10 (deploy + observability) is UNDERWAY.** The **deploy-config PR** is merged: the env surface is repaired (`API_ORIGIN` documented with its build-time trap, the dead `NEXT_PUBLIC_API_URL` deleted), [`render.yaml`](../render.yaml) declares the Render side with `autoDeploy: false`, the public exposure of `/api/v1/docs` is decided and pinned by a test, and **ADR-019** records the CD shape. **It deploys nothing and ticks no DoD box.** Remaining in the slice: observability (Sentry, structured logs, the mass-spray aggregate signal), the deploy smoke test, the author's platform actions ([`ARCHITECTURE.md` §16.B](ARCHITECTURE.md)), and the CD job itself. **Step 10 is not v1.0** — the close-out entry at the foot of this file says which boxes stay open and why.
-- **The observability PR is merged too.** pino structured logs, Sentry in both apps under four mandatory conditions (ADR-020), `/api/v1/health/ready`, and the mass-spray aggregate **counter**. **The load-bearing finding: `@sentry/nextjs` would have leaked the invite token out of the URL fragment** — and the `history.replaceState` that CLEARS the fragment emits a breadcrumb carrying the pre-clear URL, so the containment mechanism was the leak vector. Both hooks strip it, with negatives. **The alert rule is NOT built** — the counter is a signal, the alert is a platform artifact on §16.B's checklist. Still no DoD box ticked. Remaining in step 10: the deploy smoke test, the author's platform actions, and the CD job.
+- **The observability PR is merged too.** pino structured logs, Sentry in both apps under four mandatory conditions (ADR-020), `/api/v1/health/ready`, and the mass-spray aggregate **counter**. **The load-bearing finding: `@sentry/nextjs` would have leaked the invite token out of the URL fragment** — and the `history.replaceState` that CLEARS the fragment emits a breadcrumb carrying the pre-clear URL, so the containment mechanism was the leak vector. Both hooks strip it, with negatives. **The alert rule is NOT built** — the counter is a signal, the alert is a platform artifact on §16.B's checklist. Still no DoD box ticked.
+- **The smoke-test PR is merged — the INSTRUMENT, not a verdict.** A cross-site rig (`web.test` / `api.test`, two genuinely different registrable domains) runs on every PR as the `cross-site` job and makes §16.A condition 2 a permanent regression guard; the deploy smoke test itself is `workflow_dispatch`-only with a step-zero input guard, and has never been pointed at a deployment. **`Secure`, the build-time `API_ORIGIN` bake, real Vercel proxying, `NODE_ENV` on Render and the production XFF hop count have still never run against anything** — RUN-1 settles them. **OPEN-25** enrolls the `packages/shared` unbuilt-TS trap. Remaining in step 10: the author's platform actions, RUN-1, and the CD job.
 - **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy), 5 (RBAC + membership management) and 6 (domain entities) **complete and merged**. **Step 7 (audit module) COMPLETE — 7a (capture, merged as PR #15) and 7b (the read surface) — so `audit_log`, the brief's fifth and final table, is built, captured, immutable by grant and readable by admin/auditor.** The v1.0 schema is complete at **eight core tables**, plus `invite_tokens` as an implementation table (§5). **The OPEN-7 slice is COMPLETE AND MERGED** — invited users can set a password and log in (PR #19, `39eb741`), and `login_lookup`'s result signature is pinned (PR #20, `07bee36`). OPEN-4, OPEN-6 and OPEN-7 **DONE**; OPEN-9 (hard delete) remains deferred and its audit gate is now satisfied; OPEN-10, OPEN-11 and OPEN-12 enrolled at the post-step-8 reconciliation.
 - **The admin user-management slice is COMPLETE — backend (ADR-018) and UI both merged.** The pending split (OPEN-14) and G1 (OPEN-13) are **DONE**: `GET /users/pending` is a safe metadata read, minting is an explicit `POST /users/pending/:membershipId/token`, and the member list is scoped to the active workspace. The definer surface is **nine** functions. The UI adds the members table (two reads merged by set-difference on `membershipId`), the invite form, and the show-once mint — with the minted token held in one `useState` and in no cache, and `FORBIDDEN_ROLE` correcting identity rather than resetting. OPEN-14's producer-side `#token=` acceptance is **satisfied** by `invite-link.spec.ts`.
 - **Next: the remainder of the FRONTEND slice (`PROJECT_BRIEF` §11 step 8)** — auth pages, asset list and detail, record reading / maintenance, the audit view, admin user management. Slice 1 (auth, workspace switcher, tenant-keyed cache) is merged as PR #25. Take the tenant-isolation parts first: ADR-006 §9 already scopes the workspace switcher and requires the TanStack Query cache to be keyed by active `tenant_id` (or reset on switch), because RLS protects the database and the browser cache does not know tenants exist.
@@ -1317,3 +1318,72 @@ ADR-020's index row displaced the usual ADR anchors; the §17 rewrite and the §
 `:271` (Sentry + uptime + `/health` live) now has its **code** half and waits on the author's platform actions — Sentry projects, the two DSNs, and pointing the uptime monitor at `/health/ready` rather than `/health`. `:270` waits on the CD job and on `e2e` becoming a required context. `:267` (frontend journeys) and `:269` (coverage, still never measured) stay open into v1.0.
 
 **Step 10 is not v1.0.** Residuals carried in honestly and unchanged by this PR: **OPEN-22**, **OPEN-24**, OPEN-21's nonce-CSP half (now with a forward-marker saying the tunnel means it needs no ingest allowance), OPEN-9, OPEN-10, OPEN-11, OPEN-23.
+
+---
+
+## `PROJECT_BRIEF` §11 step 10 — the smoke-test PR (the instrument, built before the deploy)
+
+**This PR builds the thing that will judge the deployment. It does not run it against one.** No app code changed. Nothing is ticked. RUN-1 renders the verdict; PR-3 only hands over the instrument.
+
+### The structure split, and it was forced by a finding
+
+`webServer` in `playwright.config.ts` is **top-level, and Playwright has no per-project `webServer`**. So the two halves of this slice cannot live in one config:
+
+- **The cross-site rig is a second PROJECT** in the existing config — correct, because it *needs* both local servers, just reached under different hostnames.
+- **The smoke test is a SEPARATE config** (`playwright.smoke.config.ts`, `testDir ./smoke`, no `webServer`). As a project it would boot the API, `next start`, Postgres and Redis in order to make HTTP calls to a machine on the internet. It also overrides `retries: 0` (the main config retries twice in CI, and a retry here re-runs a registration and a login against **production**) and `fullyParallel: false` (assertion 3 consumes the jar assertion 2 filled).
+
+### The rig needs its own build, and finding that out settled an older claim
+
+`rewrites()` is baked into `.next/routes-manifest.json` at `next build`; a runtime `API_ORIGIN` is **ignored**. Measured rather than assumed: a build made with the default, served while passing `API_ORIGIN=http://127.0.0.1:3999`, still proxied to `:3001`.
+
+Two consequences. The rig gets **its own CI job** (`cross-site`) rather than a second step in `e2e`, because one `.next` directory holds one bake and giving `e2e` a different one would silently change what the required gate exercises. And **`ARCHITECTURE.md` §16.A's first condition — the build-time bake — had been reasoned and never tested; it now has a measurement behind it.** The job also greps the manifest after building and fails if the destination is not the cross-site host, because "the bake silently didn't take" is the one way that job could pass while testing the same-site topology `e2e` already covers.
+
+### The aliases are the mechanism, and the obvious tidy-up destroys them
+
+`web.test` and `api.test`, each its **own registrable domain** under a reserved TLD. Grouping them as `web.meterlog.test` / `api.meterlog.test` would give both an eTLD+1 of `meterlog.test`, make them the **same site**, and turn every assertion in the rig into a tautology that passes proving nothing.
+
+That is precisely the change someone makes for readability, so the constraint and its reason are written in **three** places: the config's `projects` block, the spec header, and the CI job that adds the aliases. It is the kind of defect this repo keeps recording — not a wrong answer, a check that quietly stops checking.
+
+**The rig skips itself locally and fails in CI.** A developer without hosts entries gets a named skip telling them what to add; CI always adds the aliases, so an unreachable proxy there is a regression and the run goes red. A skip that could hide a regression where it matters would be the wrong trade — this one cannot, because CI never takes it.
+
+### What the rig proves, on every pull request, forever
+
+Assertions 1, 2 (minus `Secure`), 3, 4 and 5 across a real site boundary. The one that earns its place is **4, the negative control**: the same cookie jar aimed directly at the API on the other registrable domain must get a **401**. That makes assertion 3 non-vacuous, and it is the permanent guard for §16.A condition 2 — if anyone ever gives the browser an absolute API origin, `credentials: 'same-origin'` means the cookie stops being sent and the run 401s loudly, here, rather than on a deploy.
+
+**`Secure` cannot run here**, and not for want of trying: the rig is HTTP, a `Secure` cookie is never sent over HTTP, and forcing `NODE_ENV=production` to make the flag appear would mean the cookie is never sent at all — the exact trap `ci.yml` already documents for the `e2e` job.
+
+### The smoke workflow
+
+`.github/workflows/smoke.yml`, **`workflow_dispatch` only** — never on push, never on pull_request, never a required context. Three independent reasons, all recorded in the file; the blunt one is that **the first run is expected to possibly fail and that failure is the finding**, and wiring an acceptance gate to a deploy turns a finding into an incident.
+
+**The step-zero guard runs before checkout.** Both inputs required; empty, non-`https`, or carrying a trailing path stops the job in five seconds with a message naming the problem. A smoke run that silently drops the negative control is the vacuous version of itself **and it looks green**, so that case is made impossible rather than documented. The spec asserts the same thing again in test 0 — deliberate duplication, because the shell guard fires even if the spec is never reached.
+
+`render_url` is an **input, not a secret**: it is a public hostname, and GitHub masks secret values in logs, which would blank out the one URL a failing negative control needs to name.
+
+### Assertion 6 is not a green assertion, and that is the honest shape
+
+OPEN-16's record correction rests on a probe of **Next's own rewrite**, in `next dev` and local `next start`. On Vercel the rewrite is the platform's routing layer — not the thing that was probed — and it may add its own `x-forwarded-for`. Nothing in the API reports the header back, and the only way to make it do so is an endpoint that echoes request headers: an unauthenticated information leak, **refused rather than deferred**.
+
+So assertion 6 sends a forged value on a deliberately failed login and **prints where to look and what the three possible answers mean**. `pino-http` logs request headers and ADR-020's redact list drops only `cookie` and `authorization`, so the forged value lands in the Render log intact. Reading it is the author's step, now on §16.B's checklist, and OPEN-16 says so in its own row.
+
+### The seeded account, and a cost stated rather than buried
+
+Step 0 registers a unique organisation through the **live** API — the same shape the e2e fixtures use, and for the reason they give: a row inserted behind the API's back would be the one thing in the test that had never met RLS, the interceptor or a DTO. It also makes the setup itself an assertion that registration works in production, and keeps a long-lived production password out of CI secrets.
+
+**Every smoke run, RUN-1 included, leaves one tenant and one user in the production database permanently.** v1.0 has no hard delete (ADR-008), so they cannot be removed even in principle. The mitigation is legibility, not cleanup: identities carry a `smoke-` prefix and an `@smoke.invalid` address — a reserved TLD that can never resolve, so no mail can ever reach one — and the run prints what it created. It is stated in the spec header, the workflow header, §16.B and here.
+
+### Honesty, in three places
+
+The spec header, the PR body and `ARCHITECTURE.md` §16.A all carry the same line: **PR-3's green means the instrument works and the direct-call regression is guarded in CI. It does not mean the deployed posture is proven.** §16.A now separates its four conditions into "condition 2 is a result" and "conditions 1, 3 and 4 remain designs", and lists by name what has never run against anything: `Secure`, the build-time bake, real Vercel proxying, `NODE_ENV` on Render, and the production XFF hop count.
+
+### One bug this PR caught in itself
+
+Running the rig locally against a resolvable stand-in — rather than trusting it to work in CI — failed on assertion 3: `/auth/me` returns `{ user, activeWorkspace, workspaces }` and both specs asserted a flat `email`. A wrong-shape assertion on a 200 is the sort that passes the day someone changes the payload; the smoke test carried the identical error and was fixed with it.
+
+### OPEN-25, enrolled
+
+The `packages/shared` finding from the observability PR lived only in ADR-020's body, where nobody asking "what does this build still owe?" would find it. It is now a register row: the package publishes unbuilt TypeScript, so any `apps/api` runtime import **passes `tsc` and `nest build` and dies at `require`** — green build, dead container, observable only on a deploy. Harmless on one condition that is currently true and is the thing to watch: nothing in `apps/api/src` imports it.
+
+### Still nothing ticked
+
+`:270` waits on the CD job and on `e2e` becoming a required context. `:271` has its code half and waits on the platform actions. `:267` and `:269` stay open into v1.0. **Step 10 is not v1.0**, and the smoke test's verdict is RUN-1's to deliver, not this PR's.
