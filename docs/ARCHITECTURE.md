@@ -205,7 +205,7 @@ A caller with **no active workspace** is refused before any row here is consulte
 | `PATCH /maintenance-records/:id`          | ✓     | ✓          | 403     |
 | `DELETE /maintenance-records/:id` (soft)  | ✓     | ✓          | 403     |
 
-The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:192)](PROGRESS.md#L192)).
+The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:193)](PROGRESS.md#L193)).
 
 **The one cell that was genuinely open, and how it was resolved.** `POST /assets` could defensibly have been admin-only. It is **admin _and_ technician**: registering an asset is field work — the technician installing a meter is the person who knows its serial number, type and location, and routing that through an admin invents a bottleneck the product has no reason to have. The destructive act is **decommissioning**, and that is where the admin-only line is drawn: `DELETE /assets/:id` is admin-only.
 
@@ -239,7 +239,7 @@ The invariant that forces it: **every status an asset has ever held must have an
 | ------------ | ----- | ---------- | ------- |
 | `GET /audit` | ✓     | 403        | ✓       |
 
-Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:576)](DECISIONS.md#L576)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:655)](DECISIONS.md#L655)).
+Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:577)](DECISIONS.md#L577)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:656)](DECISIONS.md#L656)).
 
 ### 9.4 Routes exempt from the active-workspace requirement (G2, OPEN-18)
 
@@ -254,34 +254,37 @@ The interceptor is default-deny, so this is the list that is written down and ev
 | `GET /auth/me`            | yes              |
 | `POST /auth/logout`       | no               |
 | `GET /health`             | no               |
+| `GET /health/ready`       | no               |
 
-None of these reads tenant data, and three of them are how a caller without a workspace gets one: `GET /auth/me` lists workspaces, `POST /auth/switch` selects one, `POST /auth/logout` leaves.
+None of these reads tenant data — the two health routes read no application data at all — and three of them are how a caller without a workspace gets one: `GET /auth/me` lists workspaces, `POST /auth/switch` selects one, `POST /auth/logout` leaves.
 
 ## 10. Audit logging
 
-Lives in DECISIONS: [ADR-009](DECISIONS.md#L429) capture · [ADR-010](DECISIONS.md#L477) integrity · [ADR-011](DECISIONS.md#L503) payload and redaction · [ADR-012](DECISIONS.md#L548) scope, RBAC and volume · [ADR-013](DECISIONS.md#L619) bootstrap rows · [ADR-014](DECISIONS.md#L645) read surface · [ADR-015](DECISIONS.md#L722) column naming.
+Lives in DECISIONS: [ADR-009](DECISIONS.md#L430) capture · [ADR-010](DECISIONS.md#L478) integrity · [ADR-011](DECISIONS.md#L504) payload and redaction · [ADR-012](DECISIONS.md#L549) scope, RBAC and volume · [ADR-013](DECISIONS.md#L620) bootstrap rows · [ADR-014](DECISIONS.md#L646) read surface · [ADR-015](DECISIONS.md#L723) column naming.
 
 ## 11. API conventions
 
-Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:732)](PROGRESS.md#L732)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:295)](PROGRESS.md#L295); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L645).
+Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:732)](PROGRESS.md#L732)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:296)](PROGRESS.md#L296); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L646).
 
 ## 12. Error handling & logging
 
-Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14) — see §11. **One exception, by construction:** the login rate limiter runs in Express, upstream of Nest, so the filter never sees its **429** and the middleware writes the `RATE_LIMITED` envelope itself (plus `Retry-After`). `codeFor()` carries a `TOO_MANY_REQUESTS` case regardless, so a 429 raised from inside Nest cannot ship under the default `ERROR` code. Logging: not yet built — PROJECT_BRIEF §11 step 10; [`nestjs-pino` (package.json:31)](../apps/api/package.json#L31) is installed and has no use in `apps/api/src`.
+Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14) — see §11. **One exception, by construction:** the login rate limiter runs in Express, upstream of Nest, so the filter never sees its **429** and the middleware writes the `RATE_LIMITED` envelope itself (plus `Retry-After`). `codeFor()` carries a `TOO_MANY_REQUESTS` case regardless, so a 429 raised from inside Nest cannot ship under the default `ERROR` code. Logging: **built at the observability PR** (`PROJECT_BRIEF` §11 step 10) — see §17.
+
+**The limiter is the one exception, and it is the same exception twice.** `nestjs-pino` registers its request logger as Nest MODULE middleware, applied during `app.init()`; the rate limiter is Express middleware mounted by `configureApp` BEFORE `init()`. So when the limiter short-circuits a 429, `pino-http` never runs and there is no request log line for it — exactly as the exception filter never sees that 429. The limiter therefore writes its own structured line beside its own envelope. Moving `pino-http` ahead of helmet would catch both and would put logging inside the request-pipeline floor the acceptance specs pin, which is the trade that was refused.
 
 ## 13. Configuration & secrets
 
-Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L149) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127)); production secrets in the §16.1 checklist below.
+Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L150) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127)); production secrets in the §16.1 checklist below.
 
 ## 14. Local development
 
-Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L298); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
+Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L299); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
 
 ## 15. CI/CD
 
 CI: the rationale lives in the `ci.yml` comments — [`DO NOT RENAME THIS JOB` (ci.yml:19)](../.github/workflows/ci.yml#L19), [`Check doc citations` (ci.yml:101)](../.github/workflows/ci.yml#L101), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127).
 
-CD: **decided and not yet built.** Its shape is [ADR-019](DECISIONS.md#L953) — a `deploy` job on push to `main`, gated on `verify` and `e2e`, with migrations as a step ahead of the deploy and a smoke test behind it — and the deploy target is declared in [`render.yaml`](../render.yaml), which sets `autoDeploy: false` precisely so nothing ships before that job exists. The job itself is a later slice of `PROJECT_BRIEF` §11 step 10, deliberately sequenced after an author has watched one deploy by hand (§16.B).
+CD: **decided and not yet built.** Its shape is [ADR-019](DECISIONS.md#L954) — a `deploy` job on push to `main`, gated on `verify` and `e2e`, with migrations as a step ahead of the deploy and a smoke test behind it — and the deploy target is declared in [`render.yaml`](../render.yaml), which sets `autoDeploy: false` precisely so nothing ships before that job exists. The job itself is a later slice of `PROJECT_BRIEF` §11 step 10, deliberately sequenced after an author has watched one deploy by hand (§16.B).
 
 ## 16. Deployment topology
 
@@ -303,7 +306,7 @@ CD: **decided and not yet built.** Its shape is [ADR-019](DECISIONS.md#L953) —
 
 The cookie is `httpOnly`, `secure` in production, `SameSite=Lax`, and carries **no `Domain`** ([`cookieOptions` (auth.controller.ts:16-31)](../apps/api/src/auth/auth.controller.ts#L16-L31)). It is first-party on the Vercel origin because the browser only ever talks to that origin — which is a property of **configuration, not of code**, and every way of getting it wrong fails silently, in production, on a path no local run reaches. Both apps run on `localhost` in dev and in CI, where differing ports do not change the site, so the cookie is same-site there no matter what is misconfigured: a green E2E run is not evidence about any of this, and `ISOLATION.md` §9 says so where it records what the build does not prove.
 
-1. **`API_ORIGIN` is set on Vercel at BUILD time, not only at runtime.** `rewrites()` is evaluated when Next loads its config, and `next build` bakes the result into the routing manifest — so a runtime-only value ships the localhost fallback in [`API_ORIGIN` (next.config.mjs:9)](../apps/web/next.config.mjs#L9) instead, and every API call in production reaches for an origin that is not there. It must also be plain rather than `NEXT_PUBLIC_`, carry `https://`, and stop at the origin, because the rewrite appends `/api/:path*` itself. The four rules, each with the failure it prevents, sit on the variable itself in [`.env.example`](../.env.example#L34).
+1. **`API_ORIGIN` is set on Vercel at BUILD time, not only at runtime.** `rewrites()` is evaluated when Next loads its config, and `next build` bakes the result into the routing manifest — so a runtime-only value ships the localhost fallback in [`API_ORIGIN` (next.config.mjs:17)](../apps/web/next.config.mjs#L17) instead, and every API call in production reaches for an origin that is not there. It must also be plain rather than `NEXT_PUBLIC_`, carry `https://`, and stop at the origin, because the rewrite appends `/api/:path*` itself. The four rules, each with the failure it prevents, sit on the variable itself in [`.env.example`](../.env.example#L34).
 2. **Nothing in the browser addresses Render.** Held by construction today: [`API_BASE`](../apps/web/lib/api.ts#L11) is relative, and the client pins [`credentials: 'same-origin'`](../apps/web/lib/api.ts#L153). That pin is a floor rather than a style choice — if an absolute API origin were ever introduced, the cookie would not be sent **at all** rather than sent cross-site, so the failure is a visible 401 loop instead of a quietly weakened posture.
 3. **`NODE_ENV` is literally `production` on Render**, or [`secure`](../apps/api/src/auth/auth.controller.ts#L26) evaluates false and the flag never appears. §16.1's check (c) is how that is confirmed, and it is **unverifiable by CI by construction**, because the tests run over plain HTTP.
 4. **Render terminates HTTPS on the origin `API_ORIGIN` names**, so the `Secure` cookie survives the Vercel→Render hop.
@@ -326,6 +329,9 @@ Deploy config in this repo declares; it does not act. The order matters: the las
 - [ ] Work §16.1's eleven boxes against the real database, and enable managed Postgres backups with the restore procedure written down (`PROJECT_BRIEF` §10).
 - [ ] **Run the first migration and the first deploy by hand, and watch them.** `20260908000000_auth_definer_functions` is the first migration that would have failed on Render.
 - [ ] Run the deploy smoke test against the live deployment by hand, **before** anything automates it. Its first result is the finding, whichever way it goes.
+- [ ] **Create the Sentry projects and set the two DSNs** — `SENTRY_DSN` on Render and in the Vercel server environment, `NEXT_PUBLIC_SENTRY_DSN` on Vercel. Both are optional to the code: absent, error reporting is simply off and the API says so at boot.
+- [ ] **Point the uptime monitor at `/api/v1/health/ready`, not at `/api/v1/health`.** The liveness route answers `ok` while Postgres is unreachable — that is what makes it a safe deploy gate and a useless monitor. Readiness answers 503 when a dependency is down, which is the status code an alert can fire on.
+- [ ] **Create the mass-spray ALERT RULE.** The aggregate failure counter ships with this build; nothing alerts on it. The rule is a platform artifact — a threshold on the `login.failure` event's `windowFailures`, or on the Redis key directly — and until it exists the signal is recorded and unwatched. **This is the difference between a signal and a detection**, and the docs say which one is built.
 - [ ] Only then enable the automated path (ADR-019), and write down the platform-native rollback steps (`PROJECT_BRIEF` §9).
 
 ### 16.1 Pre-deploy checklist — Render (read before the first migration runs there)
@@ -387,6 +393,30 @@ curl -is https://<host>/api/v1/auth/login -H 'content-type: application/json'   
 
 ## 17. Observability
 
-Not yet built — PROJECT_BRIEF §11 step 10 (Sentry and uptime monitoring; structured logging is §12).
+Built at the observability PR (`PROJECT_BRIEF` §11 step 10). Four things ship; the rest is enrolled, and §17.1 says which is which because the difference is the whole point.
+
+**Structured logs — pino.** `LoggerModule.forRoot` in `AppModule`, `app.useLogger` in `main.ts`. It is registered as a module, so its middleware is applied during `app.init()` — after everything `configureApp` mounts — and the request-pipeline floor is untouched. Level comes from `LOG_LEVEL`, defaulting to `info` in production and `debug` locally, and is forced to `silent` under `NODE_ENV=test`: `LoggerModule` is in `AppModule` and every acceptance spec builds its app from `AppModule`, so without that the suite would bury its own assertions. `/api/v1/health*` is excluded from request logging, because a monitor polls forever and those lines carry nothing.
+
+**Error reporting — Sentry, per app.** `@sentry/nestjs` in the API, `@sentry/nextjs` in the web app. Both are **off without a DSN**, which is the local and CI default: a test run must not depend on an external service. The API captures inside the existing [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14) rather than installing `SentryGlobalFilter`, which would contest ownership of the asserted error envelope, and it reports **5xx only** — every 4xx here is a designed refusal with a test behind it, and a dashboard where the signal is one percent of the volume is one nobody reads.
+
+**Readiness — `/api/v1/health/ready`.** A second route; §16.1's deploy gate is unchanged. See §9.4 for its exemption and the §17 note below for what it does and does not expose.
+
+**The mass-spray signal.** A coarse time-bucketed counter of login failures across all addresses, incremented in `recordFailure` — the one place a failure is charged — and emitted on the stable `login.failure` event. The per-email counters cannot answer this question: they are `sha256(email)` under one key each, so summing them means enumerating a keyspace the hashing exists to keep unenumerable.
+
+### 17.1 What is a SIGNAL and what is a DETECTION
+
+**The counter ships. The alert does not.** Nothing in this repository reads the aggregate to make a decision, and nothing pages anyone. An alert RULE is a platform artifact — a threshold, a notification channel, an on-call rotation — and it lives outside the repo; it is owed on §16.B's checklist. Until it exists, a spray increments a number that nobody is watching.
+
+This is stated at the top of the section rather than buried, because "we have mass-spray detection" is exactly the claim this build would be entitled to make and should not: the useful response to a spray is *page someone*, and nothing here pages anyone yet. `LoginRateLimitService` refused a global rate limit on the grounds that detection was the right answer; shipping half of that and calling it done would be the same error in the other direction.
+
+### 17.2 The credential channels this section opened
+
+Logging and error reporting are two new ways for a credential to leave the process, and both are constrained by the same list — `CREDENTIAL_BODY_ROUTES` and `REDACTED_HEADERS` in [`redaction.ts`](../apps/api/src/common/observability/redaction.ts) — imported by pino's `redact` and by Sentry's `beforeSend` so the two cannot drift. ADR-011's rule governs all of it: redaction is enforced by the mechanism, not documented. ADR-020 records the four conditions and their negatives.
+
+**The sharpest of the four is browser-side and was nearly missed.** The invite token lives in a URL fragment, which §9 of `ISOLATION.md` records as a containment boundary — a fragment never reaches a server. But `window.location` *does* carry it, and a browser error reporter is the first thing in this build that reads `window.location` and ships it onward. Worse, `set-password/page.tsx` clears the fragment with `history.replaceState`, and that call generates a navigation breadcrumb whose `from` is the pre-clear URL — so the containment mechanism becomes the leak vector, and the leak outlives the window it was closing. Both hooks strip it, and both are asserted.
+
+### 17.3 Not built, and enrolled
+
+Distributed tracing (`tracesSampleRate` is `0`, deliberately — this is an error reporter for v1.0, not an APM), a metrics endpoint, log aggregation and retention, and the alert rules themselves. Source-map upload is configured but inert without an auth token the author supplies (§16.B).
 
 ## 18. Known limitations

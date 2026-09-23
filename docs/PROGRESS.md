@@ -7,6 +7,7 @@
 
 - **Current state:** backend feature-complete for v1.0; e2e journeys green; **deploy CONFIGURED but not performed** — the frontend's domain pages and the deploy itself are outstanding
 - **`PROJECT_BRIEF` §11 step 10 (deploy + observability) is UNDERWAY.** The **deploy-config PR** is merged: the env surface is repaired (`API_ORIGIN` documented with its build-time trap, the dead `NEXT_PUBLIC_API_URL` deleted), [`render.yaml`](../render.yaml) declares the Render side with `autoDeploy: false`, the public exposure of `/api/v1/docs` is decided and pinned by a test, and **ADR-019** records the CD shape. **It deploys nothing and ticks no DoD box.** Remaining in the slice: observability (Sentry, structured logs, the mass-spray aggregate signal), the deploy smoke test, the author's platform actions ([`ARCHITECTURE.md` §16.B](ARCHITECTURE.md)), and the CD job itself. **Step 10 is not v1.0** — the close-out entry at the foot of this file says which boxes stay open and why.
+- **The observability PR is merged too.** pino structured logs, Sentry in both apps under four mandatory conditions (ADR-020), `/api/v1/health/ready`, and the mass-spray aggregate **counter**. **The load-bearing finding: `@sentry/nextjs` would have leaked the invite token out of the URL fragment** — and the `history.replaceState` that CLEARS the fragment emits a breadcrumb carrying the pre-clear URL, so the containment mechanism was the leak vector. Both hooks strip it, with negatives. **The alert rule is NOT built** — the counter is a signal, the alert is a platform artifact on §16.B's checklist. Still no DoD box ticked. Remaining in step 10: the deploy smoke test, the author's platform actions, and the CD job.
 - **Build-order step (PROJECT_BRIEF §11):** 4 (auth + tenancy), 5 (RBAC + membership management) and 6 (domain entities) **complete and merged**. **Step 7 (audit module) COMPLETE — 7a (capture, merged as PR #15) and 7b (the read surface) — so `audit_log`, the brief's fifth and final table, is built, captured, immutable by grant and readable by admin/auditor.** The v1.0 schema is complete at **eight core tables**, plus `invite_tokens` as an implementation table (§5). **The OPEN-7 slice is COMPLETE AND MERGED** — invited users can set a password and log in (PR #19, `39eb741`), and `login_lookup`'s result signature is pinned (PR #20, `07bee36`). OPEN-4, OPEN-6 and OPEN-7 **DONE**; OPEN-9 (hard delete) remains deferred and its audit gate is now satisfied; OPEN-10, OPEN-11 and OPEN-12 enrolled at the post-step-8 reconciliation.
 - **The admin user-management slice is COMPLETE — backend (ADR-018) and UI both merged.** The pending split (OPEN-14) and G1 (OPEN-13) are **DONE**: `GET /users/pending` is a safe metadata read, minting is an explicit `POST /users/pending/:membershipId/token`, and the member list is scoped to the active workspace. The definer surface is **nine** functions. The UI adds the members table (two reads merged by set-difference on `membershipId`), the invite form, and the show-once mint — with the minted token held in one `useState` and in no cache, and `FORBIDDEN_ROLE` correcting identity rather than resetting. OPEN-14's producer-side `#token=` acceptance is **satisfied** by `invite-link.spec.ts`.
 - **Next: the remainder of the FRONTEND slice (`PROJECT_BRIEF` §11 step 8)** — auth pages, asset list and detail, record reading / maintenance, the audit view, admin user management. Slice 1 (auth, workspace switcher, tenant-keyed cache) is merged as PR #25. Take the tenant-isolation parts first: ADR-006 §9 already scopes the workspace switcher and requires the TanStack Query cache to be keyed by active `tenant_id` (or reset on switch), because RLS protects the database and the browser cache does not know tenants exist.
@@ -1250,3 +1251,69 @@ Citations: **212 → 223** (106 content-checked, 141 label-checked). Green on an
 **Step 10 is not v1.0.** v1.0 = step 10 + the frontend completion + a coverage measurement + step-11 documentation. Known residuals carried in honestly: **OPEN-22** (the cross-tab broadcast subscriber can never fire — stale display, not a leak, with a `test.fail()` that reds the build when it is fixed), **OPEN-24** (four citations no content rule can reach), **OPEN-21**'s nonce-CSP half, plus OPEN-9, OPEN-10, OPEN-11 and OPEN-23.
 
 **OPEN-21's HSTS half is reached and deliberately not paid.** Its Due was step 10 and step 10 has arrived, so the row is answered rather than left looking overlooked — but it was always owed at step 10 **with the custom domain**, and this slice provisions no domain. Under `*.vercel.app`, `includeSubDomains` would be a claim about a parent that is not ours to make, whose blast radius is other people's subdomains; `preload` compounds it by being slow to undo. Both stay off, conditionally owed to whichever change cuts a custom domain over — in that same change, not in a later tidy-up.
+
+---
+
+## `PROJECT_BRIEF` §11 step 10 — the observability PR (and it is still NOT v1.0)
+
+**What shipped:** pino structured logs, Sentry in both apps under four mandatory conditions, `/api/v1/health/ready`, and the mass-spray aggregate **counter**. **What did not, deliberately:** the alert rule, tracing, a metrics endpoint, log aggregation. **No Definition-of-Done box is ticked** — `:271` needs Sentry, uptime and `/health` *live*, which needs the author's platform actions.
+
+### The finding: Sentry would have leaked the invite token, and the containment mechanism was the leak vector
+
+The invite token travels in a URL **fragment** — `/set-password#token=…` — and `ISOLATION.md` §9 records that as a deliberate containment boundary: a fragment never reaches a server, so the credential stays out of access logs, out of `Referer`, out of proxy history. The server stores only its SHA-256, so the link holds the one plaintext copy in existence.
+
+**`window.location` carries the fragment, and a browser error reporter is the first thing this build has ever had that reads `window.location` and ships it to a third party.** Installing `@sentry/nextjs` with default settings would have taken a live credential out of the one channel that was carefully kept clean and put it into a store with a different audience and a longer retention.
+
+**And the sharper half is the one that would have been missed.** `set-password/page.tsx` clears the fragment in a `useEffect` with `history.replaceState`, so the address bar is only dirty between hydration and that effect — a narrow window, and an `event.request.url` leak needs an error inside it. But **the `replaceState` call itself emits a navigation breadcrumb whose `from` is the pre-clear URL**, and breadcrumbs are retained and attached to the *next* event, minutes later, long after the bar looks clean. The act of containing the credential is what emits it, and the emission outlives the window it was closing. So `beforeBreadcrumb` is not the junior partner of `beforeSend` here; it is the one that matters.
+
+`minted-token-containment.spec.ts` named this before it existed, in a clause written about `console.*`: it "puts a credential in the browser log, **and in whatever ships browser logs onward**". This PR is the "whatever", and `lib/sentry-scrub.spec.ts` is its negative — a fixture URL with `#token=` must be absent from the returned event **and** from a `replaceState` breadcrumb.
+
+### Two conditions changed shape on contact with the SDK
+
+**`sendDefaultPii: false` does not exist in Sentry v11.** It is gone from the options type, so setting it neither typechecks nor takes effect. Rather than pin the SDK a major version back for one boolean, condition (a) is met by **enforcement**: `beforeSend` deletes the headers by name, deletes `user.ip_address` and `server_name`, and reduces URLs to their path — all asserted. That is the stronger position and it is ADR-011's rule again: a flag's meaning belongs to the SDK version, while a scrubber belongs to this repository. The version change is what proved the flag was the weaker plan.
+
+**`withSentryConfig` is not on the package root in v11** — it lives at `@sentry/nextjs/config`, and importing it from the root yields `undefined` and fails at config-load time. Caught immediately by `security-headers.spec.ts`, which loads `next.config.mjs`; a nice demonstration that the spec pins more than the headers it names.
+
+### The redaction list is NOT in `packages/shared`, and the reason is a deploy-class bug
+
+That was the intended home and it cannot be one today. `packages/shared` is published as TypeScript **source**, not a build artifact — recorded at `next.config.mjs`, and workable because the web app compiles it via `transpilePackages`. The API has never imported it.
+
+**Probed before relying on it:** an API file importing `@meterlog/shared` passes `tsc --noEmit`, passes `nest build`, and the emitted `dist` then dies at runtime with `Unexpected token 'export'` — `require('@meterlog/shared')` resolves to a `.ts` file Node cannot execute. **Green build, dead container, first seen on the deploy.** That is the superuser-migrator shape and the cross-site-cookie shape, and it would have been shipped by the PR whose entire subject is not shipping things like that.
+
+Giving the package a build step reverses a recorded decision and changes how the web app resolves it — a reviewed refactor, not a line on an observability PR. **Both consumers of the list are in `apps/api`**, so it is defined beside them: still exactly one definition, no drift, no structural change. The web's Sentry config needs none of it, since a browser event carries no API request body. **Flagged as a deviation from the ruling, with the measurement, rather than worked around silently.**
+
+### pino, and the 429 it structurally cannot see
+
+`LoggerModule.forRoot` in `AppModule`, `app.useLogger` in `main.ts` (`bufferLogs` was already set at scaffold). Registered as a module, so its middleware lands during `app.init()` — after everything `configureApp` mounts with `app.use(...)`. **The request-pipeline floor is untouched and the acceptance suite pins the same pipeline it always did.**
+
+**The consequence is stated rather than discovered:** the login limiter is Express middleware mounted before `init()`, so when it short-circuits a 429, `pino-http` never runs and there is no request log for it — and those 429s are the most interesting events the API produces. This is the same asymmetry ARCHITECTURE §12 already records for errors ("the filter never sees its 429 and the middleware writes the `RATE_LIMITED` envelope itself"). The limiter therefore writes its own structured line, beside its own envelope. Moving `pino-http` ahead of helmet would catch it and would put logging inside the security floor the specs pin; that trade was refused.
+
+**`LOG_LEVEL` is finally read by something** — it had sat in `.env.example` unread since the scaffold, the same dead-variable shape the deploy-config PR repaired for `NEXT_PUBLIC_API_URL`. **`NODE_ENV=test` beats it outright, and the order is measured:** Vitest pins `NODE_ENV=test`, but `loadEnv` then copies `LOG_LEVEL=debug` in from the repo's `.env`. An explicit-wins order would silence CI (no `.env` there) and leave every developer machine noisy — a request log line per HTTP call across the whole acceptance suite.
+
+### `/health/ready` — and the 401 it would have been
+
+A **second** route. `/api/v1/health` is untouched, because `render.yaml` points Render's health check at it and §16.1 makes that a deploy gate: repointing it at a route that touches Postgres would let a transient blip fail a deploy and take down a healthy service. The handler says so.
+
+**It needed an entry in `WORKSPACE_EXEMPT_ROUTES`, and without it the route is a 401 rather than a probe** — the tenant-context interceptor is default-deny, so an uptime monitor would have reported the service down while it was perfectly healthy, forever, from a one-line omission. Adding the route also reds `route-inventory.spec.ts` until ARCHITECTURE §9.4 gains its row, which is the designed alarm working; greened by adding the row.
+
+Booleans only — `{ready, db, redis}` — because the route is unauthenticated and a driver's error string routinely carries host, port, database and role. **503 when a dependency is down**, because a 200 carrying `{db:false}` is a monitor that never fires. **Both** Redis clients are pinged: `SessionService`'s and `LoginRateLimitService`'s are independent connections, and a probe that saw one would report ready through the other's outage. `ping()` is purely additive on both — `PING` only, no key access, no state — and both services' existing specs are unchanged.
+
+### The mass-spray signal — shipped; the alert — owed
+
+A coarse five-minute bucketed `INCR` in `recordFailure`, the single place a failure is charged, pipelined with the per-email increment so the aggregate costs the response-holding path nothing measurable. The per-email counters structurally cannot answer this: they are `sha256(email)` under one key each, so summing them means enumerating a keyspace the hashing exists to keep unenumerable.
+
+The test that shows why it exists: **five accounts, two failures each — every per-email bucket at 2 against a limit of 10, not one of them remarkable — and the aggregate at 10.**
+
+**It is a SIGNAL, not a DETECTION, and the docs say so in those words.** Nothing reads the counter to decide anything and nothing pages anyone; the alert **rule** is a platform artifact and is now a checkbox in §16.B. `LoginRateLimitService` refused a global rate limit on the grounds that detection was the right answer — shipping half of that and calling it detection would be the same error in the other direction.
+
+One teardown change came with it: `resetLoginRateLimit` now clears the aggregate prefix too. The aggregate key is keyed by **time**, not by address, so it is shared by every spec in the same five-minute bucket, and a spec asserting on it would otherwise inherit every failure the previous file charged.
+
+### Landing pass
+
+ADR-020's index row displaced the usual ADR anchors; the §17 rewrite and the §12 and §16.B edits moved `ARCHITECTURE.md` lines. Every displaced target was opened and confirmed rather than bumped mechanically. One citation was wrong on first write — `rewrites` cited at `next.config.mjs:37-39`, three lines stale because the Sentry import comment pushed the function down — and the checker caught it.
+
+### DoD: still nothing ticked
+
+`:271` (Sentry + uptime + `/health` live) now has its **code** half and waits on the author's platform actions — Sentry projects, the two DSNs, and pointing the uptime monitor at `/health/ready` rather than `/health`. `:270` waits on the CD job and on `e2e` becoming a required context. `:267` (frontend journeys) and `:269` (coverage, still never measured) stay open into v1.0.
+
+**Step 10 is not v1.0.** Residuals carried in honestly and unchanged by this PR: **OPEN-22**, **OPEN-24**, OPEN-21's nonce-CSP half (now with a forward-marker saying the tunnel means it needs no ingest allowance), OPEN-9, OPEN-10, OPEN-11, OPEN-23.

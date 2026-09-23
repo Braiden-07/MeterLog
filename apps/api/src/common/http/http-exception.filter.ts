@@ -1,4 +1,5 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus } from '@nestjs/common';
+import * as Sentry from '@sentry/nestjs';
 import type { Response } from 'express';
 
 /**
@@ -14,6 +15,8 @@ import type { Response } from 'express';
 export class HttpExceptionFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {
     const response = host.switchToHttp().getResponse<Response>();
+
+    reportIfServerFault(exception);
 
     if (exception instanceof HttpException) {
       const status = exception.getStatus();
@@ -83,4 +86,47 @@ function codeFor(status: number): string {
     default:
       return 'ERROR';
   }
+}
+
+/**
+ * SENTRY CAPTURE — here, and 5xx ONLY.
+ *
+ * ================= WHY IN THIS FILTER AND NOT `SentryGlobalFilter` ==========
+ *
+ * `@sentry/nestjs` ships its own global exception filter, and installing it
+ * would put two filters in contention for the thing this one exists to
+ * guarantee: that EVERY error leaves as `{ error: { code, message } }`. That
+ * envelope is not a convention here, it is asserted — the validation acceptance
+ * test caught Nest's own `BadRequestException` shape slipping through a
+ * presence-only check once already. So reporting is added INSIDE the filter
+ * that owns the envelope rather than beside a second one that would also like
+ * to own it.
+ *
+ * ========================= WHY 5xx ONLY =====================================
+ *
+ * Every 4xx this API raises is a DESIGNED refusal with a test behind it: 401
+ * `UNAUTHENTICATED`, 403 `FORBIDDEN_ROLE` / `NO_ACTIVE_WORKSPACE`, 409
+ * `TENANT_MISMATCH`, 429 `RATE_LIMITED`. Reporting them would fill the project
+ * with events that mean "the system worked", and a dashboard where the signal
+ * is 1% of the volume is a dashboard nobody reads — which is how a real 500
+ * goes unnoticed.
+ *
+ * It also narrows the credential surface as a side effect worth naming: the
+ * 4xx on `/auth/login` is the failed-login response, and a failed login is the
+ * request whose body is a password. Not reporting it means the commonest
+ * credential-bearing error never reaches the reporter at all, with `beforeSend`
+ * as the floor underneath rather than the only line of defence.
+ *
+ * A no-op when Sentry was never initialised — `captureException` on an
+ * unconfigured client does nothing, so this costs a function call in CI.
+ */
+function reportIfServerFault(exception: unknown): void {
+  const status =
+    exception instanceof HttpException
+      ? exception.getStatus()
+      : HttpStatus.INTERNAL_SERVER_ERROR;
+
+  if (status < HttpStatus.INTERNAL_SERVER_ERROR) return;
+
+  Sentry.captureException(exception);
 }

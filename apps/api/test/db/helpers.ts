@@ -682,33 +682,38 @@ export async function resetDatabase(migrator: PrismaClient): Promise<void> {
  * landed — every new spec would have to remember, and the one that forgot would
  * break a different file.
  *
- * Matched on the exported PREFIX rather than a list of emails, so a spec that
+ * Matched on the exported PREFIXES rather than a list of emails, so a spec that
  * invents a new fixture address is covered without editing anything. `SCAN`
  * rather than `KEYS`: `KEYS` blocks the server, and this runs in a `beforeEach`.
+ *
+ * BOTH PREFIXES, since the observability PR. The per-email counters were the
+ * only durable limiter state until the mass-spray AGGREGATE counter landed, and
+ * that one is keyed by TIME rather than by address — so it is shared by every
+ * spec running in the same five-minute bucket, and a spec asserting on it would
+ * otherwise inherit every failure the previous file charged. Exactly the shape
+ * this helper's own comment warns about: teardown knowledge belongs in one
+ * place, and a new key that teardown does not know about is how it stops being
+ * one place.
  */
 export async function resetLoginRateLimit(): Promise<void> {
   const url = process.env.REDIS_URL;
   if (!url) return;
 
   const { default: Redis } = await import('ioredis');
-  const { LOGIN_FAILURE_KEY_PREFIX } = await import(
+  const { LOGIN_FAILURE_AGGREGATE_PREFIX, LOGIN_FAILURE_KEY_PREFIX } = await import(
     '../../src/common/rate-limit/login-rate-limit.service'
   );
 
   const redis = new Redis(url, { maxRetriesPerRequest: 2, lazyConnect: false });
   try {
-    let cursor = '0';
-    do {
-      const [next, keys] = await redis.scan(
-        cursor,
-        'MATCH',
-        `${LOGIN_FAILURE_KEY_PREFIX}*`,
-        'COUNT',
-        500,
-      );
-      cursor = next;
-      if (keys.length > 0) await redis.del(...keys);
-    } while (cursor !== '0');
+    for (const prefix of [LOGIN_FAILURE_KEY_PREFIX, LOGIN_FAILURE_AGGREGATE_PREFIX]) {
+      let cursor = '0';
+      do {
+        const [next, keys] = await redis.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 500);
+        cursor = next;
+        if (keys.length > 0) await redis.del(...keys);
+      } while (cursor !== '0');
+    }
   } finally {
     await redis.quit();
   }
