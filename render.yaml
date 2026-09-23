@@ -1,0 +1,212 @@
+# =============================================================================
+# RENDER BLUEPRINT — `PROJECT_BRIEF` §11 step 10, the deploy-config PR.
+#
+# INERT UNTIL APPLIED. Committing this file deploys nothing and provisions
+# nothing. Render reads it only when an author points a Blueprint at this repo,
+# and `autoDeploy: false` below means it will not ship a commit on its own even
+# then. Everything here is a declaration the author acts on — see
+# `docs/ARCHITECTURE.md` §16 for the full author checklist, and §16.1 for the
+# eleven boxes that must be ticked before the FIRST migration runs here.
+#
+# ======================= WHAT IS NOT IN THIS FILE ============================
+#
+# SECRET VALUES. Every secret below is `sync: false`, which is Render's way of
+# saying "this key exists, its value comes from the dashboard". A blueprint that
+# carried the values would put the session signing key and two database
+# passwords in a public repository.
+#
+# THE FRONTEND. Vercel has no config file in this repo because Next needs none —
+# its settings are dashboard fields, and they are recorded in `ARCHITECTURE.md`
+# §16 rather than here so they are not split across two places. The one that
+# decides whether the deployed app works at all is `API_ORIGIN`: it must be set
+# on the Vercel project as a plain (NOT `NEXT_PUBLIC_`) variable, present at
+# BUILD time, pointing at this service's `https://` origin with no trailing
+# path. `.env.example` carries the four rules and the failure each one prevents.
+#
+# MIGRATIONS. They are a gated deploy step, not part of `startCommand` — see the
+# note on `startCommand` below.
+#
+# ================= THE IDENTIFIERS RENDER RENAMES ============================
+#
+# Plan names, `runtime:` (older blueprints spell it `env:`) and the Key Value /
+# Redis service type are the parts of this schema Render has changed before and
+# may have changed again. They are the one thing here to verify against Render's
+# current blueprint docs at apply time; a wrong identifier fails validation in
+# the dashboard immediately and loudly, which is the safe direction.
+# =============================================================================
+
+services:
+  - type: web
+    name: meterlog-api
+    runtime: node
+    # NOT `free`. ADR-003 accepted Render on the condition that the tier is
+    # chosen deliberately: free Postgres expires and free web services
+    # cold-start, and a cold start would land in the §13 p95 latency metric as
+    # if it were application latency.
+    plan: starter
+    region: oregon
+    branch: main
+
+    # ===================== CD IS NOT RENDER'S JOB ============================
+    #
+    # OFF, DELIBERATELY, AND THIS IS THE LINE THAT MAKES DoD :270 HONEST.
+    # Render's git integration watches the BRANCH, not the run — it cannot see
+    # whether `verify` and `e2e` passed, so with auto-deploy on it would ship a
+    # commit whose e2e job is red. "Deploy automated on `main`" has to mean
+    # "deploy gated on the checks", which only a GitHub Actions job can express.
+    # That job arrives in PR-4 and triggers this service explicitly.
+    #
+    # It is also off for a second reason that expires: `ARCHITECTURE.md` §16.1's
+    # standing risk is that the migration role is a superuser locally and in CI
+    # and is NOT one here, so a whole class of privilege defect appears for the
+    # first time against this database. The first deploy wants a human watching
+    # it. Turning auto-deploy on before that has happened automates a step
+    # nobody has yet seen succeed.
+    autoDeploy: false
+
+    # `--include=dev` IS LOAD-BEARING, NOT BELT-AND-BRACES. `NODE_ENV` is
+    # `production` on this service (see envVars), and npm omits
+    # devDependencies when it sees that — which would remove `@nestjs/cli` and
+    # `prisma`, the two binaries the next two commands are. The failure is at
+    # build time and legible, but it costs a deploy cycle to diagnose from
+    # "nest: not found".
+    #
+    # `db:generate` runs before the build because the Prisma client is generated
+    # code the TypeScript build imports.
+    #
+    # The API imports no workspace package (`@meterlog/shared` is a web-only
+    # dependency), so building that one workspace is sufficient and there is no
+    # package-build ordering to get right.
+    buildCommand: npm ci --include=dev && npm run db:generate && npm run build --workspace=@meterlog/api
+
+    # ============ MIGRATIONS ARE NOT IN HERE, AND THAT IS THE POINT ==========
+    #
+    # `npm run db:migrate:deploy && node ...` would run migrations on every
+    # container start: every restart, every scale event, every crash-loop
+    # iteration races to migrate, and a failed migration becomes a boot loop
+    # rather than a failed deploy. Worse, it would run them as whatever role
+    # `DATABASE_URL` names — the APP role, which owns nothing and would fail.
+    #
+    # Migrations run as a gated step in the Actions deploy job (PR-4), with
+    # `MIGRATION_DATABASE_URL`, BEFORE this service is told to deploy. See
+    # ADR-019.
+    startCommand: node apps/api/dist/main.js
+
+    # ============== THIS IS A DEPLOY GATE, NOT A MONITOR =====================
+    #
+    # `ARCHITECTURE.md` §16.1 makes this line part of a security control.
+    # `SessionService` throws in its constructor when `SESSION_SECRET` is
+    # missing, so Nest's DI fails at bootstrap and the process exits non-zero —
+    # but a fail-closed guard is only worth what the moment it first runs is
+    # worth, and that moment is this health check. With it, a container that
+    # dies at boot fails the deploy; without it, Render can leave a dead or
+    # half-wired service in rotation.
+    #
+    # DO NOT REPOINT THIS AT A DEEPER PROBE. `/api/v1/health` is served by a
+    # Nest controller, so reaching it proves the app wired up. §16.1 warns that
+    # if this ever becomes a static route that does not exercise DI, the guard
+    # silently stops being a deploy gate. A readiness probe that touches
+    # Postgres and Redis is a different endpoint for a different consumer (the
+    # uptime monitor) and arrives in PR-2.
+    healthCheckPath: /api/v1/health
+
+    envVars:
+      # LITERAL `production`, and it is a security flag in disguise. The session
+      # cookie is `secure: process.env.NODE_ENV === 'production'`
+      # (apps/api/src/auth/auth.controller.ts). Anything else here — unset,
+      # `prod`, `Production` — and the flag silently does not appear, and a
+      # signed session cookie can travel over a plain-HTTP hop. §16.1 calls this
+      # unverifiable by CI and verifiable only against a real deployment,
+      # because the tests run over plain HTTP by necessity; check (c) there is
+      # how you confirm it, and the deploy smoke test (PR-3) is what automates
+      # that check.
+      - key: NODE_ENV
+        value: production
+
+      # `SessionService` refuses to construct without this, so an
+      # unsigned-cookie deployment cannot happen by accident — it presents as a
+      # failed deploy via the health check above. Generate with
+      # `openssl rand -hex 32`.
+      - key: SESSION_SECRET
+        sync: false
+
+      # ================== THE MOST DANGEROUS LINE IN THIS FILE ===============
+      #
+      # This MUST name `meterlog_app` — the NOSUPERUSER, NOBYPASSRLS role that
+      # owns nothing (ADR-004). It is `sync: false` rather than
+      # `fromDatabase: connectionString` and that is not an oversight:
+      # `fromDatabase` yields the connection string of the database's OWNER
+      # role, and pointing `DATABASE_URL` at the owner disables tenant isolation
+      # entirely while every structural test still passes. §16.1 lists
+      # confirming this as its own box for that reason.
+      #
+      # The password half is an author action by construction: `ALTER ROLE
+      # meterlog_app WITH LOGIN PASSWORD '<secret>'` is deliberately absent from
+      # every migration (§16.1), so the role exists after migration with no
+      # login until someone sets one from the secret store.
+      - key: DATABASE_URL
+        sync: false
+
+      # DECLARED FOR COMPLETENESS, AND THE RECOMMENDATION IS TO LEAVE IT EMPTY.
+      # The running API never reads this — only `prisma migrate deploy` does,
+      # and that runs in the Actions job (PR-4) against GitHub Actions secrets.
+      # A populated value here would put the schema-owning role's credentials
+      # inside the application container for no runtime purpose. Populate it
+      # only if you choose to run migrations from a Render job instead, and
+      # revisit ADR-019 if you do.
+      - key: MIGRATION_DATABASE_URL
+        sync: false
+
+      # Wired from the Key Value service below rather than by hand: it is not a
+      # secret the author chooses, it is an address Render assigns, and typing
+      # it twice is how the two drift. Redis is a hard runtime dependency, not a
+      # cache (ADR-001) — it holds every session, and the login rate limiter's
+      # counters — so `LoginRateLimitService` and `SessionService` both throw
+      # rather than degrade when it is missing.
+      - key: REDIS_URL
+        fromService:
+          name: meterlog-redis
+          type: redis
+          property: connectionString
+
+      # `PORT` IS DELIBERATELY ABSENT. Render injects it and the API reads
+      # `process.env.PORT ?? 3001` (apps/api/src/main.ts). Declaring a fixed one
+      # here would fight the platform for no gain.
+
+  - type: redis
+    name: meterlog-redis
+    plan: starter
+    region: oregon
+    # NO EXTERNAL ACCESS. Sessions and login-failure counters live here; nothing
+    # outside Render's private network has any business reaching them. An empty
+    # allow-list is the closed default, and unlike the database below there is
+    # no author checklist that needs a connection from a laptop.
+    ipAllowList: []
+
+databases:
+  - name: meterlog-postgres
+    plan: basic-256mb
+    region: oregon
+    postgresMajorVersion: '16'
+    databaseName: meterlog
+
+    # NAMED FOR THE ROLE IT ACTUALLY IS. Render's provisioned user owns the
+    # database, which makes it this project's MIGRATION role (ADR-004's
+    # two-role model), and naming it so keeps `MIGRATION_DATABASE_URL` legible
+    # as exactly what Render hands you. It is NOT a superuser — which is the
+    # whole of §16.1's standing risk, since locally and in CI it is.
+    #
+    # OPEN, AND §16.1 SAYS TO ANSWER IT WITH A REAL ANSWER RATHER THAN AN
+    # ASSUMPTION: migration `20260903000000` issues `CREATE ROLE` /
+    # `ALTER ROLE ... SET`, so this role needs `CREATEROLE` and role-admin
+    # rights. Whether Render's provisioned owner has them is ADR-004's open
+    # question and is unanswerable from here.
+    user: meterlog_migrator
+
+    # `ipAllowList` IS DELIBERATELY NOT SET, because both answers are wrong as a
+    # committed default. Closed, and §16.1's checks (a) and (b) cannot be run —
+    # they are `psql` queries from the author's machine, and so is the one-time
+    # `ALTER ROLE meterlog_app` that gives the app role a password. Open, and a
+    # public Postgres port outlives the afternoon it was needed for. Set it to
+    # your own address for the checklist, then close it — as an author action,
+    # recorded in §16, not as a line in this file that nobody revisits.
