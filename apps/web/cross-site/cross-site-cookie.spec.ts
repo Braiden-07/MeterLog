@@ -108,8 +108,14 @@ test.describe('the session cookie across a real site boundary', () => {
 
   test('login sets a host-only Lax cookie, and it survives the proxy round trip', async ({
     browser,
+    baseURL,
   }) => {
-    const context = await browser.newContext({ baseURL: process.env.CROSS_SITE_BASE_URL });
+    // `baseURL` COMES FROM THE FIXTURE, NOT FROM `process.env`. A manual
+    // `browser.newContext()` does NOT inherit the project's `use` options, so
+    // the baseURL has to be passed in — and reading it from an env var instead
+    // sets it to `undefined` wherever that var is unset, which is every machine
+    // except the one where it was written. CI found exactly that.
+    const context = await browser.newContext({ baseURL });
     try {
       const email = `smoke-${unique('crosssite')}@smoke.invalid`;
 

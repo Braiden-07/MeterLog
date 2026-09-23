@@ -108,12 +108,18 @@ test.describe('deploy smoke — the deployed cross-origin cookie posture', () =>
     expect(headers['x-content-type-options']).toBe('nosniff');
   });
 
-  test('2 — login sets HttpOnly · Secure · SameSite=Lax, with NO Domain', async ({ browser }) => {
+  test('2 — login sets HttpOnly · Secure · SameSite=Lax, with NO Domain', async ({
+    browser,
+    baseURL,
+  }) => {
     // §16.1's check (c), automated. That check is a `curl … | grep set-cookie`
     // that must contain HttpOnly, Secure and SameSite=Lax; the NO-Domain half is
     // added here because it is what keeps the cookie HOST-ONLY, which assertion
     // 4 depends on and which nothing else would notice being widened.
-    const context = await browser.newContext();
+    // `baseURL` from the fixture: a manual `browser.newContext()` does not
+    // inherit the config's `use` options, so a relative path would throw
+    // "Invalid URL" without it.
+    const context = await browser.newContext({ baseURL });
     try {
       const identity = smokeIdentity();
       email = identity.email;
@@ -157,12 +163,13 @@ test.describe('deploy smoke — the deployed cross-origin cookie posture', () =>
 
   test('3 — the cookie set through the proxy is sent back through it (THE POSTURE)', async ({
     browser,
+    baseURL,
   }) => {
     // THE ASSERTION THE WHOLE SLICE EXISTS FOR. A real login through the
     // deployed Vercel origin, then a real API call through the same origin with
     // the SAME jar. This is what "the same-origin proxy works in production"
     // means, and it has never been true or false — only designed.
-    const context = await browser.newContext();
+    const context = await browser.newContext({ baseURL });
     try {
       const identity = smokeIdentity();
 
@@ -219,6 +226,7 @@ test.describe('deploy smoke — the deployed cross-origin cookie posture', () =>
 
   test('6 — X-Forwarded-For is SENT; what the API observed is a manual step', async ({
     browser,
+    baseURL,
   }) => {
     // ============ NOT A GREEN ASSERTION, AND THAT IS THE HONEST SHAPE ========
     //
@@ -241,7 +249,10 @@ test.describe('deploy smoke — the deployed cross-origin cookie posture', () =>
     // a forged value that cannot occur naturally, then prints exactly where to
     // look for it.
     const forged = `203.0.113.${Math.floor(Math.random() * 200) + 1}`;
-    const context = await browser.newContext({ extraHTTPHeaders: { 'x-forwarded-for': forged } });
+    const context = await browser.newContext({
+      baseURL,
+      extraHTTPHeaders: { 'x-forwarded-for': forged },
+    });
     try {
       const identity = smokeIdentity();
       await context.request.post('/api/v1/auth/register', {
