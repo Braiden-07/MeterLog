@@ -1,4 +1,5 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { json } from 'express';
 import helmet from 'helmet';
 
@@ -63,9 +64,19 @@ const GLOBAL_PREFIX = 'api/v1';
  * to mean anything.
  *
  * OUT: process-level concerns that no test exercises and that would cost the
- * suite time or noise — `listen`, log buffering, and the Swagger document. They
- * stay in `main.ts`. A spec that needs the OpenAPI document builds its own
- * (`pending-split.spec.ts` does), which is the correct scope for it.
+ * suite time or noise — `listen`, log buffering, and the Swagger document.
+ * Generating the OpenAPI document scans every controller, and paying that on
+ * every acceptance spec's app init would buy the suite nothing.
+ *
+ * THE SWAGGER DOCUMENT IS STILL OUT OF THIS FUNCTION, BUT IT IS NO LONGER INSIDE
+ * `main.ts` EITHER — it is `mountOpenApi` below, which `main.ts` calls and so
+ * does the one spec that asserts `/api/v1/docs` is PUBLICLY reachable
+ * (`test/api/openapi-docs.spec.ts`). Moved there at the deploy-config PR for the
+ * reason this whole file exists: that spec's claim is about what production
+ * serves to an anonymous visitor, so it has to call production's mount rather
+ * than stand up a copy and assert against that. A spec that needs the document's
+ * CONTENT still builds its own (`pending-split.spec.ts` does), which is the
+ * correct scope for that and costs the rest of the suite nothing.
  *
  * ALSO OUT, DELIBERATELY: `test/api/route-inventory.spec.ts` does not call this
  * and must not. It issues no HTTP request at all — it reads the router and
@@ -176,4 +187,70 @@ export function configureApp(app: INestApplication): INestApplication {
   );
 
   return app;
+}
+
+/**
+ * The version advertised on the public OpenAPI page.
+ *
+ * A HAND-KEPT LITERAL, and the reason it is not imported from `package.json` is
+ * worth one line: `apps/api/package.json` sits outside `src`, and pulling it in
+ * as a module would put a second entry under the build's root and move
+ * `dist/main.js`, which `render.yaml`'s `startCommand` names by path. Not worth
+ * it for a string.
+ *
+ * `1.0.0-rc.1` RATHER THAN `1.0.0`, DELIBERATELY. The backend is feature-complete
+ * and this is the deploy-prep slice, but `PROJECT_BRIEF` §11 step 10 is NOT v1.0
+ * — §12 still has open boxes that no deploy ticks (the essential frontend
+ * journeys, and coverage). Advertising `1.0.0` on the first page a visitor reads
+ * would be the milestone claim the repo has not earned. It replaces a `0.1.0`
+ * that had been the scaffold value since step 3.
+ *
+ * `apps/api/package.json` and the root manifest still say `0.1.0`. Reconciling
+ * the three is a RELEASE decision for step 11, not a docs decision for this PR,
+ * and is recorded rather than quietly done here.
+ */
+export const OPENAPI_VERSION = '1.0.0-rc.1';
+
+/**
+ * Mounts the OpenAPI document and its Swagger UI at `/api/v1/docs`.
+ *
+ * ================ THE PAGE IS PUBLIC, AND THAT IS THE DECISION ==============
+ *
+ * `/api/v1/docs` is served to anyone, unauthenticated, in production. That is a
+ * choice rather than an oversight, and this comment exists because the shape of
+ * it — a docs UI reachable without a session — is the shape a reviewer or a
+ * scanner flags on sight. WHAT MAKES IT SAFE, rather than merely intended:
+ *
+ *   - **The repository is public.** The document is generated from decorators in
+ *     source anyone can already read. It discloses no route, DTO or status code
+ *     that `apps/api/src` does not, so there is no information here that hiding
+ *     the page would withhold from anyone who can use a browser.
+ *   - **Every endpoint behind it is authn-gated.** The document describes the
+ *     surface; it opens none of it. The exempt routes are enumerated and
+ *     asserted (`WORKSPACE_EXEMPT_ROUTES`, and `test/api/route-inventory.spec.ts`
+ *     holds the whole route/role matrix to `ARCHITECTURE.md` §9), so "public
+ *     docs" cannot quietly come to mean "public data".
+ *   - **It is a read of a generated document.** The page mutates nothing, and
+ *     `SwaggerModule.setup` adds no route that writes.
+ *
+ * ACCEPTED, AND STATED RATHER THAN DISCOVERED: Swagger UI's "Try it out" posts
+ * real requests at the live API from the visitor's browser. An anonymous visitor
+ * pressing it collects 401s — they hold no session, and the same-origin proxy is
+ * not in their path — so what they can actually exercise is the unauthenticated
+ * surface, which is `/health`, `/auth/register`, `/auth/login` (rate-limited per
+ * email) and the set-password flow. Someone who IS logged in as an admin can
+ * mutate their OWN tenant from this page, which is a thing that admin could do
+ * from the app regardless. The cost is that registration is reachable from a
+ * button; it was already reachable from `curl`.
+ *
+ * NOT IN `configureApp`, and the boundary is argued there — this costs a
+ * controller scan per call, and the acceptance suite has no use for it.
+ */
+export function mountOpenApi(app: INestApplication): void {
+  const openApi = new DocumentBuilder()
+    .setTitle('MeterLog API')
+    .setDescription('Multi-tenant asset & utility-meter traceability')
+    .setVersion(OPENAPI_VERSION)
+    .build();
+  SwaggerModule.setup(`${GLOBAL_PREFIX}/docs`, app, SwaggerModule.createDocument(app, openApi));
 }

@@ -205,7 +205,7 @@ A caller with **no active workspace** is refused before any row here is consulte
 | `PATCH /maintenance-records/:id`          | ✓     | ✓          | 403     |
 | `DELETE /maintenance-records/:id` (soft)  | ✓     | ✓          | 403     |
 
-The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:191)](PROGRESS.md#L191)).
+The five `/maintenance-records` rows were added at G2, transcribed from the phase-4 decision — reads un-gated, writes admin + technician, and `DELETE` deliberately **not** admin-only because retracting a record of work is recoverable where decommissioning an asset is not ([`/maintenance-records` (PROGRESS.md:192)](PROGRESS.md#L192)).
 
 **The one cell that was genuinely open, and how it was resolved.** `POST /assets` could defensibly have been admin-only. It is **admin _and_ technician**: registering an asset is field work — the technician installing a meter is the person who knows its serial number, type and location, and routing that through an admin invents a bottleneck the product has no reason to have. The destructive act is **decommissioning**, and that is where the admin-only line is drawn: `DELETE /assets/:id` is admin-only.
 
@@ -239,7 +239,7 @@ The invariant that forces it: **every status an asset has ever held must have an
 | ------------ | ----- | ---------- | ------- |
 | `GET /audit` | ✓     | 403        | ✓       |
 
-Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:575)](DECISIONS.md#L575)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:654)](DECISIONS.md#L654)).
+Added at G2, transcribed from ADR-012's RBAC decision that the trail is readable by admin **and** auditor ([`admin AND auditor` (DECISIONS.md:576)](DECISIONS.md#L576)), made an enforcement by ADR-014 ([`@RequiresRole('admin', 'auditor')` (DECISIONS.md:655)](DECISIONS.md#L655)).
 
 ### 9.4 Routes exempt from the active-workspace requirement (G2, OPEN-18)
 
@@ -259,11 +259,11 @@ None of these reads tenant data, and three of them are how a caller without a wo
 
 ## 10. Audit logging
 
-Lives in DECISIONS: [ADR-009](DECISIONS.md#L428) capture · [ADR-010](DECISIONS.md#L476) integrity · [ADR-011](DECISIONS.md#L502) payload and redaction · [ADR-012](DECISIONS.md#L547) scope, RBAC and volume · [ADR-013](DECISIONS.md#L618) bootstrap rows · [ADR-014](DECISIONS.md#L644) read surface · [ADR-015](DECISIONS.md#L721) column naming.
+Lives in DECISIONS: [ADR-009](DECISIONS.md#L429) capture · [ADR-010](DECISIONS.md#L477) integrity · [ADR-011](DECISIONS.md#L503) payload and redaction · [ADR-012](DECISIONS.md#L548) scope, RBAC and volume · [ADR-013](DECISIONS.md#L619) bootstrap rows · [ADR-014](DECISIONS.md#L645) read surface · [ADR-015](DECISIONS.md#L722) column naming.
 
 ## 11. API conventions
 
-Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:732)](PROGRESS.md#L732)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:294)](PROGRESS.md#L294); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L644).
+Lives elsewhere: the error envelope in [`HttpExceptionFilter`](../apps/api/src/common/http/http-exception.filter.ts#L14), recorded at step 4 phase 4 ([`HttpExceptionFilter` (PROGRESS.md:732)](PROGRESS.md#L732)); the 400 / 422 / 409 split at [`ASSET_TRANSITION_ILLEGAL` (PROGRESS.md:295)](PROGRESS.md#L295); the SQLSTATE → HTTP mapping in §16.2 below; pagination in [ADR-014](DECISIONS.md#L645).
 
 ## 12. Error handling & logging
 
@@ -271,17 +271,62 @@ Errors: the envelope filter, [`HttpExceptionFilter`](../apps/api/src/common/http
 
 ## 13. Configuration & secrets
 
-Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L148) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127)); production secrets in the §16.1 checklist below.
+Lives elsewhere: the two roles and two connection strings in [ADR-004](DECISIONS.md#L149) and [`.env.example`](../.env.example#L1); CI values in the `ci.yml` env comments ([`SESSION_SECRET` (ci.yml:70-74)](../.github/workflows/ci.yml#L70-L74), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127)); production secrets in the §16.1 checklist below.
 
 ## 14. Local development
 
-Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L297); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
+Lives elsewhere: the workspace layout in [ADR-005](DECISIONS.md#L298); the bootstrap sequence in [`docker compose up -d` (CLAUDE.md:24)](../CLAUDE.md#L24) (Commands); local Postgres and Redis in [docker-compose.yml:1-3](../docker-compose.yml#L1-L3); the local-only role bootstrap in [01-bootstrap-roles.sh:2-11](../docker/postgres/01-bootstrap-roles.sh#L2-L11).
 
 ## 15. CI/CD
 
-CI: the rationale lives in the `ci.yml` comments — [`DO NOT RENAME THIS JOB` (ci.yml:19)](../.github/workflows/ci.yml#L19), [`Check doc citations` (ci.yml:101)](../.github/workflows/ci.yml#L101), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127). CD: not yet built — PROJECT_BRIEF §11 step 10.
+CI: the rationale lives in the `ci.yml` comments — [`DO NOT RENAME THIS JOB` (ci.yml:19)](../.github/workflows/ci.yml#L19), [`Check doc citations` (ci.yml:101)](../.github/workflows/ci.yml#L101), [`Give the app role a password` (ci.yml:124-127)](../.github/workflows/ci.yml#L124-L127).
+
+CD: **decided and not yet built.** Its shape is [ADR-019](DECISIONS.md#L953) — a `deploy` job on push to `main`, gated on `verify` and `e2e`, with migrations as a step ahead of the deploy and a smoke test behind it — and the deploy target is declared in [`render.yaml`](../render.yaml), which sets `autoDeploy: false` precisely so nothing ships before that job exists. The job itself is a later slice of `PROJECT_BRIEF` §11 step 10, deliberately sequenced after an author has watched one deploy by hand (§16.B).
 
 ## 16. Deployment topology
+
+**Two platforms, one browser-visible origin.** The Next app runs on Vercel and is the only origin a browser ever addresses; it proxies `/api/*` to the NestJS API on Render, which holds managed Postgres and Redis alongside it (ADR-003). None of that split is visible to the browser, and §16.A below is the list of conditions that keeps it that way.
+
+**Nothing here is provisioned by this repository.** [`render.yaml`](../render.yaml) is a blueprint an author applies; Vercel has no config file because Next needs none, so its settings are recorded in §16.B rather than split across two places. Both are inert until someone acts. **Read §16.1 before the first migration runs against Render** — it is eleven checkboxes rather than a register row, which makes it the easiest thing on this page to skip and the most expensive to have skipped: its standing risk is a privilege-defect class that **green CI cannot see**, because the migration role is a superuser locally and in CI and is not one there.
+
+**What runs where, and what each side needs:**
+
+| Where              | What                             | Configuration that must be right                                                                                                                                |
+| ------------------ | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Vercel             | the Next app; the `/api/*` proxy | Root directory `apps/web`. **`API_ORIGIN`** — see §16.A. No other variable decides whether the deployed app works at all.                                        |
+| Render (web)       | the Nest API                     | `NODE_ENV=production` (literal), `SESSION_SECRET`, `DATABASE_URL` (app role), `REDIS_URL`. Health check on `/api/v1/health`. `PORT` is injected by the platform. |
+| Render (Postgres)  | the eight core tables, with RLS  | Two roles, two URLs (ADR-004). The provisioned owner is the **migration** role; `meterlog_app` is created by migration and given a password by hand (§16.1).     |
+| Render (Key Value) | sessions, login-failure counters | A hard runtime dependency, not a cache (ADR-001). Needs no access from outside Render.                                                                           |
+| GitHub Actions     | migrations, deploy, smoke        | `MIGRATION_DATABASE_URL` and the platform deploy credentials live here, not in the application container (ADR-019).                                              |
+
+### 16.A The four conditions the session cookie depends on
+
+The cookie is `httpOnly`, `secure` in production, `SameSite=Lax`, and carries **no `Domain`** ([`cookieOptions` (auth.controller.ts:16-31)](../apps/api/src/auth/auth.controller.ts#L16-L31)). It is first-party on the Vercel origin because the browser only ever talks to that origin — which is a property of **configuration, not of code**, and every way of getting it wrong fails silently, in production, on a path no local run reaches. Both apps run on `localhost` in dev and in CI, where differing ports do not change the site, so the cookie is same-site there no matter what is misconfigured: a green E2E run is not evidence about any of this, and `ISOLATION.md` §9 says so where it records what the build does not prove.
+
+1. **`API_ORIGIN` is set on Vercel at BUILD time, not only at runtime.** `rewrites()` is evaluated when Next loads its config, and `next build` bakes the result into the routing manifest — so a runtime-only value ships the localhost fallback in [`API_ORIGIN` (next.config.mjs:9)](../apps/web/next.config.mjs#L9) instead, and every API call in production reaches for an origin that is not there. It must also be plain rather than `NEXT_PUBLIC_`, carry `https://`, and stop at the origin, because the rewrite appends `/api/:path*` itself. The four rules, each with the failure it prevents, sit on the variable itself in [`.env.example`](../.env.example#L34).
+2. **Nothing in the browser addresses Render.** Held by construction today: [`API_BASE`](../apps/web/lib/api.ts#L11) is relative, and the client pins [`credentials: 'same-origin'`](../apps/web/lib/api.ts#L153). That pin is a floor rather than a style choice — if an absolute API origin were ever introduced, the cookie would not be sent **at all** rather than sent cross-site, so the failure is a visible 401 loop instead of a quietly weakened posture.
+3. **`NODE_ENV` is literally `production` on Render**, or [`secure`](../apps/api/src/auth/auth.controller.ts#L26) evaluates false and the flag never appears. §16.1's check (c) is how that is confirmed, and it is **unverifiable by CI by construction**, because the tests run over plain HTTP.
+4. **Render terminates HTTPS on the origin `API_ORIGIN` names**, so the `Secure` cookie survives the Vercel→Render hop.
+
+**What breaks it, stated so it is recognisable in the wild:** a missing or runtime-only `API_ORIGIN` (every call fails at once); a `NEXT_PUBLIC_` copy, or an absolute base URL in the client (login appears to succeed and every call after it 401s — the silent one); `NODE_ENV` unset or spelled differently (no `Secure` flag); a `Domain=` added to the cookie (it stops being host-only); a trailing `/api/v1` on `API_ORIGIN` (404s everywhere).
+
+**And none of it is proven until it is deployed.** The acceptance gate is the deploy smoke test: a real login through the deployed Vercel origin sets the cookie, a subsequent API call through the same origin sends it, and the same cookie sent **directly** to Render is refused — the third assertion being what stops the first two passing for the wrong reason. That test is owed by a later slice of step 10. Until it has run, everything above is a design rather than a result.
+
+### 16.B The author actions no pull request can perform
+
+Deploy config in this repo declares; it does not act. The order matters: the last three exist because §16.1's standing risk means the first migration against Render wants a human watching it.
+
+- [ ] Create the Render Blueprint from [`render.yaml`](../render.yaml), and **choose the plan tier deliberately** — ADR-003 accepted Render on the condition that free-Postgres expiry and free-tier cold starts are priced rather than discovered.
+- [ ] Verify the identifiers Render renames: plan names, `runtime:`, and the Key Value / Redis service type. A wrong one fails validation in the dashboard, which is the safe direction to be wrong in.
+- [ ] Set `SESSION_SECRET` and `DATABASE_URL` on the Render service. `DATABASE_URL` must name **`meterlog_app`**, never the provisioned owner: pointing it at the owner disables tenant isolation while every structural test still passes.
+- [ ] Open the database's IP allow-list to your own address, run §16.1's checks (a) and (b) plus the one-time `ALTER ROLE meterlog_app WITH LOGIN PASSWORD`, then **close it again**.
+- [ ] Create the Vercel project with root directory `apps/web`, and set **`API_ORIGIN`** per §16.A.
+- [ ] Add the GitHub Actions secrets the deploy job will need (ADR-019): `MIGRATION_DATABASE_URL`, and the two platform deploy credentials.
+- [ ] **Add `e2e` to the `main` ruleset's required status checks.** It is required by nothing today — [`adding the job does NOT make it required` (ci.yml:182-183)](../.github/workflows/ci.yml#L182-L183) says so in the file — so a red e2e blocks no merge, and DoD :270 cannot honestly tick until it does.
+- [ ] Work §16.1's eleven boxes against the real database, and enable managed Postgres backups with the restore procedure written down (`PROJECT_BRIEF` §10).
+- [ ] **Run the first migration and the first deploy by hand, and watch them.** `20260908000000_auth_definer_functions` is the first migration that would have failed on Render.
+- [ ] Run the deploy smoke test against the live deployment by hand, **before** anything automates it. Its first result is the finding, whichever way it goes.
+- [ ] Only then enable the automated path (ADR-019), and write down the platform-native rollback steps (`PROJECT_BRIEF` §9).
 
 ### 16.1 Pre-deploy checklist — Render (read before the first migration runs there)
 
